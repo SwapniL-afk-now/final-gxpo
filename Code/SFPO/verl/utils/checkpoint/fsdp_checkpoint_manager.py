@@ -148,6 +148,32 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to dump to local
         torch.distributed.barrier()
 
+        # LoRA: also export the adapter in standard peft form (tiny tensors, cheap allgather)
+        # so offline eval can do PeftModel.from_pretrained(base) + merge_and_unload
+        unwrapped = self.model._fsdp_wrapped_module
+        if hasattr(unwrapped, 'peft_config'):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT,
+                                          ShardedStateDictConfig(offload_to_cpu=False)):
+                    gpu_state = self.model.state_dict()
+            lora_params = {}
+            for key in sorted(gpu_state.keys()):
+                if '.lora_A.' in key or '.lora_B.' in key:
+                    tensor = gpu_state[key]
+                    if hasattr(tensor, 'full_tensor'):
+                        tensor = tensor.full_tensor()
+                    # peft adapter files drop the '.default' adapter-name segment
+                    lora_params[key.replace('.default.', '.')] = tensor.detach().cpu()
+            del gpu_state
+            if self.rank == 0:
+                from safetensors.torch import save_file
+                adapter_dir = os.path.join(local_path, 'lora_adapter')
+                os.makedirs(adapter_dir, exist_ok=True)
+                save_file(lora_params, os.path.join(adapter_dir, 'adapter_model.safetensors'))
+                unwrapped.peft_config['default'].save_pretrained(adapter_dir)
+            torch.distributed.barrier()
+
         if self.rank == 0:
             hf_local_path = os.path.join(local_path, 'huggingface')
             os.makedirs(hf_local_path, exist_ok=True)

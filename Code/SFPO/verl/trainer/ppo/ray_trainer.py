@@ -16,6 +16,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import json
 import os
 import uuid
 from contextlib import contextmanager
@@ -609,6 +610,7 @@ class RayPPOTrainer(object):
         # Also report the average
         sum_acc = 0
         sum_count = 0
+        val_n = self.config.actor_rollout_ref.rollout.val_kwargs.n
         for data_source, rewards in data_source_reward.items():
             rewards = np.array(rewards)
             #ignore the format score
@@ -617,6 +619,14 @@ class RayPPOTrainer(object):
             print(f'>>> Test: val/test_score/{data_source}: {np.mean(rewards)}')
             sum_acc += np.mean(rewards)
             sum_count += 1
+
+            # pass@1 (mean correctness over n samples) and pass@n (any-correct per prompt);
+            # interleaved repeat => contiguous groups of n samples per prompt
+            correct = (rewards >= 0.95).astype(np.float64)
+            metric_dict[f'val/pass_at_1/{data_source}'] = float(correct.mean())
+            if val_n > 1 and len(correct) % val_n == 0:
+                per_prompt = correct.reshape(-1, val_n)
+                metric_dict[f'val/pass_at_{val_n}/{data_source}'] = float(per_prompt.max(axis=1).mean())
         metric_dict['val/test_score/average'] = sum_acc / sum_count
         print(f'>>> Test: val/test_score/average: {sum_acc / sum_count}')
         print(metric_dict)
@@ -923,6 +933,11 @@ class RayPPOTrainer(object):
         self.global_steps += 1
         last_val_metrics = None
 
+        # rebuttal backbone: durable per-step metrics log (independent of wandb)
+        fit_start_time = time.monotonic()
+        metrics_jsonl_path = os.path.join(self.config.trainer.get('default_local_dir', '.'), 'metrics.jsonl')
+        os.makedirs(os.path.dirname(metrics_jsonl_path) or '.', exist_ok=True)
+
         sq_start = 0
         from collections import defaultdict
         data_avg_reward = defaultdict(list)
@@ -1208,9 +1223,10 @@ class RayPPOTrainer(object):
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
                         
-                    if len(self.entropy_container) >= self.config.actor_rollout_ref.actor.zscore_w:
-                        u = float(np.mean(self.entropy_container[-self.config.actor_rollout_ref.actor.zscore_w:]))
-                        std = float(np.std(self.entropy_container[-self.config.actor_rollout_ref.actor.zscore_w:])) + 1e-9
+                    zscore_w = self.config.actor_rollout_ref.actor.get('zscore_w', 0)
+                    if zscore_w > 0 and len(self.entropy_container) >= zscore_w:
+                        u = float(np.mean(self.entropy_container[-zscore_w:]))
+                        std = float(np.std(self.entropy_container[-zscore_w:])) + 1e-9
                         z = (self.entropy_container[-1] - u) / std
 
                         if z >= self.config.actor_rollout_ref.actor.zscore_threshold:
@@ -1221,8 +1237,9 @@ class RayPPOTrainer(object):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            if self.config.actor_rollout_ref.actor.use_sfpo and not self.stop_SFPO :
-                                batch.meta_info['kl_value'] = abs(self.kl)
+                            if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
+                                actor_output = self.actor_rollout_wg.gxpo_update_actor(batch)
+                            elif self.config.actor_rollout_ref.actor.get('use_sfpo', False) and not self.stop_SFPO:
                                 actor_output = self.actor_rollout_wg.sfpo_update_actor(batch)
                             else:
                                 actor_output = self.actor_rollout_wg.update_actor(batch)
@@ -1259,8 +1276,15 @@ class RayPPOTrainer(object):
                 sampling_metircs['sampling/sampling_total_num'] = self.sampling_num
                 metrics.update(sampling_metircs)
 
+                metrics['train/elapsed_hours'] = (time.monotonic() - fit_start_time) / 3600.0
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+
+                with open(metrics_jsonl_path, 'a') as f:
+                    row = {'step': self.global_steps}
+                    row.update({k: (v.item() if hasattr(v, 'item') else v) for k, v in metrics.items()})
+                    f.write(json.dumps(row, default=float) + '\n')
 
                 if is_last_step:
                     pprint(f'Final validation metrics: {last_val_metrics}')

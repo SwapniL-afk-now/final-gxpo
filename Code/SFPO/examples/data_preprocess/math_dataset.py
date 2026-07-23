@@ -32,6 +32,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--local_dir', default='~/data/math')
     parser.add_argument('--hdfs_dir', default=None)
+    parser.add_argument('--levels', default=None,
+                        help="Comma-separated difficulty levels to keep, e.g. '3,4,5' for the "
+                             "Hendrycks MATH Level 3-5 split. Default keeps all levels.")
 
     args = parser.parse_args()
 
@@ -43,6 +46,13 @@ if __name__ == '__main__':
 
     train_dataset = dataset['train']
     test_dataset = dataset['test']
+
+    if args.levels is not None:
+        # dataset stores level as 'Level 3' strings
+        keep = {f'Level {lv.strip()}' for lv in args.levels.split(',')}
+        train_dataset = train_dataset.filter(lambda ex: ex['level'] in keep)
+        test_dataset = test_dataset.filter(lambda ex: ex['level'] in keep)
+        print(f'Level filter {sorted(keep)}: {len(train_dataset)} train / {len(test_dataset)} test examples')
 
     instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 

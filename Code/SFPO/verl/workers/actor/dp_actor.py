@@ -25,6 +25,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.actor import BasePPOActor
+from verl.workers.actor.gxpo_state import GXPOState
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
@@ -34,6 +35,15 @@ import verl.utils.torch_functional as verl_F
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
 __all__ = ['DataParallelPPOActor']
+
+
+def _merge_metrics(dst: dict, src: dict):
+    """Merge a mini-batch metrics dict into the accumulated dict (lists extend, scalars overwrite)."""
+    for key, val in src.items():
+        if isinstance(val, list):
+            dst.setdefault(key, []).extend(val)
+        else:
+            dst[key] = val
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -57,6 +67,23 @@ class DataParallelPPOActor(BasePPOActor):
             torch.compile(verl_F.entropy_from_logits, dynamic=True)
             if self.config.get('use_torch_compile', True)  #  use torch compile by default
             else verl_F.entropy_from_logits)
+
+        # cumulative backward-pass counter (1 BP = one full gradient over a mini-batch)
+        self.cumulative_bp = 0
+
+        # GXPO: shutoff-gate state + lazily allocated per-parameter buffers
+        self.gxpo_state = None
+        self._gxpo_bufs = None
+        if self.config.get('use_gxpo', False) and actor_optimizer is not None:
+            self.gxpo_state = GXPOState(
+                K=self.config.get('gxpo_k', 5),
+                alpha=self.config.get('gxpo_alpha', 0.5),
+                delta=self.config.get('gxpo_delta', 1e-8),
+                tau=self.config.get('gxpo_tau', 0.5),
+                omega=self.config.get('gxpo_omega', 0.1),
+                shutoff_mode=self.config.get('gxpo_shutoff_mode', 'trajectory_aware'),
+            )
+            self._gxpo_diag_freq = int(self.config.get('gxpo_diag_freq', 10))
 
     def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -158,13 +185,17 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
-    def _optimizer_step(self):
+    def _clip_grads(self):
         assert self.config.grad_clip is not None
 
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
+        return grad_norm
+
+    def _optimizer_step(self):
+        grad_norm = self._clip_grads()
         self.actor_optimizer.step()
         return grad_norm
 
@@ -285,12 +316,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
-    def update_policy(self, data: DataProto):
-        # make sure we are in training mode
-        self.actor_module.train()
-
-        temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
-
+    def _make_minibatch_iterator(self, data: DataProto):
+        """Select PPO keys and split the batch into mini-batches (shared by all update paths)."""
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
@@ -304,90 +331,368 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys = ['multi_modal_inputs']
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
+            non_tensor_select_keys = None
             dataloader = batch.split(self.config.ppo_mini_batch_size)
+        return dataloader, has_multi_modal_inputs, select_keys, non_tensor_select_keys
+
+    def _backward_minibatch(self,
+                            mini_batch,
+                            temperature,
+                            has_multi_modal_inputs,
+                            select_keys,
+                            non_tensor_select_keys=None,
+                            recompute_old_log_probs=False):
+        """Zero grads and run one full forward/backward over a PPO mini-batch.
+
+        Counts as exactly one backward pass (gradient accumulation over
+        micro-batches). Does NOT clip or step the optimizer. When
+        `recompute_old_log_probs`, old_log_probs are refreshed under no_grad at
+        the current parameters (GXPO probe/correction passes).
+        """
+        # split batch into micro_batches
+        if has_multi_modal_inputs:
+            self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+            num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+            micro_batches = mini_batch.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+        elif self.config.use_dynamic_bsz:
+            max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
+            micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+        else:
+            self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+            # split batch into micro_batches
+            micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+
+        self.actor_optimizer.zero_grad()
+        metrics = {}
+
+        for data in micro_batches:
+            # Support all hardwares
+            if isinstance(data, DataProto):
+                data = {**data.batch.to(torch.cuda.current_device()), **data.non_tensor_batch}
+            else:
+                data = data.to(torch.cuda.current_device())  # actor device is cpu when using offload
+            responses = data['responses']
+            response_length = responses.size(1)
+            attention_mask = data['attention_mask']
+            response_mask = attention_mask[:, -response_length:]
+            if recompute_old_log_probs:
+                with torch.no_grad():
+                    _, old_log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+            else:
+                old_log_prob = data['old_log_probs']
+            advantages = data['advantages']
+
+            clip_ratio = self.config.clip_ratio
+            entropy_coeff = self.config.entropy_coeff
+
+            # all return: (bsz, response_length)
+            entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+
+            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
+                                                                          log_prob=log_prob,
+                                                                          advantages=advantages,
+                                                                          eos_mask=response_mask,
+                                                                          cliprange=clip_ratio)
+            # compute entropy loss from entropy
+            entropy_loss = verl_F.masked_mean(entropy, response_mask)
+
+            # compute policy loss
+            policy_loss = pg_loss - entropy_loss * entropy_coeff
+
+            if self.config.use_kl_loss:
+                ref_log_prob = data['ref_log_prob']
+                # compute kl loss
+                kld = core_algos.kl_penalty(logprob=log_prob,
+                                            ref_logprob=ref_log_prob,
+                                            kl_penalty=self.config.kl_loss_type)
+                kl_loss = masked_mean(kld, response_mask)
+
+                policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
+                metrics['actor/kl_loss'] = kl_loss.detach().item()
+                metrics['actor/kl_coef'] = self.config.kl_loss_coef
+
+            if self.config.use_dynamic_bsz:
+                # relative to the dynamic bsz
+                loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+            else:
+                loss = policy_loss / self.gradient_accumulation
+            loss.backward()
+
+            micro_metrics = {
+                'actor/entropy_loss': entropy_loss.detach().item(),
+                'actor/pg_loss': pg_loss.detach().item(),
+                'actor/pg_clipfrac': pg_clipfrac.detach().item(),
+                'actor/ppo_kl': ppo_kl.detach().item(),
+            }
+            append_to_dict(metrics, micro_metrics)
+
+        self.cumulative_bp += 1
+        return metrics
+
+    def update_policy(self, data: DataProto):
+        # make sure we are in training mode
+        self.actor_module.train()
+
+        temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
+        dataloader, has_multi_modal_inputs, select_keys, non_tensor_select_keys = self._make_minibatch_iterator(data)
 
         metrics = {}
-        # print('batch_size: ', data.batch.batch_size[0])
-        # print('num_mini_batches: ', self.config.ppo_mini_batch_size)
-        # print('gradient_accumulation: ', self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu)
         for epoch in range(self.config.ppo_epochs):
-            for batch_idx, data in enumerate(dataloader):
-                # split batch into micro_batches
-                mini_batch = data
-                if has_multi_modal_inputs:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
-                    micro_batches = data.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
-                elif self.config.use_dynamic_bsz:
-                    max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
-                else:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    # split batch into micro_batches
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-
-                self.actor_optimizer.zero_grad()
-
-                for data in micro_batches:
-                    # Support all hardwares
-                    if isinstance(data, DataProto):
-                        data = {**data.batch.to(torch.cuda.current_device()), **data.non_tensor_batch}
-                    else:
-                        data = data.to(torch.cuda.current_device())  # actor device is cpu when using offload
-                    responses = data['responses']
-                    response_length = responses.size(1)
-                    attention_mask = data['attention_mask']
-                    response_mask = attention_mask[:, -response_length:]
-                    old_log_prob = data['old_log_probs']
-                    advantages = data['advantages']
-
-                    clip_ratio = self.config.clip_ratio
-                    entropy_coeff = self.config.entropy_coeff
-
-                    # all return: (bsz, response_length)
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
-
-                    pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                                  log_prob=log_prob,
-                                                                                  advantages=advantages,
-                                                                                  eos_mask=response_mask,
-                                                                                  cliprange=clip_ratio)
-                    # compute entropy loss from entropy
-                    entropy_loss = verl_F.masked_mean(entropy, response_mask)
-
-                    # compute policy loss
-                    policy_loss = pg_loss - entropy_loss * entropy_coeff
-
-                    if self.config.use_kl_loss:
-                        ref_log_prob = data['ref_log_prob']
-                        # compute kl loss
-                        kld = core_algos.kl_penalty(logprob=log_prob,
-                                                    ref_logprob=ref_log_prob,
-                                                    kl_penalty=self.config.kl_loss_type)
-                        kl_loss = masked_mean(kld, response_mask)
-
-                        policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                        metrics['actor/kl_loss'] = kl_loss.detach().item()
-                        metrics['actor/kl_coef'] = self.config.kl_loss_coef
-
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
-                    else:
-                        loss = policy_loss / self.gradient_accumulation
-                    loss.backward()
-
-                    data = {
-                        'actor/entropy_loss': entropy_loss.detach().item(),
-                        'actor/pg_loss': pg_loss.detach().item(),
-                        'actor/pg_clipfrac': pg_clipfrac.detach().item(),
-                        'actor/ppo_kl': ppo_kl.detach().item(),
-                    }
-                    append_to_dict(metrics, data)
+            for batch_idx, mini_batch in enumerate(dataloader):
+                mb_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                                      non_tensor_select_keys)
+                _merge_metrics(metrics, mb_metrics)
 
                 print('>>> Weight update!!!')
                 grad_norm = self._optimizer_step()
-                data = {'actor/grad_norm': grad_norm.detach().item()}
-            append_to_dict(metrics, data)
+                append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
+        metrics['actor/cumulative_bp'] = self.cumulative_bp
+        self.actor_optimizer.zero_grad()
+        return metrics
+
+    # ------------------------------------------------------------------
+    # GXPO: Gradient Extrapolation-Based Policy Optimization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _gxpo_default_metrics(enabled: float = 0.0, z_score: float = 0.0) -> dict:
+        return {
+            'actor/gxpo_enabled': enabled,
+            'actor/gxpo_trigger_z': z_score,
+            'actor/gxpo_trigger_stat': 0.0,
+            'actor/gxpo_g0_norm': 0.0,
+            'actor/gxpo_g1_norm': 0.0,
+            'actor/gxpo_gslow_norm': 0.0,
+            'actor/gxpo_r_mean': 0.0,
+            'actor/gxpo_r_std': 0.0,
+            'actor/gxpo_scale_mean': 0.0,
+            'actor/gxpo_scale_max': 0.0,
+            'actor/gxpo_disp2_norm': 0.0,
+            'actor/gxpo_dispK_norm': 0.0,
+            'actor/gxpo_dispK_over_disp2': 0.0,
+            'actor/gxpo_cos_g0_g1': 0.0,
+            'actor/gxpo_cos_g0_gslow': 0.0,
+            'actor/gxpo_inactive_frac': 0.0,
+        }
+
+    def _gxpo_init_buffers(self):
+        if self._gxpo_bufs is not None:
+            return
+        self._gxpo_params = [p for p in self.actor_module.parameters() if p.requires_grad]
+        self._gxpo_bufs = {
+            name: [torch.empty_like(p) for p in self._gxpo_params] for name in ('theta0', 'g0', 'g1')
+        }
+
+    def _gxpo_capture_grads(self, bufs):
+        for p, buf in zip(self._gxpo_params, bufs):
+            if p.grad is None:
+                buf.zero_()
+            else:
+                buf.copy_(p.grad)
+
+    def _gxpo_restore_theta0(self):
+        with torch.no_grad():
+            for p, t0 in zip(self._gxpo_params, self._gxpo_bufs['theta0']):
+                p.data.copy_(t0)
+
+    def _gxpo_minibatch_step(self, mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                             non_tensor_select_keys):
+        """One GXPO 3-pass update on a single PPO mini-batch (Algorithm 1 of the paper).
+
+        Faithful port of gxpo_single_minibatch_update from the reference
+        implementation: probe passes capture g0/g1 post-clip, retention ratio
+        r = g1/g0_safe is clamped to [-2, 3], the geometric scale
+        S_K/S_2 is clamped to [1, K/2+1], and the slow correction is taken at
+        theta_tilde = theta0 + alpha * scale * (theta2 - theta0).
+        """
+        state = self.gxpo_state
+        step_idx = state.step_count
+        K, alpha, delta = state.K, state.alpha, state.delta
+        recompute_old = self.config.get('gxpo_recompute_old_log_probs', True)
+
+        def standard_step():
+            metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                               non_tensor_select_keys)
+            grad_norm = self._optimizer_step()
+            append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
+            append_to_dict(metrics, self._gxpo_default_metrics(enabled=0.0))
+            state.step_count = step_idx + 1
+            return metrics
+
+        if not state.is_enabled(step_idx):
+            return standard_step()
+
+        self._gxpo_init_buffers()
+        params = self._gxpo_params
+        theta0, g0_bufs, g1_bufs = (self._gxpo_bufs[k] for k in ('theta0', 'g0', 'g1'))
+
+        with torch.no_grad():
+            for p, t0 in zip(params, theta0):
+                t0.copy_(p.data)
+
+        def fallback():
+            # ponytail: light fallback — restore theta0 only; probe-step optimizer-moment
+            # pollution is accepted (rare non-finite event), no optimizer-state deepcopy
+            self._gxpo_restore_theta0()
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            return standard_step()
+
+        # Pass 1: g0 at theta0
+        self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                 non_tensor_select_keys)
+        gn0 = self._clip_grads().detach().item()
+        if not (gn0 == gn0 and abs(gn0) != float('inf')) or gn0 <= 1e-8:
+            return fallback()
+        self._gxpo_capture_grads(g0_bufs)
+        self.actor_optimizer.step()
+
+        # Pass 2: g1 at theta_{t,1}
+        self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                 non_tensor_select_keys, recompute_old_log_probs=recompute_old)
+        gn1 = self._clip_grads().detach().item()
+        if not (gn1 == gn1 and abs(gn1) != float('inf')):
+            return fallback()
+        self._gxpo_capture_grads(g1_bufs)
+        self.actor_optimizer.step()
+
+        # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
+        device = theta0[0].device
+        # stats layout: [g0_sq, g1_sq, dot_g0_g1, disp2_sq, dispK_sq, sum_r, sum_r_sq,
+        #                n_active, n_total, scale_sum, errK_sq, dot_ce, closed_sq, explicit_sq]
+        stats = torch.zeros(14, dtype=torch.float64, device=device)
+        scale_max = torch.zeros(1, dtype=torch.float64, device=device)
+        do_diag = self._gxpo_diag_freq > 0 and (step_idx % self._gxpo_diag_freq == 0)
+
+        with torch.no_grad():
+            for p, t0, g0b, g1b in zip(params, theta0, g0_bufs, g1_bufs):
+                stats[0] += g0b.double().pow(2).sum()
+                stats[1] += g1b.double().pow(2).sum()
+                stats[2] += (g0b.double() * g1b.double()).sum()
+                stats[7] += (g0b.abs() > delta).sum()
+                stats[8] += g0b.numel()
+
+                sgn = torch.where(g0b >= 0, 1.0, -1.0)
+                r = g1b / (g0b.abs().clamp(min=delta) * sgn)
+                r.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
+                stats[5] += r.double().sum()
+                stats[6] += r.double().pow(2).sum()
+
+                one_minus_r = 1.0 - r
+                s_k = (1.0 - r.pow(K)) / (one_minus_r + delta)
+                s_2 = (1.0 - r * r) / (one_minus_r + delta)
+                scale = (s_k / (s_2 + delta)).clamp_(1.0, K / 2.0 + 1.0)
+                stats[9] += scale.double().sum()
+                scale_max = torch.maximum(scale_max, scale.max().double().reshape(1))
+
+                disp2 = p.data - t0
+                stats[3] += disp2.double().pow(2).sum()
+
+                if do_diag:
+                    # Table 6: closed-form S_K/S_2 vs explicit Horner sums
+                    s_expl = torch.ones_like(r)
+                    for _ in range(K - 1):
+                        s_expl.mul_(r).add_(1.0)
+                    s2_expl = 1.0 + r
+                    scale_expl = torch.where(s2_expl.abs() > delta, s_expl / s2_expl, scale)
+                    d_closed = disp2 * scale
+                    d_expl = disp2 * scale_expl
+                    stats[10] += (d_closed - d_expl).double().pow(2).sum()
+                    stats[11] += (d_closed.double() * d_expl.double()).sum()
+                    stats[12] += d_closed.double().pow(2).sum()
+                    stats[13] += d_expl.double().pow(2).sum()
+
+                dispK = disp2.mul_(scale)  # disp2 buffer becomes dispK
+                stats[4] += dispK.double().pow(2).sum()
+                p.data.copy_(dispK.mul_(alpha).add_(t0))
+
+        # Pass 3: slow correction at theta_tilde
+        pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                                 non_tensor_select_keys, recompute_old_log_probs=recompute_old)
+        gn_slow = self._clip_grads().detach().item()
+        if not (gn_slow == gn_slow and abs(gn_slow) != float('inf')):
+            return fallback()
+
+        gslow_stats = torch.zeros(2, dtype=torch.float64, device=device)
+        with torch.no_grad():
+            for p, g0b in zip(params, g0_bufs):
+                if p.grad is None:
+                    continue
+                gslow_stats[0] += p.grad.double().pow(2).sum()
+                gslow_stats[1] += (p.grad.double() * g0b.double()).sum()
+        self.actor_optimizer.step()
+
+        # single global reduction so every rank takes the identical gate decision
+        if torch.distributed.is_initialized():
+            full = torch.cat([stats, gslow_stats])
+            torch.distributed.all_reduce(full, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(scale_max, op=torch.distributed.ReduceOp.MAX)
+            stats, gslow_stats = full[:14], full[14:]
+
+        vals = torch.cat([stats, gslow_stats, scale_max]).tolist()
+        (g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq, n_active, n_total, scale_sum,
+         errK_sq, dot_ce, closed_sq, explicit_sq, gslow_sq, dot0slow, scale_mx) = vals
+
+        eps = 1e-12
+        g0_norm, g1_norm, gslow_norm = g0_sq**0.5, g1_sq**0.5, gslow_sq**0.5
+        r_mean = sum_r / max(n_total, 1.0)
+        r_var = max(sum_r_sq / max(n_total, 1.0) - r_mean**2, 0.0)
+        disp2_norm, dispK_norm = disp2_sq**0.5, dispK_sq**0.5
+
+        z_score, trigger_stat, triggered = state.update_trigger_state(step=step_idx,
+                                                                      g0_norm=g0_norm,
+                                                                      g_slow_norm=gslow_norm)
+        state.step_count = step_idx + 1
+
+        metrics = pass3_metrics
+        append_to_dict(metrics, {'actor/grad_norm': float(gn_slow)})
+        append_to_dict(metrics, {
+            'actor/gxpo_enabled': 1.0,
+            'actor/gxpo_trigger_z': float(z_score),
+            'actor/gxpo_trigger_stat': float(trigger_stat),
+            'actor/gxpo_g0_norm': g0_norm,
+            'actor/gxpo_g1_norm': g1_norm,
+            'actor/gxpo_gslow_norm': gslow_norm,
+            'actor/gxpo_r_mean': r_mean,
+            'actor/gxpo_r_std': r_var**0.5,
+            'actor/gxpo_scale_mean': scale_sum / max(n_total, 1.0),
+            'actor/gxpo_scale_max': scale_mx,
+            'actor/gxpo_disp2_norm': disp2_norm,
+            'actor/gxpo_dispK_norm': dispK_norm,
+            'actor/gxpo_dispK_over_disp2': dispK_norm / (disp2_norm + eps),
+            'actor/gxpo_cos_g0_g1': dot01 / (g0_norm * g1_norm + eps),
+            'actor/gxpo_cos_g0_gslow': dot0slow / (g0_norm * gslow_norm + eps),
+            'actor/gxpo_inactive_frac': 1.0 - n_active / max(n_total, 1.0),
+        })
+        if do_diag:
+            errK = errK_sq**0.5
+            append_to_dict(metrics, {
+                'actor/gxpo_diag_thetaK_abs_err': errK,
+                'actor/gxpo_diag_thetatilde_abs_err': alpha * errK,
+                'actor/gxpo_diag_disp_cosine_err':
+                    1.0 - dot_ce / (closed_sq**0.5 * explicit_sq**0.5 + eps),
+            })
+        if triggered:
+            print(f'[GXPO] shutoff triggered at minibatch step {step_idx}: '
+                  f'|z|={abs(z_score):.3f} >= tau={state.tau} -> single-pass GRPO from now on')
+        return metrics
+
+    def update_policy_gxpo(self, data: DataProto):
+        """GXPO actor update: 3-pass extrapolated step per mini-batch while the
+        shutoff gate is open, single-pass GRPO afterwards."""
+        assert self.gxpo_state is not None, 'update_policy_gxpo called without use_gxpo=True'
+        self.actor_module.train()
+
+        temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
+        dataloader, has_multi_modal_inputs, select_keys, non_tensor_select_keys = self._make_minibatch_iterator(data)
+
+        metrics = {}
+        for epoch in range(self.config.ppo_epochs):
+            for mini_batch in dataloader:
+                mb_metrics = self._gxpo_minibatch_step(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                                       non_tensor_select_keys)
+                _merge_metrics(metrics, mb_metrics)
+        metrics['actor/cumulative_bp'] = self.cumulative_bp
+        if self.gxpo_state.trigger_index != float('inf'):
+            metrics['actor/gxpo_shutoff_step'] = float(self.gxpo_state.trigger_index)
         self.actor_optimizer.zero_grad()
         return metrics

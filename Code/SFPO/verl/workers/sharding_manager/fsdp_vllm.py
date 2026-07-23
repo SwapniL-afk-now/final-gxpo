@@ -28,6 +28,8 @@ from verl.protocol import all_gather_data_proto
 from verl.utils.debug import log_gpu_memory_usage
 from verl.third_party.vllm import vllm_version
 
+from verl.utils.lora_utils import merge_lora_state_dict
+
 from .base import BaseShardingManager
 
 logger = logging.getLogger(__file__)
@@ -58,6 +60,12 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                                      state_dict_type=StateDictType.SHARDED_STATE_DICT,
                                      state_dict_config=ShardedStateDictConfig())
 
+        # LoRA: read the adapter scaling (alpha/r) from the live peft module once;
+        # None means the actor is not LoRA-wrapped and sync passes weights through untouched
+        self.lora_scaling = next((m.scaling['default']
+                                  for m in module.modules()
+                                  if isinstance(getattr(m, 'scaling', None), dict) and 'default' in m.scaling), None)
+
         self.tp_size = vllm_ps.get_tensor_model_parallel_world_size()
         self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
 
@@ -84,6 +92,8 @@ class FSDPVLLMShardingManager(BaseShardingManager):
 
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
+        if self.lora_scaling is not None:
+            params = merge_lora_state_dict(params, self.lora_scaling)
         log_gpu_memory_usage('After state_dict() in sharding manager memory', logger=logger)
         # Copy, not share memory
         load_format = 'hf' if self.full_params else 'dtensor'

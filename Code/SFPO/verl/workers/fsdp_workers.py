@@ -223,6 +223,27 @@ class ActorRolloutRefWorker(Worker):
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+
+            # LoRA (paper protocol: rank 128, alpha 256 on q/k/v/o attention projections)
+            lora_rank = int(self.config.model.get('lora_rank', 0))
+            if role == 'actor' and lora_rank > 0:
+                from peft import LoraConfig, get_peft_model
+                lora_config = LoraConfig(task_type='CAUSAL_LM',
+                                         r=lora_rank,
+                                         lora_alpha=self.config.model.get('lora_alpha', 32),
+                                         target_modules=list(
+                                             self.config.model.get('target_modules',
+                                                                   ['q_proj', 'k_proj', 'v_proj', 'o_proj'])),
+                                         bias='none')
+                actor_module = get_peft_model(actor_module, lora_config)
+                actor_module.to(torch_dtype)
+                if enable_gradient_checkpointing:
+                    # frozen embeddings + checkpointing need grad-requiring inputs
+                    actor_module.enable_input_require_grads()
+                self._is_lora = True
+                self._lora_config = lora_config
+                if self.rank == 0:
+                    actor_module.print_trainable_parameters()
         torch.distributed.barrier()
 
         if self.rank == 0:
@@ -243,7 +264,9 @@ class ActorRolloutRefWorker(Worker):
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None))
+        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module,
+                                                config=fsdp_config.get('wrap_policy', None),
+                                                is_lora=role == 'actor' and getattr(self, '_is_lora', False))
 
         if self._is_rollout and self.config.rollout.name == 'hf':
             # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
@@ -276,7 +299,7 @@ class ActorRolloutRefWorker(Worker):
         # TODO: add more optimizer args into config
         if role == 'actor' and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup
-            actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
+            actor_optimizer = optim.AdamW(filter(lambda p: p.requires_grad, actor_module_fsdp.parameters()),
                                           lr=optim_config.lr,
                                           betas=optim_config.get('betas', (0.9, 0.999)),
                                           weight_decay=optim_config.get('weight_decay', 1e-2))
@@ -465,11 +488,56 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def lookahead_update_actor(self, data: DataProto):
+    def gxpo_update_actor(self, data: DataProto):
+        # Support all hardwares
+        data = data.to(torch.cuda.current_device())
+
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+
+        log_gpu_memory_usage('Before gxpo update policy', logger=logger)
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            # perform training
+            with Timer(name='update_policy', logger=None) as timer:
+                metrics = self.actor.update_policy_gxpo(data=data)
+            delta_time = timer.last
+            global_num_tokens = data.meta_info['global_token_num']
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics[
+                'perf/mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            metrics['perf/max_memory_allocated_gb'] = torch.cuda.max_memory_allocated() / (1024**3)
+            metrics['perf/max_memory_reserved_gb'] = torch.cuda.max_memory_reserved() / (1024**3)
+            metrics['perf/cpu_memory_used_gb'] = psutil.virtual_memory().used / (1024**3)
+
+            self.actor_lr_scheduler.step()
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics['actor/lr'] = lr
+
+            log_gpu_memory_usage('After gxpo update policy', logger=logger)
+
+            output = DataProto(meta_info={'metrics': metrics})
+
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            output = output.to('cpu')
+
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def sfpo_update_actor(self, data: DataProto):
         # Support all hardwares
         self.training_step += 1
-        num_inner_steps = self.config.actor.lookahead_inner_steps
-        step_size = self.config.actor.lookahead_step_size
+        num_inner_steps = self.config.actor.get('sfpo_inner_steps', self.config.actor.get('lookahead_inner_steps', 3))
+        step_size = self.config.actor.get('sfpo_step_size', self.config.actor.get('lookahead_step_size', 0.8))
         data = data.to(torch.cuda.current_device())
 
         print("*********************************************")
