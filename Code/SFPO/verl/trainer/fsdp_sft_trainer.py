@@ -103,6 +103,21 @@ class FSDPSFTTrainer(object):
         # build model
         self._build_model_optimizer()
 
+        # GXPO-style update on the supervised objective: shutoff gate + lazily allocated
+        # per-parameter buffers. Absent `optim.use_gxpo` keeps the plain 1-pass SFT path.
+        self.gxpo_state = None
+        self._gxpo_bufs = None
+        if self.config.optim.get('use_gxpo', False):
+            from verl.workers.actor.gxpo_state import GXPOState
+            self.gxpo_state = GXPOState(
+                K=self.config.optim.get('gxpo_k', 5),
+                alpha=self.config.optim.get('gxpo_alpha', 0.5),
+                delta=self.config.optim.get('gxpo_delta', 1e-8),
+                tau=self.config.optim.get('gxpo_tau', 0.5),
+                omega=self.config.optim.get('gxpo_omega', 0.1),
+                shutoff_mode=self.config.optim.get('gxpo_shutoff_mode', 'trajectory_aware'),
+            )
+
         # TODO: add checkpoint manager
         if self.device_mesh.get_rank() == 0:
             print(self.config)
@@ -154,10 +169,13 @@ class FSDPSFTTrainer(object):
         if self.device_mesh.get_rank() == 0:
             print(f'Using FSDP rank {rank} and size {world_size} for data distribution')
 
+        # trainer.seed was declared in the config but never reached the sampler, so the
+        # shuffle order was always DistributedSampler's default seed=0 regardless of it.
         self.train_sampler = DistributedSampler(self.train_dataset,
                                                 shuffle=True,
                                                 num_replicas=world_size,
                                                 rank=rank,
+                                                seed=config.trainer.get('seed', 0),
                                                 drop_last=True)
         self.train_dataloader = DataLoader(dataset=self.train_dataset,
                                            batch_size=config.data.train_batch_size,
@@ -382,29 +400,39 @@ class FSDPSFTTrainer(object):
                     loss.backward()
                 return loss
 
-    def training_step(self, batch: TensorDict):
-        self.fsdp_model.train()
+    def _accumulate_and_clip(self, batch: TensorDict):
+        """One full gradient pass over `batch`: zero_grad, accumulate micro-batches, clip.
 
-        log_gpu_memory_usage('Before optimizer zero_grad', logger=logger)
-
+        Returns (step_loss, grad_norm). Leaves grads populated so the caller decides whether
+        to capture them, step, or discard. `_compute_loss_and_backward` pops 'loss_mask' from
+        the micro-batch it is handed, so the split is redone here on every pass -- GXPO runs
+        this three times over the same batch.
+        """
         self.optimizer.zero_grad()
-
-        log_gpu_memory_usage('After optimizer zero_grad', logger=logger)
 
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
         for micro_batch in micro_batches:
-            loss = self._compute_loss_and_backward(batch=micro_batch) / n_micro_batches
+            loss = self._compute_loss_and_backward(batch=micro_batch.clone(recurse=False)) / n_micro_batches
             step_loss += loss.item()
 
-        self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+        grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+        return step_loss, grad_norm
 
-        log_gpu_memory_usage('Before optimizer step', logger=logger)
+    def training_step(self, batch: TensorDict):
+        self.fsdp_model.train()
 
-        self.optimizer.step()
+        log_gpu_memory_usage('Before optimizer zero_grad', logger=logger)
 
-        log_gpu_memory_usage('After optimizer step', logger=logger)
+        if self.gxpo_state is not None:
+            step_loss, metrics = self._gxpo_training_step(batch)
+        else:
+            step_loss, grad_norm = self._accumulate_and_clip(batch)
+            log_gpu_memory_usage('Before optimizer step', logger=logger)
+            self.optimizer.step()
+            log_gpu_memory_usage('After optimizer step', logger=logger)
+            metrics = {'train/grad_norm': grad_norm.detach().item(), 'train/gxpo_enabled': 0.0}
 
         self.lr_scheduler.step()
 
@@ -415,7 +443,156 @@ class FSDPSFTTrainer(object):
 
         step_loss = torch.tensor(step_loss).cuda()
         torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
-        return {'train/loss': step_loss.detach().item(), 'train/lr(1e-3)': lr * 1e3}
+        return {'train/loss': step_loss.detach().item(), 'train/lr(1e-3)': lr * 1e3, **metrics}
+
+    def _gxpo_capture_grads(self, bufs):
+        for p, buf in zip(self._gxpo_params, bufs):
+            if p.grad is None:
+                buf.zero_()
+            else:
+                buf.copy_(p.grad)
+
+    def _gxpo_training_step(self, batch: TensorDict):
+        """GXPO 3-pass update on a supervised (cross-entropy) objective.
+
+        Same geometry as the RL version (`dp_actor._gxpo_minibatch_step`) but with no
+        importance ratio and no advantages: the identical CE loss is simply re-evaluated at
+        theta0, theta1 and theta_tilde. Probe g0 at theta0 -> step -> probe g1 at theta1 ->
+        step (theta2 is live) -> reposition to theta0 + alpha*scale*(theta2-theta0) -> slow
+        correction. Falls back to a single standard step once the shutoff gate trips.
+        """
+        state = self.gxpo_state
+        step_idx = state.step_count
+        K, alpha, delta = state.K, state.alpha, state.delta
+
+        def standard_step():
+            step_loss, grad_norm = self._accumulate_and_clip(batch)
+            self.optimizer.step()
+            state.step_count = step_idx + 1
+            return step_loss, {'train/grad_norm': grad_norm.detach().item(), 'train/gxpo_enabled': 0.0}
+
+        if not state.is_enabled(step_idx):
+            return standard_step()
+
+        if self._gxpo_bufs is None:
+            self._gxpo_params = [p for p in self.fsdp_model.parameters() if p.requires_grad]
+            self._gxpo_bufs = {n: [torch.empty_like(p) for p in self._gxpo_params] for n in ('theta0', 'g0', 'g1')}
+        params = self._gxpo_params
+        theta0, g0_bufs, g1_bufs = (self._gxpo_bufs[k] for k in ('theta0', 'g0', 'g1'))
+
+        with torch.no_grad():
+            for p, t0 in zip(params, theta0):
+                t0.copy_(p.data)
+
+        def finite(x):
+            return x == x and abs(x) != float('inf')
+
+        def fallback():
+            with torch.no_grad():
+                for p, t0 in zip(params, theta0):
+                    p.data.copy_(t0)
+            self.optimizer.zero_grad(set_to_none=True)
+            return standard_step()
+
+        # Pass 1: g0 at theta0
+        _, gn0 = self._accumulate_and_clip(batch)
+        gn0 = gn0.detach().item()
+        if not finite(gn0) or gn0 <= 1e-8:
+            return fallback()
+        self._gxpo_capture_grads(g0_bufs)
+        self.optimizer.step()
+
+        # Pass 2: g1 at theta_1
+        _, gn1 = self._accumulate_and_clip(batch)
+        gn1 = gn1.detach().item()
+        if not finite(gn1):
+            return fallback()
+        self._gxpo_capture_grads(g1_bufs)
+        self.optimizer.step()
+
+        # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
+        device = theta0[0].device
+        # stats: [g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq, n_total, scale_sum]
+        stats = torch.zeros(9, dtype=torch.float64, device=device)
+        with torch.no_grad():
+            for p, t0, g0b, g1b in zip(params, theta0, g0_bufs, g1_bufs):
+                stats[0] += g0b.double().pow(2).sum()
+                stats[1] += g1b.double().pow(2).sum()
+                stats[2] += (g0b.double() * g1b.double()).sum()
+                stats[7] += g0b.numel()
+
+                sgn = torch.where(g0b >= 0, 1.0, -1.0)
+                r = g1b / (g0b.abs().clamp(min=delta) * sgn)
+                r.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
+                stats[5] += r.double().sum()
+                stats[6] += r.double().pow(2).sum()
+
+                one_minus_r = 1.0 - r
+                s_k = (1.0 - r.pow(K)) / (one_minus_r + delta)
+                s_2 = (1.0 - r * r) / (one_minus_r + delta)
+                scale = (s_k / (s_2 + delta)).clamp_(1.0, K / 2.0 + 1.0)
+                stats[8] += scale.double().sum()
+
+                disp2 = p.data - t0
+                stats[3] += disp2.double().pow(2).sum()
+                dispK = disp2.mul_(scale)  # disp2 buffer becomes dispK
+                stats[4] += dispK.double().pow(2).sum()
+                p.data.copy_(dispK.mul_(alpha).add_(t0))
+
+        # Pass 3: slow correction at theta_tilde
+        step_loss, gn_slow = self._accumulate_and_clip(batch)
+        gn_slow = gn_slow.detach().item()
+        if not finite(gn_slow):
+            return fallback()
+
+        gslow_sq = torch.zeros(1, dtype=torch.float64, device=device)
+        with torch.no_grad():
+            for p in params:
+                if p.grad is not None:
+                    gslow_sq += p.grad.double().pow(2).sum()
+        self.optimizer.step()
+
+        if torch.distributed.is_initialized():
+            full = torch.cat([stats, gslow_sq])
+            torch.distributed.all_reduce(full, op=torch.distributed.ReduceOp.SUM)
+            stats, gslow_sq = full[:9], full[9:]
+
+        (g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq, n_total,
+         scale_sum) = stats.tolist()
+        gslow_sq = gslow_sq.item()
+
+        eps = 1e-12
+        g0_norm, g1_norm, gslow_norm = g0_sq**0.5, g1_sq**0.5, gslow_sq**0.5
+        r_mean = sum_r / max(n_total, 1.0)
+        r_var = max(sum_r_sq / max(n_total, 1.0) - r_mean**2, 0.0)
+        disp2_norm, dispK_norm = disp2_sq**0.5, dispK_sq**0.5
+
+        z_score, trigger_stat, triggered = state.update_trigger_state(step=step_idx,
+                                                                      g0_norm=g0_norm,
+                                                                      g_slow_norm=gslow_norm)
+        state.step_count = step_idx + 1
+
+        if triggered:
+            print(f'[GXPO-SFT] shutoff triggered at step {step_idx}: '
+                  f'|z|={abs(z_score):.3f} >= tau={state.tau} -> single-pass SFT from now on')
+
+        # metric names mirror the RL arm so the two runs can be plotted together
+        return step_loss, {
+            'train/grad_norm': float(gn_slow),
+            'train/gxpo_enabled': 1.0,
+            'train/gxpo_trigger_z': float(z_score),
+            'train/gxpo_trigger_stat': float(trigger_stat),
+            'train/gxpo_g0_norm': g0_norm,
+            'train/gxpo_g1_norm': g1_norm,
+            'train/gxpo_gslow_norm': gslow_norm,
+            'train/gxpo_r_mean': r_mean,
+            'train/gxpo_r_std': r_var**0.5,
+            'train/gxpo_scale_mean': scale_sum / max(n_total, 1.0),
+            'train/gxpo_disp2_norm': disp2_norm,
+            'train/gxpo_dispK_norm': dispK_norm,
+            'train/gxpo_dispK_over_disp2': dispK_norm / (disp2_norm + eps),
+            'train/gxpo_cos_g0_g1': dot01 / (g0_norm * g1_norm + eps),
+        }
 
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
@@ -440,6 +617,21 @@ class FSDPSFTTrainer(object):
             if self.config.trainer.default_hdfs_dir:
                 hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
+        torch.distributed.barrier()
+
+    def _run_validation(self, tracking, global_step, rank):
+        """Mean val loss, logged as val/loss. `trainer.val_max_batches` caps the number of
+        val batches so a periodic eval over a large test split stays affordable."""
+        max_batches = self.config.trainer.get('val_max_batches', 0)
+        val_losses = []
+        for i, val_data in enumerate(self.val_dataloader):
+            if max_batches and i >= max_batches:
+                break
+            val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
+            val_losses.append(self.validation_step(val_data))
+        if rank == 0:
+            avg_val_loss = torch.mean(torch.stack(val_losses))
+            tracking.log(data={'val/loss': avg_val_loss.detach().item()}, step=global_step)
         torch.distributed.barrier()
 
     def fit(self):
@@ -475,35 +667,26 @@ class FSDPSFTTrainer(object):
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
 
+                # periodic validation / checkpointing (the defaults keep the old
+                # validate-and-save-at-epoch-end-only behaviour)
+                test_freq = self.config.trainer.get('test_freq', 0)
+                save_freq = self.config.trainer.get('save_freq', 0)
+                if test_freq > 0 and global_step % test_freq == 0 and global_step < self.total_training_steps:
+                    self._run_validation(tracking, global_step, rank)
+                if save_freq > 0 and global_step % save_freq == 0 and global_step < self.total_training_steps:
+                    self.save_checkpoint(step=global_step)
+
                 # for early exit validation
                 if global_step >= self.total_training_steps:
                     # Perform final validation
-                    val_losses = []
-                    for val_data in self.val_dataloader:
-                        val_data = TensorDict(val_data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                        val_loss = self.validation_step(val_data)
-                        val_losses.append(val_loss)
-                    if rank == 0:
-                        avg_val_loss = torch.mean(torch.stack(val_losses))
-                        metric = {'val/loss': avg_val_loss.detach().item()}
-                        tracking.log(data=metric, step=global_step)
-                    torch.distributed.barrier()
+                    self._run_validation(tracking, global_step, rank)
 
                     # Save final checkpoint
                     self.save_checkpoint(step=global_step)
                     return
 
             # validation
-            val_losses = []
-            for data in self.val_dataloader:
-                data = TensorDict(data, batch_size=self.config.data.micro_batch_size_per_gpu).cuda()
-                val_loss = self.validation_step(data)
-                val_losses.append(val_loss)
-            if rank == 0:
-                val_loss = torch.mean(torch.stack(val_losses))
-                metric = {'val/loss': val_loss.detach().item()}
-                tracking.log(data=metric, step=global_step)
-            torch.distributed.barrier()
+            self._run_validation(tracking, global_step, rank)
 
             # save checkpoint
             self.save_checkpoint(step=global_step)

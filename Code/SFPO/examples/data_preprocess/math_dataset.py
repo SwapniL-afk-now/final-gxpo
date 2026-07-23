@@ -35,6 +35,11 @@ if __name__ == '__main__':
     parser.add_argument('--levels', default=None,
                         help="Comma-separated difficulty levels to keep, e.g. '3,4,5' for the "
                              "Hendrycks MATH Level 3-5 split. Default keeps all levels.")
+    parser.add_argument('--sft', action='store_true',
+                        help="Emit SFT-format columns (plain-string 'prompt' + 'response' holding "
+                             "the full worked solution) instead of the RL chat-list schema. The "
+                             "prompt string is identical either way, so SFT and RL runs see the "
+                             "same inputs after the chat template is applied.")
 
     args = parser.parse_args()
 
@@ -68,7 +73,10 @@ if __name__ == '__main__':
             solution = extract_solution(answer)
             data = {
                 "data_source": data_source,
-                "prompt": [{
+                # SFTDataset wraps this string in [{'role':'user',...}] and applies the chat
+                # template itself, so the plain string here yields the same tokens as the RL
+                # chat-list form below.
+                "prompt": question if args.sft else [{
                     "role": "user",
                     "content": question
                 }],
@@ -82,6 +90,9 @@ if __name__ == '__main__':
                     'index': idx
                 }
             }
+            if args.sft:
+                # the worked solution, which the RL path discards -- this is the SFT target
+                data['response'] = answer
             return data
 
         return process_fn
