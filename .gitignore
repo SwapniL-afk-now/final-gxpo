@@ -7,3 +7,9 @@ __pycache__/
 .ipynb_checkpoints/
 graphify-out/
 .DS_Store
+
+# training run artifacts (checkpoints, logs, wandb) - not for version control
+Code/SFPO/runs/
+Code/SFPO/outputs/
+Code/SFPO/wandb/
+*.out

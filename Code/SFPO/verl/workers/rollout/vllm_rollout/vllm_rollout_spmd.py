@@ -210,9 +210,21 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
+            sampling_params = self.sampling_params
+            # Multi-seed validation: give each repeated sample its own reproducible
+            # seed (base gen_seed offset by row index) so the val_kwargs.n copies of a
+            # prompt stay diverse (real pass@n) yet identical across re-runs of a seed.
+            gen_seed = prompts.meta_info.get('gen_seed', None)
+            if is_validate and gen_seed is not None:
+                from copy import deepcopy
+                sampling_params = []
+                for i in range(len(vllm_inputs)):
+                    sp = deepcopy(self.sampling_params)
+                    sp.seed = int(gen_seed) * 100003 + i
+                    sampling_params.append(sp)
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
+                sampling_params=sampling_params,
                 use_tqdm=False)
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable

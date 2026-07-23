@@ -51,7 +51,7 @@ class Tracking(object):
                     wandb_id = f.read().strip()
                 if wandb_id:
                     try:
-                        wandb.init(project=project_name, id=wandb_id, resume="allow", mode="offline")
+                        wandb.init(project=project_name, id=wandb_id, resume="allow", mode=os.environ.get("WANDB_MODE", "online"))
                         wandb_resume_flag = True
                         print("wandb resume success with id: ", wandb_id)
                     except:
@@ -59,7 +59,7 @@ class Tracking(object):
                 self.logger['wandb'] = wandb
 
             if not wandb_resume_flag:
-                wandb.init(project=project_name, name=experiment_name, config=config, mode="offline")
+                wandb.init(project=project_name, name=experiment_name, config=config, mode=os.environ.get("WANDB_MODE", "online"))
                 with open(wandb_id_file, "w") as f:
                     f.write(wandb.run.id)
                     self.logger['wandb'] = wandb

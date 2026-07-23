@@ -440,9 +440,12 @@ class RayPPOTrainer(object):
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
-            #get seed from current time
-            seed = int(time.time() * 1000) % (2**32)
-            train_dataloader_generator.manual_seed(seed)
+            # fixed seed if data.seed is set (reproducible / matched across runs), else time-based
+            seed = self.config.data.get('seed', None)
+            if seed is None:
+                seed = int(time.time() * 1000) % (2**32)
+            print(f'Train dataloader shuffle seed: {seed}')
+            train_dataloader_generator.manual_seed(int(seed))
 
             sampler = RandomSampler(data_source=self.train_dataset, generator=train_dataloader_generator)
         else:
@@ -521,6 +524,30 @@ class RayPPOTrainer(object):
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _validate(self):
+        """Run validation over one or more RNG seeds (trainer.validation_seeds).
+
+        For each seed logs per-source metrics as val/.../seed{S}, and reports
+        the mean and std across seeds as the canonical val/.../{source} keys.
+        """
+        seeds = self.config.trainer.get('validation_seeds', None)
+        if not seeds:
+            return self._validate_once(gen_seed=None)
+
+        per_seed = {s: self._validate_once(gen_seed=int(s)) for s in seeds}
+
+        merged = {}
+        # collect the set of metric names across seeds (they share the same keys)
+        keys = set().union(*[d.keys() for d in per_seed.values()])
+        for key in keys:
+            vals = [per_seed[s][key] for s in seeds if key in per_seed[s]]
+            for s in seeds:
+                if key in per_seed[s]:
+                    merged[f'{key}/seed{int(s)}'] = per_seed[s][key]
+            merged[key] = float(np.mean(vals))
+            merged[f'{key}/std'] = float(np.std(vals))
+        return merged
+
+    def _validate_once(self, gen_seed=None):
         reward_tensor_lst = []
         data_source_lst = []
 
@@ -565,6 +592,7 @@ class RayPPOTrainer(object):
                 'recompute_log_prob': False,
                 'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 'validate': True,
+                'gen_seed': gen_seed,
             }
             print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
 
@@ -627,6 +655,8 @@ class RayPPOTrainer(object):
             if val_n > 1 and len(correct) % val_n == 0:
                 per_prompt = correct.reshape(-1, val_n)
                 metric_dict[f'val/pass_at_{val_n}/{data_source}'] = float(per_prompt.max(axis=1).mean())
+                # avg@n: mean accuracy across the n samples, averaged over prompts
+                metric_dict[f'val/avg_at_{val_n}/{data_source}'] = float(per_prompt.mean(axis=1).mean())
         metric_dict['val/test_score/average'] = sum_acc / sum_count
         print(f'>>> Test: val/test_score/average: {sum_acc / sum_count}')
         print(metric_dict)
@@ -700,7 +730,20 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
-    def _save_checkpoint(self):
+    def _best_ckpt_score(self, val_metrics):
+        """Checkpoint-selection score: sum of avg@n and pass@n (seed-mean) over val sources."""
+        n = self.config.actor_rollout_ref.rollout.val_kwargs.n
+        tags = (f'/avg_at_{n}/', f'/pass_at_{n}/')
+        return float(sum(v for k, v in val_metrics.items()
+                         if any(t in k for t in tags) and '/seed' not in k and not k.endswith('/std')))
+
+    def _save_checkpoint(self, keep_only_best=False):
+        # keep_only_best: prune every existing global_step_* dir so at most one checkpoint (the best) survives
+        if keep_only_best:
+            import shutil, glob
+            for d in glob.glob(os.path.join(self.config.trainer.default_local_dir, 'global_step_*')):
+                if os.path.isdir(d):
+                    shutil.rmtree(d, ignore_errors=True)
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
                                                 f'global_step_{self.global_steps}')
@@ -1134,6 +1177,12 @@ class RayPPOTrainer(object):
                     log_avg_reward = log_reward_tensor.mean(dim=1).tolist()
                     correct_num = (batch.batch['reward'].view(-1, self.config.actor_rollout_ref.rollout.n) > 0.95).sum(dim=1)
 
+                    # training accuracy / pass metrics over the n rollouts per prompt
+                    _train_correct = (log_reward_tensor > 0.95).float()  # (num_prompts, n)
+                    metrics['train/avg_at_n'] = _train_correct.mean().item()        # mean accuracy across all samples
+                    metrics['train/pass_at_1'] = _train_correct.mean().item()       # == avg accuracy
+                    metrics['train/pass_at_n'] = _train_correct.max(dim=1)[0].mean().item()  # any-correct per prompt
+
                     reward_history.append((log_data_source, log_index_tensor, log_reward_tensor))
                     for i in range(len(log_index_tensor)):
                         data_full_reward[log_index_tensor[i].item()].append(log_reward_tensor[i])
@@ -1251,6 +1300,7 @@ class RayPPOTrainer(object):
                     self.entropy_container.append(float(actor_output_metrics['actor/entropy_loss']))
 
                     # validate
+                    did_validate = False
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
                         (is_last_step or  self.global_steps % self.config.trainer.test_freq == 0):
                         print('start validation...')
@@ -1259,11 +1309,23 @@ class RayPPOTrainer(object):
                             if is_last_step:
                                 last_val_metrics = val_metrics
                         metrics.update(val_metrics)
+                        did_validate = True
 
-                    if self.config.trainer.save_freq > 0 and ( is_last_step or \
-                            self.global_steps % self.config.trainer.save_freq == 0):
-                        with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
+                    # Save ONLY the single best checkpoint, selected by (avg@n + pass@n) on validation.
+                    if self.config.trainer.save_freq > 0 and did_validate:
+                        score = self._best_ckpt_score(val_metrics)
+                        metrics['val/best_ckpt_score'] = score
+                        if score > getattr(self, '_best_val_score', float('-inf')):
+                            print(f'[best-ckpt] step {self.global_steps}: new best score {score:.4f} '
+                                  f'(prev {getattr(self, "_best_val_score", float("-inf")):.4f}); saving')
+                            self._best_val_score = score
+                            self._best_val_step = self.global_steps
+                            with _timer('save_checkpoint', timing_raw):
+                                self._save_checkpoint(keep_only_best=True)
+                        else:
+                            print(f'[best-ckpt] step {self.global_steps}: score {score:.4f} <= '
+                                  f'best {self._best_val_score:.4f} (from step {self._best_val_step}); skip save')
+                        metrics['val/best_ckpt_step'] = getattr(self, '_best_val_step', 0)
 
                     # reward_metrics = compute_reward_metrics(batch, self.config)
 
