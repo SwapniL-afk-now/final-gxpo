@@ -277,6 +277,17 @@ class ActorRolloutRefWorker(Worker):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
+        # Muon orthogonalizes 2-D weights, but FSDP's sharded parameter views are flattened
+        # to 1-D (torch _flat_param.py:_use_sharded_views) -- which would put the entire
+        # model in Muon's AdamW fallback branch and silently turn a "muon" run into AdamW.
+        # NO_SHARD + use_orig_params is the only combination that hands back original shapes.
+        use_muon = (role == 'actor' and optim_config is not None and
+                    str(optim_config.get('name', 'adamw')).lower() == 'muon')
+        if use_muon:
+            assert self.world_size == 1, 'muon path requires single-GPU (NO_SHARD + use_orig_params)'
+            from torch.distributed.fsdp import ShardingStrategy
+            sharding_strategy = ShardingStrategy.NO_SHARD
+
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
         # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
@@ -285,7 +296,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module,
             cpu_offload=cpu_offload,
             param_init_fn=init_fn,
-            use_orig_params=False,
+            use_orig_params=use_muon,
             auto_wrap_policy=auto_wrap_policy,
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy,  # zero3
@@ -299,10 +310,14 @@ class ActorRolloutRefWorker(Worker):
         # TODO: add more optimizer args into config
         if role == 'actor' and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup
-            actor_optimizer = optim.AdamW(filter(lambda p: p.requires_grad, actor_module_fsdp.parameters()),
-                                          lr=optim_config.lr,
-                                          betas=optim_config.get('betas', (0.9, 0.999)),
-                                          weight_decay=optim_config.get('weight_decay', 1e-2))
+            if use_muon:
+                from verl.workers.muon import build_muon
+                actor_optimizer = build_muon(actor_module_fsdp, optim_config)
+            else:
+                actor_optimizer = optim.AdamW(filter(lambda p: p.requires_grad, actor_module_fsdp.parameters()),
+                                              lr=optim_config.lr,
+                                              betas=optim_config.get('betas', (0.9, 0.999)),
+                                              weight_decay=optim_config.get('weight_decay', 1e-2))
 
             total_steps = optim_config.get('total_training_steps', 0)
             num_warmup_steps = int(optim_config.get('lr_warmup_steps', -1))
