@@ -73,6 +73,12 @@ def main():
         outputs = llm.generate(flat_prompts, params, use_tqdm=True)
         texts = [o.outputs[0].text for o in outputs]
 
+        # Diagnostic: separate "wrong answer" from "no answer we could parse".
+        from verl.utils.reward_score.latex_math import extract_solution
+        noparse = sum(extract_solution(t) is None for t in texts) / len(texts)
+        truncated = sum(o.outputs[0].finish_reason == 'length' for o in outputs) / len(outputs)
+        print(f'  seed {gen_seed}: unparseable={noparse:.4f}  truncated={truncated:.4f}')
+
         # (num_prompts, n) score matrix
         correct = np.zeros((len(prompts), args.n))
         for i in range(len(prompts)):
@@ -81,16 +87,29 @@ def main():
                                                texts[i * args.n + j], ground_truths[i])
                 correct[i, j] = float(score) > 0.95
 
+        # pass@1 = unbiased single-sample success rate = mean over all n samples, so it is
+        # numerically the same quantity as avg@n; both are printed because the paper tables
+        # name them separately.
         avg_at_n = float(correct.mean())
+        pass_at_1 = avg_at_n
         pass_at_n = float(correct.max(axis=1).mean())
-        per_seed[gen_seed] = (avg_at_n, pass_at_n)
-        print(f'  seed {gen_seed}: avg@{args.n}={avg_at_n:.4f}  pass@{args.n}={pass_at_n:.4f}')
+        per_seed[gen_seed] = (pass_at_1, avg_at_n, pass_at_n)
+        print(f'  seed {gen_seed}: pass@1={pass_at_1:.4f}  avg@{args.n}={avg_at_n:.4f}  '
+              f'pass@{args.n}={pass_at_n:.4f}')
 
-    avgs = [v[0] for v in per_seed.values()]
-    passes = [v[1] for v in per_seed.values()]
-    print(f'\nmodel: {args.model}')
-    print(f'avg@{args.n}  mean={np.mean(avgs):.4f}  std={np.std(avgs):.4f}')
-    print(f'pass@{args.n} mean={np.mean(passes):.4f}  std={np.std(passes):.4f}')
+    p1 = [v[0] for v in per_seed.values()]
+    avgs = [v[1] for v in per_seed.values()]
+    passes = [v[2] for v in per_seed.values()]
+    print(f'\nmodel: {args.model}  data: {args.data}')
+    print(f'pass@1   mean={np.mean(p1):.4f}  std={np.std(p1):.4f}')
+    print(f'avg@{args.n}   mean={np.mean(avgs):.4f}  std={np.std(avgs):.4f}')
+    print(f'pass@{args.n}  mean={np.mean(passes):.4f}  std={np.std(passes):.4f}')
+    print('RESULT_JSON ' + __import__('json').dumps({
+        'model': args.model, 'data': args.data, 'n': args.n, 'seeds': seeds,
+        'pass@1': [np.mean(p1), np.std(p1)],
+        f'avg@{args.n}': [np.mean(avgs), np.std(avgs)],
+        f'pass@{args.n}': [np.mean(passes), np.std(passes)],
+    }))
 
 
 if __name__ == '__main__':

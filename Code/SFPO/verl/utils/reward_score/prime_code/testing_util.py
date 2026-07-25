@@ -32,7 +32,15 @@ from io import StringIO
 # used for testing the code that reads from input
 from unittest.mock import patch, mock_open
 
-from pyext import RuntimeModule
+import types as _types
+
+
+class RuntimeModule:  # stdlib shim for pyext (unbuildable on py3.12); only from_string is used
+    @staticmethod
+    def from_string(name, docstring, source):
+        mod = _types.ModuleType(name)
+        exec(source, mod.__dict__)
+        return mod
 
 from enum import Enum
 

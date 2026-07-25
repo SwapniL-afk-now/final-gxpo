@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
-# Rebuttal runs: SFPO vs GXPO, Qwen2.5-1.5B-Instruct, full fine-tune, DAPO-17k train / AMC23 eval.
-# Usage: METHOD=sfpo GPU=0 ./run_rebuttal.sh    |    METHOD=gxpo GPU=1 ./run_rebuttal.sh
+# Rebuttal runs: plain GRPO baseline, Qwen2.5-1.5B-Instruct, full fine-tune, DAPO-17k train / AMC23 eval.
+# Same as run_rebuttal_seeded.sh with no SFPO/GXPO flags -- algorithm.adv_estimator=grpo already applies.
+# Usage: TRAIN_SEED=42 GPU=0 ./run_rebuttal_grpo.sh
 set -euo pipefail
 
 # /etc/environment ships RAY_ADDRESS="127.0.0.1" (no port) which is an invalid
 # bootstrap address; clear it so ray.init() starts a fresh local cluster.
 export RAY_ADDRESS=local   # force an isolated Ray cluster per job -- unaddressed ray.init() auto-attaches to any existing local cluster (via /tmp/ray/session_latest), starving concurrent GPU0/GPU1 jobs of GPUs ("Total available GPUs 0")
 
-METHOD="${METHOD:?set METHOD=sfpo|gxpo}"
 GPU="${GPU:?set GPU=0|1}"
-K=5
-ALPHA=0.5
-SFPO_TAU=0.5      # SFPO entropy z-score shutoff threshold
-GXPO_TAU=2.0      # GXPO trajectory-aware shutoff threshold
 TRAIN_SEED="${TRAIN_SEED:-42}"     # overridable via env for queued multi-seed runs
 VAL_SEEDS="[0,1,2]"           # three evaluation seeds on amc23
 LR=1e-6
@@ -23,35 +19,9 @@ PROJECT=rebuttul
 MODEL=/workspace/models/Qwen2.5-1.5B-Instruct
 TRAIN=/workspace/jepa-grpo-cache/data/math_l35/train.parquet   # Hendrycks MATH, Level 3-5
 VAL=/workspace/jepa-grpo-cache/eval_data/amc23.parquet
-if [ "$METHOD" = "gxpo" ]; then TAU="$GXPO_TAU"; else TAU="$SFPO_TAU"; fi
-EXP="${METHOD}_k${K}_a${ALPHA}_tau${TAU}_mathl35_amc23_seed${TRAIN_SEED}"
+EXP="grpo_mathl35_amc23_seed${TRAIN_SEED}"
 RUN_DIR="./runs/${EXP}"
 mkdir -p "$RUN_DIR"
-
-METHOD_FLAGS=()
-case "$METHOD" in
-  sfpo)
-    METHOD_FLAGS+=(
-      +actor_rollout_ref.actor.use_sfpo=True
-      +actor_rollout_ref.actor.sfpo_inner_steps="$K"
-      +actor_rollout_ref.actor.sfpo_step_size="$ALPHA"
-      +actor_rollout_ref.actor.zscore_w=30
-      +actor_rollout_ref.actor.zscore_threshold="$SFPO_TAU"
-    ) ;;
-  gxpo)
-    METHOD_FLAGS+=(
-      +actor_rollout_ref.actor.use_gxpo=True
-      +actor_rollout_ref.actor.gxpo_k="$K"
-      +actor_rollout_ref.actor.gxpo_alpha="$ALPHA"
-      +actor_rollout_ref.actor.gxpo_delta=1e-8
-      +actor_rollout_ref.actor.gxpo_tau="$GXPO_TAU"
-      +actor_rollout_ref.actor.gxpo_omega=0.1
-      +actor_rollout_ref.actor.gxpo_shutoff_mode=trajectory_aware
-      +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=True
-      +actor_rollout_ref.actor.gxpo_diag_freq=10
-    ) ;;
-  *) echo "unknown METHOD=$METHOD"; exit 1 ;;
-esac
 
 export CUDA_VISIBLE_DEVICES="$GPU"
 export WANDB_PROJECT="$PROJECT"
@@ -109,5 +79,4 @@ python -u -m verl.trainer.main_ppo \
     +trainer.validation_seeds="$VAL_SEEDS" \
     +trainer.max_steps=$MAX_STEPS \
     trainer.total_epochs=100 \
-    "${METHOD_FLAGS[@]}" \
     | tee "$RUN_DIR/train.log"

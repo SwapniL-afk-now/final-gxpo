@@ -1,12 +1,6 @@
 #!/usr/bin/env bash
-# SFT + GXPO-style update: identical to run_sft_baseline.sh except each step is the GXPO
-# 3-pass extrapolated update (probe g0, probe g1, reposition, slow correction) applied to a
-# plain cross-entropy objective -- no importance ratio, no advantages. K/alpha/tau match the
-# GXPO RL arm so the two are directly comparable.
-#
-# Costs ~3x the baseline's wall time (3 backward passes per step).
-# lr 1e-5, batch 32, 500 steps (3 epochs of data, capped at 500), validate every 10 steps, seed 42.
-# Usage: GPU=1 ./run_sft_gxpo.sh
+# SFT + GXPO-style update, lookahead K=3 / alpha=0.1 variant of run_sft_gxpo.sh (which uses K=5/alpha=0.5).
+# Usage: GPU=0 ./run_sft_gxpo_k3_a0.1.sh
 set -euo pipefail
 
 # /etc/environment ships RAY_ADDRESS="127.0.0.1" (no port), an invalid bootstrap address.
@@ -16,15 +10,9 @@ GPU="${GPU:?set GPU=0|1}"
 TRAIN_SEED="${TRAIN_SEED:-42}"
 LR=1e-5
 PROJECT=rebuttul
-K=5
-ALPHA=0.5
-# SFT dense cross-entropy grad-norms are ~2.5x noisier vs their EMA than the RL arm's
-# advantage-grad norms. On clean baseline SFT the natural post-warmup |z| tops out at ~4.9,
-# so RL's tau=2.0 false-trips ~23x over 500 steps; tau=5.0 gives 0 false trips while still
-# catching a genuine >5-sigma divergence. (data analysis over the seed42 SFT grad-norm logs.)
+K=3
+ALPHA=0.1
 GXPO_TAU=5.0
-# The EMA gate starts cold (mu=1); step-0 z~30 for norms~30 would instantly, permanently
-# shut off extrapolation. The EMA tracks within ~2 steps, so suppress the trigger for 3.
 GXPO_WARMUP=3
 
 MODEL=/workspace/models/Qwen2.5-1.5B-Instruct

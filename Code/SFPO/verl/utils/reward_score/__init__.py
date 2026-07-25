@@ -36,6 +36,18 @@ def _default_compute_score(prompt_str, data_source, solution_str, ground_truth, 
     elif data_source in ['codecontests', 'apps', 'codeforces', 'taco']:
         from . import prime_code
         res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+    elif data_source == 'kodcode':
+        # function-based problems graded by their pytest suite (ground_truth = KodCode `test` string)
+        from . import kodcode
+        res = kodcode.compute_score(solution_str, ground_truth, continuous=True)
+    elif data_source == 'livecodebench':
+        # stdin/stdout code exec (ported from JEPA repo; no pyext dependency)
+        from . import stdio_code
+        res = stdio_code.compute_score(solution_str, ground_truth, extra_info=extra_info, continuous=True)
+    elif data_source in ['humanevalplus', 'mbppplus']:
+        # assert-based EvalPlus code exec (ported from JEPA repo)
+        from . import codegen_plus
+        res = codegen_plus.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source in ['hiyouga/geometry3k']:
         from . import geo3k
         res = geo3k.compute_score(solution_str, ground_truth)
@@ -45,6 +57,8 @@ def _default_compute_score(prompt_str, data_source, solution_str, ground_truth, 
         from . import latex_math
         res = latex_math.compute_score(prompt_str, solution_str, ground_truth)
 
+    if isinstance(res, dict):
+        return float(res['score'])
     if isinstance(res, (int, float, bool)):
         return float(res)
     else:

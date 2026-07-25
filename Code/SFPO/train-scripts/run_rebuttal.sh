@@ -5,7 +5,7 @@ set -euo pipefail
 
 # /etc/environment ships RAY_ADDRESS="127.0.0.1" (no port) which is an invalid
 # bootstrap address; clear it so ray.init() starts a fresh local cluster.
-unset RAY_ADDRESS
+export RAY_ADDRESS=local   # force an isolated Ray cluster per job -- unaddressed ray.init() auto-attaches to any existing local cluster (via /tmp/ray/session_latest), starving concurrent GPU0/GPU1 jobs of GPUs ("Total available GPUs 0")
 
 METHOD="${METHOD:?set METHOD=sfpo|gxpo}"
 GPU="${GPU:?set GPU=0|1}"

@@ -29,7 +29,11 @@ def last_boxed_only_string(string):
         i += 1
 
     if right_brace_idx is None:
-        retval = None
+        # Unterminated \boxed{ (model stopped mid-expression, e.g. "\boxed{2.$").
+        # Recover the answer instead of scoring 0: take up to the first $ or newline.
+        tail = string[idx + len("\\boxed{"):]
+        tail = re.split(r'[$\n]', tail, 1)[0].strip()
+        retval = "\\boxed{" + tail + "}" if tail else None
     else:
         retval = string[idx:right_brace_idx + 1]
 

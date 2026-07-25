@@ -32,6 +32,7 @@ from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, CPUOffload
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel, AutoConfig
+from omegaconf import OmegaConf
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup
 from tensordict import TensorDict
 from torch.utils.data import DataLoader, DistributedSampler
@@ -116,6 +117,7 @@ class FSDPSFTTrainer(object):
                 tau=self.config.optim.get('gxpo_tau', 0.5),
                 omega=self.config.optim.get('gxpo_omega', 0.1),
                 shutoff_mode=self.config.optim.get('gxpo_shutoff_mode', 'trajectory_aware'),
+                warmup_steps=self.config.optim.get('gxpo_warmup', 0),
             )
 
         # TODO: add checkpoint manager
@@ -400,13 +402,18 @@ class FSDPSFTTrainer(object):
                     loss.backward()
                 return loss
 
-    def _accumulate_and_clip(self, batch: TensorDict):
+    def _accumulate_and_clip(self, batch: TensorDict, capture_bufs=None):
         """One full gradient pass over `batch`: zero_grad, accumulate micro-batches, clip.
 
         Returns (step_loss, grad_norm). Leaves grads populated so the caller decides whether
         to capture them, step, or discard. `_compute_loss_and_backward` pops 'loss_mask' from
         the micro-batch it is handed, so the split is redone here on every pass -- GXPO runs
         this three times over the same batch.
+
+        If `capture_bufs` is given, the raw grads are copied into it *before* clipping. GXPO
+        needs the pre-clip gradients: clip_grad_norm_(max_norm=1.0) renormalizes every pass to
+        norm 1.0 in place, which would flatten the per-coordinate retention ratio r=g1/g0 and
+        the shutoff gate's g-norm statistic (both would see identical unit-norm grads).
         """
         self.optimizer.zero_grad()
 
@@ -416,6 +423,9 @@ class FSDPSFTTrainer(object):
         for micro_batch in micro_batches:
             loss = self._compute_loss_and_backward(batch=micro_batch.clone(recurse=False)) / n_micro_batches
             step_loss += loss.item()
+
+        if capture_bufs is not None:
+            self._gxpo_capture_grads(capture_bufs)
 
         grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
         return step_loss, grad_norm
@@ -494,20 +504,18 @@ class FSDPSFTTrainer(object):
             self.optimizer.zero_grad(set_to_none=True)
             return standard_step()
 
-        # Pass 1: g0 at theta0
-        _, gn0 = self._accumulate_and_clip(batch)
+        # Pass 1: g0 at theta0 (capture raw grads pre-clip -- see _accumulate_and_clip)
+        _, gn0 = self._accumulate_and_clip(batch, capture_bufs=g0_bufs)
         gn0 = gn0.detach().item()
         if not finite(gn0) or gn0 <= 1e-8:
             return fallback()
-        self._gxpo_capture_grads(g0_bufs)
         self.optimizer.step()
 
         # Pass 2: g1 at theta_1
-        _, gn1 = self._accumulate_and_clip(batch)
+        _, gn1 = self._accumulate_and_clip(batch, capture_bufs=g1_bufs)
         gn1 = gn1.detach().item()
         if not finite(gn1):
             return fallback()
-        self._gxpo_capture_grads(g1_bufs)
         self.optimizer.step()
 
         # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
@@ -544,25 +552,19 @@ class FSDPSFTTrainer(object):
         gn_slow = gn_slow.detach().item()
         if not finite(gn_slow):
             return fallback()
-
-        gslow_sq = torch.zeros(1, dtype=torch.float64, device=device)
-        with torch.no_grad():
-            for p in params:
-                if p.grad is not None:
-                    gslow_sq += p.grad.double().pow(2).sum()
         self.optimizer.step()
 
         if torch.distributed.is_initialized():
-            full = torch.cat([stats, gslow_sq])
-            torch.distributed.all_reduce(full, op=torch.distributed.ReduceOp.SUM)
-            stats, gslow_sq = full[:9], full[9:]
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
 
         (g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq, n_total,
          scale_sum) = stats.tolist()
-        gslow_sq = gslow_sq.item()
 
         eps = 1e-12
-        g0_norm, g1_norm, gslow_norm = g0_sq**0.5, g1_sq**0.5, gslow_sq**0.5
+        # gn_slow is already the global pre-clip grad norm (clip_grad_norm_ reduces across
+        # FSDP shards); feed it to the shutoff gate rather than the clipped post-step grads,
+        # whose norm is pinned at ~1.0 and makes the z-score degenerate.
+        g0_norm, g1_norm, gslow_norm = g0_sq**0.5, g1_sq**0.5, gn_slow
         r_mean = sum_r / max(n_total, 1.0)
         r_var = max(sum_r_sq / max(n_total, 1.0) - r_mean**2, 0.0)
         disp2_norm, dispK_norm = disp2_sq**0.5, dispK_sq**0.5
@@ -641,7 +643,8 @@ class FSDPSFTTrainer(object):
         if rank == 0:
             tracking = Tracking(project_name=self.config.trainer.project_name,
                                 experiment_name=self.config.trainer.experiment_name,
-                                default_backend=self.config.trainer.logger)
+                                default_backend=self.config.trainer.logger,
+                                config=OmegaConf.to_container(self.config, resolve=True))
 
         global_step = 0
         # compute the total training steps.

@@ -82,6 +82,8 @@ class DataParallelPPOActor(BasePPOActor):
                 tau=self.config.get('gxpo_tau', 0.5),
                 omega=self.config.get('gxpo_omega', 0.1),
                 shutoff_mode=self.config.get('gxpo_shutoff_mode', 'trajectory_aware'),
+                fallback_mode=self.config.get('gxpo_fallback_mode', 'permanent'),
+                fallback_window=self.config.get('gxpo_fallback_window', 10),
             )
             self._gxpo_diag_freq = int(self.config.get('gxpo_diag_freq', 10))
 
@@ -496,7 +498,7 @@ class DataParallelPPOActor(BasePPOActor):
                 p.data.copy_(t0)
 
     def _gxpo_minibatch_step(self, mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                             non_tensor_select_keys):
+                             non_tensor_select_keys, force_standard=False):
         """One GXPO 3-pass update on a single PPO mini-batch (Algorithm 1 of the paper).
 
         Faithful port of gxpo_single_minibatch_update from the reference
@@ -504,11 +506,16 @@ class DataParallelPPOActor(BasePPOActor):
         r = g1/g0_safe is clamped to [-2, 3], the geometric scale
         S_K/S_2 is clamped to [1, K/2+1], and the slow correction is taken at
         theta_tilde = theta0 + alpha * scale * (theta2 - theta0).
+
+        force_standard: skip extrapolation for this one step (degenerate batch, e.g. mass
+        format-parse failures) without touching the shutoff gate's EMA/trigger state -- the
+        step is simply not fed into the gate at all, since it was never asked to.
         """
         state = self.gxpo_state
         step_idx = state.step_count
         K, alpha, delta = state.K, state.alpha, state.delta
         recompute_old = self.config.get('gxpo_recompute_old_log_probs', True)
+        skip_corrective = self.config.get('gxpo_skip_corrective', False)
 
         def standard_step():
             metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
@@ -519,7 +526,7 @@ class DataParallelPPOActor(BasePPOActor):
             state.step_count = step_idx + 1
             return metrics
 
-        if not state.is_enabled(step_idx):
+        if force_standard or not state.is_enabled(step_idx):
             return standard_step()
 
         self._gxpo_init_buffers()
@@ -537,8 +544,9 @@ class DataParallelPPOActor(BasePPOActor):
             self.actor_optimizer.zero_grad(set_to_none=True)
             return standard_step()
 
-        # Pass 1: g0 at theta0
-        self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+        # Pass 1: g0 at theta0. Keep its loss metrics (actor/entropy_loss etc.) — the skip-corrective
+        # ablation has no Pass 3 to source them from, and ray_trainer reads actor/entropy_loss every step.
+        probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
                                  non_tensor_select_keys)
         gn0 = self._clip_grads().detach().item()
         if not (gn0 == gn0 and abs(gn0) != float('inf')) or gn0 <= 1e-8:
@@ -605,21 +613,27 @@ class DataParallelPPOActor(BasePPOActor):
                 stats[4] += dispK.double().pow(2).sum()
                 p.data.copy_(dispK.mul_(alpha).add_(t0))
 
-        # Pass 3: slow correction at theta_tilde
-        pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                                 non_tensor_select_keys, recompute_old_log_probs=recompute_old)
-        gn_slow = self._clip_grads().detach().item()
-        if not (gn_slow == gn_slow and abs(gn_slow) != float('inf')):
-            return fallback()
+        # Pass 3: slow correction at theta_tilde. Skipped for the no-corrective ablation, where the
+        # reposition above IS the update (params already sit at theta_tilde, nothing more to do).
+        if skip_corrective:
+            pass3_metrics = probe_metrics  # reuse g0-probe loss metrics; no Pass 3 exists here
+            gn_slow = gn1  # report the last real probe norm; no corrective grad exists
+            gslow_stats = torch.zeros(2, dtype=torch.float64, device=device)
+        else:
+            pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                                     non_tensor_select_keys, recompute_old_log_probs=recompute_old)
+            gn_slow = self._clip_grads().detach().item()
+            if not (gn_slow == gn_slow and abs(gn_slow) != float('inf')):
+                return fallback()
 
-        gslow_stats = torch.zeros(2, dtype=torch.float64, device=device)
-        with torch.no_grad():
-            for p, g0b in zip(params, g0_bufs):
-                if p.grad is None:
-                    continue
-                gslow_stats[0] += p.grad.double().pow(2).sum()
-                gslow_stats[1] += (p.grad.double() * g0b.double()).sum()
-        self.actor_optimizer.step()
+            gslow_stats = torch.zeros(2, dtype=torch.float64, device=device)
+            with torch.no_grad():
+                for p, g0b in zip(params, g0_bufs):
+                    if p.grad is None:
+                        continue
+                    gslow_stats[0] += p.grad.double().pow(2).sum()
+                    gslow_stats[1] += (p.grad.double() * g0b.double()).sum()
+            self.actor_optimizer.step()
 
         # single global reduction so every rank takes the identical gate decision
         if torch.distributed.is_initialized():
@@ -638,9 +652,16 @@ class DataParallelPPOActor(BasePPOActor):
         r_var = max(sum_r_sq / max(n_total, 1.0) - r_mean**2, 0.0)
         disp2_norm, dispK_norm = disp2_sq**0.5, dispK_sq**0.5
 
+        # The gate reads PRE-clip norms (gn0/gn_slow, straight off _clip_grads), not the post-clip
+        # g0_norm/gslow_norm logged below. Post-clip norms saturate at grad_clip, so a genuine
+        # gradient blow-up pins the trigger stat to a constant and the z-score *shrinks* exactly
+        # when it should fire -- observed in gxpo_kodcode_seed42_v2_fmtskip_k10_tau1.0 (548cfptf),
+        # where raw grad_norm hit 2.2 while trigger_stat sat at 1.0 and z fell 0.77 -> 0.51.
+        # gn_slow is already gn1 in the no-corrective ablation (see above), so this covers both.
+        gate_slow_norm = gn_slow
         z_score, trigger_stat, triggered = state.update_trigger_state(step=step_idx,
-                                                                      g0_norm=g0_norm,
-                                                                      g_slow_norm=gslow_norm)
+                                                                      g0_norm=gn0,
+                                                                      g_slow_norm=gate_slow_norm)
         state.step_count = step_idx + 1
 
         metrics = pass3_metrics
@@ -682,6 +703,15 @@ class DataParallelPPOActor(BasePPOActor):
         assert self.gxpo_state is not None, 'update_policy_gxpo called without use_gxpo=True'
         self.actor_module.train()
 
+        # Guard against degenerate batches (e.g. a format-parse collapse: most rollouts get
+        # reward 0 because they failed to parse, not because the problem was hard). Such a batch
+        # has near-uniform reward -> near-zero-magnitude probe gradients g0/g1 -> a spurious,
+        # huge z-score that permanently trips the shutoff gate on a fluke rather than a real
+        # divergence. Skip extrapolation for this step only; the gate's EMA is left untouched
+        # since a degenerate batch was never a valid observation of the gate's trigger statistic.
+        format_error_ratio = (data.batch['token_level_scores'].sum(-1) == 0).float().mean().item()
+        force_standard = format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5)
+
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
         dataloader, has_multi_modal_inputs, select_keys, non_tensor_select_keys = self._make_minibatch_iterator(data)
 
@@ -689,8 +719,10 @@ class DataParallelPPOActor(BasePPOActor):
         for epoch in range(self.config.ppo_epochs):
             for mini_batch in dataloader:
                 mb_metrics = self._gxpo_minibatch_step(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                                       non_tensor_select_keys)
+                                                       non_tensor_select_keys, force_standard=force_standard)
                 _merge_metrics(metrics, mb_metrics)
+        if force_standard:
+            metrics['actor/gxpo_format_skip'] = 1.0
         metrics['actor/cumulative_bp'] = self.cumulative_bp
         if self.gxpo_state.trigger_index != float('inf'):
             metrics['actor/gxpo_shutoff_step'] = float(self.gxpo_state.trigger_index)

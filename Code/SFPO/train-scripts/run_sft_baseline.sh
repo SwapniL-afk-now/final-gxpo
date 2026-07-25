@@ -4,17 +4,16 @@
 # identical except for the GXPO-style 3-pass update -- together they answer whether the
 # GXPO update transfers to a supervised (and by extension pretraining) objective.
 #
-# Hyperparameters mirror the RL rebuttal runs: lr 1e-6, batch 32, 200 steps, seed 42.
+# lr 1e-5, batch 32, 500 steps (3 epochs of data, capped at 500), validate every 10 steps, seed 42.
 # Usage: GPU=0 ./run_sft_baseline.sh
 set -euo pipefail
 
 # /etc/environment ships RAY_ADDRESS="127.0.0.1" (no port), an invalid bootstrap address.
-unset RAY_ADDRESS
+export RAY_ADDRESS=local   # force an isolated Ray cluster per job -- unaddressed ray.init() auto-attaches to any existing local cluster (via /tmp/ray/session_latest), starving concurrent GPU0/GPU1 jobs of GPUs ("Total available GPUs 0")
 
 GPU="${GPU:?set GPU=0|1}"
 TRAIN_SEED="${TRAIN_SEED:-42}"
-LR=1e-6
-MAX_STEPS=200
+LR=1e-5
 PROJECT=rebuttul
 
 MODEL=/workspace/models/Qwen2.5-1.5B-Instruct
@@ -53,8 +52,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=1 \
     trainer.default_local_dir="$RUN_DIR" \
     trainer.default_hdfs_dir=null \
     trainer.logger=['console','wandb'] \
-    trainer.total_epochs=2 \
-    trainer.total_training_steps=$MAX_STEPS \
+    trainer.total_epochs=3 \
+    trainer.total_training_steps=500 \
     +trainer.test_freq=10 \
     +trainer.save_freq=100 \
     +trainer.val_max_batches=50 \

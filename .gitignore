@@ -13,3 +13,27 @@ Code/SFPO/runs/
 Code/SFPO/outputs/
 Code/SFPO/wandb/
 *.out
+
+# secrets - never commit
+.env
+*.env
+!.env.example
+
+# model / checkpoint weights
+global_step_*/
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+*.pth
+*.gguf
+
+# results, notes and figures (kept local)
+*.log
+*.png
+*.md
+*.txt
+*.json
+*.jsonl
+*.pdf
+Code/SFPO/eval-results/
