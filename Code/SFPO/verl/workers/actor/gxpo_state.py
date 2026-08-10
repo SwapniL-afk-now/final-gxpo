@@ -69,6 +69,9 @@ class GXPOState:
         self.mu = 1.0  # EMA mean of the trigger statistic
         self.sigma = 1.0  # EMA std of the trigger statistic
         self.step_count = 0
+        # The paper's gate uses a rolling history and does not evaluate a z-score
+        # until at least two valid corrective-gradient observations exist.
+        self.observation_count = 0
 
     def is_enabled(self, step: Optional[int] = None) -> bool:
         if step is None:
@@ -105,7 +108,9 @@ class GXPOState:
     def check_trigger(self, Z_s: float, step: int) -> bool:
         if step < self.warmup_steps:
             return False
-        if abs(Z_s) >= self.tau and self.trigger_index == float('inf'):
+        # Algorithm 1 shuts off on an upward instability only.  A low-norm
+        # observation is not evidence that extrapolation has become unsafe.
+        if Z_s >= self.tau and self.trigger_index == float('inf'):
             self.trigger_index = step + 1
             return True
         return False
@@ -116,7 +121,15 @@ class GXPOState:
         trigger_stat = self.resolve_trigger_observation(g0_norm=g0_norm, g_slow_norm=g_slow_norm)
         if self.shutoff_mode == 'never':
             return 0.0, float(trigger_stat), False
+        # Fill the rolling baseline before allowing a shutoff decision.  This
+        # mirrors the paper's `if len(B) > 1` gate condition and avoids a
+        # cold-start z-score based on the initial (1, 1) EMA.
+        if self.observation_count < 2:
+            self.update_stats(trigger_stat)
+            self.observation_count += 1
+            return 0.0, float(trigger_stat), False
         z_score = self.update_stats(trigger_stat)
+        self.observation_count += 1
         triggered = self.check_trigger(z_score, step)
         return float(z_score), float(trigger_stat), bool(triggered)
 

@@ -54,7 +54,7 @@ case "$METHOD" in
       +actor_rollout_ref.actor.gxpo_tau="$TAU"
       +actor_rollout_ref.actor.gxpo_omega=0.1
       +actor_rollout_ref.actor.gxpo_shutoff_mode=trajectory_aware
-      +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=True
+      +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=False
       +actor_rollout_ref.actor.gxpo_diag_freq=10
     ) ;;
 esac

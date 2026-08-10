@@ -88,7 +88,7 @@ python -u -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.gxpo_delta=1e-8 \
     +actor_rollout_ref.actor.gxpo_tau=$GXPO_TAU \
     +actor_rollout_ref.actor.gxpo_omega=0.1 \
-    +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=True \
+    +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=False \
     +actor_rollout_ref.actor.gxpo_diag_freq=10 \
     +actor_rollout_ref.actor.gxpo_shutoff_mode=never \
     | tee "$RUN_DIR/train.log"

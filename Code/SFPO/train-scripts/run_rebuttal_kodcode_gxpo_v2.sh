@@ -94,7 +94,7 @@ python -u -m verl.trainer.main_ppo \
     +actor_rollout_ref.actor.gxpo_tau="$GXPO_TAU" \
     +actor_rollout_ref.actor.gxpo_omega=0.1 \
     +actor_rollout_ref.actor.gxpo_shutoff_mode=trajectory_aware \
-    +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=True \
+    +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=False \
     +actor_rollout_ref.actor.gxpo_diag_freq=10 \
     +actor_rollout_ref.actor.gxpo_format_error_skip_threshold="$FORMAT_SKIP_THRESHOLD" \
     | tee "$RUN_DIR/train.log"

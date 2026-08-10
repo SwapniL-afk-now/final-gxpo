@@ -475,6 +475,7 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_cos_g0_g1': 0.0,
             'actor/gxpo_cos_g0_gslow': 0.0,
             'actor/gxpo_inactive_frac': 0.0,
+            'actor/gxpo_ratio_clip_frac': 0.0,
         }
 
     def _gxpo_init_buffers(self):
@@ -514,7 +515,7 @@ class DataParallelPPOActor(BasePPOActor):
         state = self.gxpo_state
         step_idx = state.step_count
         K, alpha, delta = state.K, state.alpha, state.delta
-        recompute_old = self.config.get('gxpo_recompute_old_log_probs', True)
+        recompute_old = self.config.get('gxpo_recompute_old_log_probs', False)
         skip_corrective = self.config.get('gxpo_skip_corrective', False)
 
         def standard_step():
@@ -548,26 +549,28 @@ class DataParallelPPOActor(BasePPOActor):
         # ablation has no Pass 3 to source them from, and ray_trainer reads actor/entropy_loss every step.
         probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
                                  non_tensor_select_keys)
+        # Capture raw gradients for the retention ratio; clip only the optimizer step.
+        self._gxpo_capture_grads(g0_bufs)
         gn0 = self._clip_grads().detach().item()
         if not (gn0 == gn0 and abs(gn0) != float('inf')) or gn0 <= 1e-8:
             return fallback()
-        self._gxpo_capture_grads(g0_bufs)
         self.actor_optimizer.step()
 
         # Pass 2: g1 at theta_{t,1}
         self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
                                  non_tensor_select_keys, recompute_old_log_probs=recompute_old)
+        # Capture raw gradients before clipping, matching g0.
+        self._gxpo_capture_grads(g1_bufs)
         gn1 = self._clip_grads().detach().item()
         if not (gn1 == gn1 and abs(gn1) != float('inf')):
             return fallback()
-        self._gxpo_capture_grads(g1_bufs)
         self.actor_optimizer.step()
 
         # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
         device = theta0[0].device
         # stats layout: [g0_sq, g1_sq, dot_g0_g1, disp2_sq, dispK_sq, sum_r, sum_r_sq,
-        #                n_active, n_total, scale_sum, errK_sq, dot_ce, closed_sq, explicit_sq]
-        stats = torch.zeros(14, dtype=torch.float64, device=device)
+        #                n_active, n_total, scale_sum, errK_sq, dot_ce, closed_sq, explicit_sq, ratio_clipped]
+        stats = torch.zeros(15, dtype=torch.float64, device=device)
         scale_max = torch.zeros(1, dtype=torch.float64, device=device)
         do_diag = self._gxpo_diag_freq > 0 and (step_idx % self._gxpo_diag_freq == 0)
 
@@ -579,18 +582,44 @@ class DataParallelPPOActor(BasePPOActor):
                 stats[7] += (g0b.abs() > delta).sum()
                 stats[8] += g0b.numel()
 
-                sgn = torch.where(g0b >= 0, 1.0, -1.0)
-                r = g1b / (g0b.abs().clamp(min=delta) * sgn)
-                r.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
+                # Algorithm 1: extrapolate only sufficiently active coordinates.
+                # Inactive coordinates retain the observed two-step displacement
+                # (scale=1); fabricating r=g1/delta for them injects arbitrary
+                # extrapolation noise into near-zero gradients.
+                active = g0b.abs() > delta
+                scale = torch.ones_like(g0b)
+                r = torch.ones_like(g0b)
+                if active.any():
+                    r_active = g1b[active] / g0b[active]
+                    # Numerical safeguard only; the geometric rule itself is
+                    # unchanged and, importantly, scale is not forced >= 1.
+                    finite_r = torch.isfinite(r_active)
+                    clipped_r = (~finite_r) | (r_active < -2.0) | (r_active > 3.0)
+                    stats[14] += clipped_r.sum()
+                    r_active.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
+
+                    # Horner form of S_n(r)=1+r+...+r^(n-1), stable near r=1.
+                    def geometric_sum(value, n):
+                        result = torch.ones_like(value)
+                        for _ in range(1, n):
+                            result.mul_(value).add_(1.0)
+                        return result
+
+                    s_k = geometric_sum(r_active, K)
+                    s_2 = geometric_sum(r_active, 2)
+                    active_scale = s_k / s_2
+                    # S_2 is zero at r=-1, where the geometric conversion is
+                    # undefined. Fall back to the observed displacement there.
+                    active_scale = torch.where(
+                        s_2.abs() > delta,
+                        active_scale,
+                        torch.ones_like(active_scale),
+                    ).nan_to_num(nan=1.0, posinf=1.0, neginf=1.0)
+                    r[active] = r_active
+                    scale[active] = active_scale
+
                 stats[5] += r.double().sum()
                 stats[6] += r.double().pow(2).sum()
-
-                one_minus_r = 1.0 - r
-                s_k = (1.0 - r.pow(K)) / (one_minus_r + delta)
-                s_2 = (1.0 - r * r) / (one_minus_r + delta)
-                scale = (s_k / (s_2 + delta)).clamp_(1.0, K / 2.0 + 1.0)
-                stats[9] += scale.double().sum()
-                scale_max = torch.maximum(scale_max, scale.max().double().reshape(1))
 
                 disp2 = p.data - t0
                 stats[3] += disp2.double().pow(2).sum()
@@ -644,7 +673,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         vals = torch.cat([stats, gslow_stats, scale_max]).tolist()
         (g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq, n_active, n_total, scale_sum,
-         errK_sq, dot_ce, closed_sq, explicit_sq, gslow_sq, dot0slow, scale_mx) = vals
+         errK_sq, dot_ce, closed_sq, explicit_sq, ratio_clipped, gslow_sq, dot0slow, scale_mx) = vals
 
         eps = 1e-12
         g0_norm, g1_norm, gslow_norm = g0_sq**0.5, g1_sq**0.5, gslow_sq**0.5
@@ -683,6 +712,7 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_cos_g0_g1': dot01 / (g0_norm * g1_norm + eps),
             'actor/gxpo_cos_g0_gslow': dot0slow / (g0_norm * gslow_norm + eps),
             'actor/gxpo_inactive_frac': 1.0 - n_active / max(n_total, 1.0),
+            'actor/gxpo_ratio_clip_frac': ratio_clipped / max(n_active, 1.0),
         })
         if do_diag:
             errK = errK_sq**0.5
