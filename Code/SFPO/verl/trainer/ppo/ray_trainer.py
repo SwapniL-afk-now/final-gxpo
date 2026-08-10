@@ -246,6 +246,12 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     return data
 
 
+def ckpt_steps_to_remove(steps, keep, best_step=None):
+    """Which global_step_* dirs to delete: keep the newest `keep` for resume, never the best one."""
+    steps = sorted(steps)
+    return [s for s in steps[:-keep] if s != best_step] if len(steps) > keep else []
+
+
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
     with Timer(name=name, logger=None) as timer:
@@ -731,19 +737,15 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg.init_model()
 
     def _best_ckpt_score(self, val_metrics):
-        """Checkpoint-selection score: sum of avg@n and pass@n (seed-mean) over val sources."""
-        n = self.config.actor_rollout_ref.rollout.val_kwargs.n
-        tags = (f'/avg_at_{n}/', f'/pass_at_{n}/')
-        return float(sum(v for k, v in val_metrics.items()
-                         if any(t in k for t in tags) and '/seed' not in k and not k.endswith('/std')))
+        """Checkpoint-selection score: macro-mean val pass@1 across val sources (seed-mean).
 
-    def _save_checkpoint(self, keep_only_best=False):
-        # keep_only_best: prune every existing global_step_* dir so at most one checkpoint (the best) survives
-        if keep_only_best:
-            import shutil, glob
-            for d in glob.glob(os.path.join(self.config.trainer.default_local_dir, 'global_step_*')):
-                if os.path.isdir(d):
-                    shutil.rmtree(d, ignore_errors=True)
+        Unweighted across sources, so a 30-problem AIME set counts the same as 40-problem AMC23.
+        """
+        vals = [v for k, v in val_metrics.items()
+                if k.startswith('val/pass_at_1/') and '/seed' not in k and not k.endswith('/std')]
+        return float(np.mean(vals)) if vals else float('-inf')
+
+    def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
                                                 f'global_step_{self.global_steps}')
@@ -813,8 +815,17 @@ class RayPPOTrainer(object):
         with open(local_sampling_num, 'w') as f:
             f.write(str(self.sampling_num))
 
-        # Keep only the latest n checkpoints
-        n=2
+        # Record which step is the best-pass@1 one so it can be found (and pinned) after the run.
+        best_step = getattr(self, '_best_val_step', None)
+        if best_step is not None:
+            with open(osj(self.config.trainer.default_local_dir, 'best_ckpt.json'), 'w') as f:
+                json.dump({'best_step': best_step,
+                           'best_score': getattr(self, '_best_val_score', None),
+                           'metric': 'macro-mean val/pass_at_1',
+                           'path': f'global_step_{best_step}'}, f)
+
+        # Keep only the latest n checkpoints (for resume), plus the pinned best-pass@1 one.
+        n = self.config.trainer.get('keep_last_ckpts', 2)
         if self.config.trainer.get('keep_all_ckpts', False):  # Remove old checkpoints
             return
 
@@ -828,13 +839,10 @@ class RayPPOTrainer(object):
             except ValueError:
                 continue  # Ignore malformed directories
 
-        steps.sort()  # Oldest first
-
-        if len(steps) > n:
-            for step in steps[:-n]:
-                dir_to_remove = osj(self.config.trainer.default_local_dir, f'global_step_{step}')
-                print(f"Removing old checkpoint directory: {dir_to_remove}")
-                shutil.rmtree(dir_to_remove, ignore_errors=True)
+        for step in ckpt_steps_to_remove(steps, n, best_step):
+            dir_to_remove = osj(self.config.trainer.default_local_dir, f'global_step_{step}')
+            print(f"Removing old checkpoint directory: {dir_to_remove}")
+            shutil.rmtree(dir_to_remove, ignore_errors=True)
 
     def _load_checkpoint(self):
         print('self.config.trainer.resume_mode', self.config.trainer.resume_mode)
@@ -1311,21 +1319,30 @@ class RayPPOTrainer(object):
                         metrics.update(val_metrics)
                         did_validate = True
 
-                    # Save ONLY the single best checkpoint, selected by (avg@n + pass@n) on validation.
-                    if self.config.trainer.save_freq > 0 and did_validate:
+                    # Two independent reasons to write a checkpoint: the periodic one that makes the
+                    # run resumable, and a new best-pass@1 one that the paper reports. Both write a
+                    # normal global_step_N dir; retention keeps the last few and pins the best.
+                    need_save = (self.config.trainer.save_freq > 0 and
+                                 (is_last_step or self.global_steps % self.config.trainer.save_freq == 0))
+
+                    if did_validate:
                         score = self._best_ckpt_score(val_metrics)
                         metrics['val/best_ckpt_score'] = score
                         if score > getattr(self, '_best_val_score', float('-inf')):
-                            print(f'[best-ckpt] step {self.global_steps}: new best score {score:.4f} '
+                            print(f'[best-ckpt] step {self.global_steps}: new best pass@1 {score:.4f} '
                                   f'(prev {getattr(self, "_best_val_score", float("-inf")):.4f}); saving')
                             self._best_val_score = score
                             self._best_val_step = self.global_steps
-                            with _timer('save_checkpoint', timing_raw):
-                                self._save_checkpoint(keep_only_best=True)
+                            need_save = True
                         else:
-                            print(f'[best-ckpt] step {self.global_steps}: score {score:.4f} <= '
-                                  f'best {self._best_val_score:.4f} (from step {self._best_val_step}); skip save')
+                            print(f'[best-ckpt] step {self.global_steps}: pass@1 {score:.4f} <= '
+                                  f'best {self._best_val_score:.4f} (from step {self._best_val_step})')
                         metrics['val/best_ckpt_step'] = getattr(self, '_best_val_step', 0)
+                        metrics['val/best_pass_at_1'] = getattr(self, '_best_val_score', float('-inf'))
+
+                    if need_save:
+                        with _timer('save_checkpoint', timing_raw):
+                            self._save_checkpoint()
 
                     # reward_metrics = compute_reward_metrics(batch, self.config)
 
