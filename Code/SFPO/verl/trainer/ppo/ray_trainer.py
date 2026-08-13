@@ -1187,9 +1187,18 @@ class RayPPOTrainer(object):
 
                     # training accuracy / pass metrics over the n rollouts per prompt
                     _train_correct = (log_reward_tensor > 0.95).float()  # (num_prompts, n)
-                    metrics['train/avg_at_n'] = _train_correct.mean().item()        # mean accuracy across all samples
-                    metrics['train/pass_at_1'] = _train_correct.mean().item()       # == avg accuracy
-                    metrics['train/pass_at_n'] = _train_correct.max(dim=1)[0].mean().item()  # any-correct per prompt
+                    train_avg = _train_correct.mean().item()                    # mean accuracy across all samples
+                    train_pass_n = _train_correct.max(dim=1)[0].mean().item()     # any-correct per prompt
+                    n_rollouts = int(self.config.actor_rollout_ref.rollout.n)
+                    # Keep the original dynamic names and also emit the canonical
+                    # names used by the GSPO trainer/W&B dashboards.
+                    metrics['train/avg_at_n'] = train_avg
+                    metrics['train/pass_at_n'] = train_pass_n
+                    metrics['train/pass_at_1'] = train_avg
+                    metrics['train/accuracy'] = train_avg
+                    metrics['train/failure_rate'] = 1.0 - train_avg
+                    metrics[f'train/avg_at_{n_rollouts}'] = train_avg
+                    metrics[f'train/pass_at_{n_rollouts}'] = train_pass_n
 
                     reward_history.append((log_data_source, log_index_tensor, log_reward_tensor))
                     for i in range(len(log_index_tensor)):

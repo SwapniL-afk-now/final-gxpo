@@ -615,6 +615,12 @@ class DataParallelPPOActor(BasePPOActor):
                         active_scale,
                         torch.ones_like(active_scale),
                     ).nan_to_num(nan=1.0, posinf=1.0, neginf=1.0)
+                    # Bound the geometric extrapolation factor. Without this,
+                    # ratios near the configured clip limits can produce enormous
+                    # K-step scales (especially for K=10), destabilizing the
+                    # repositioning step. Keep this consistent with the SFT GXPO
+                    # implementation and the documented safety range.
+                    active_scale.clamp_(1.0, K / 2.0 + 1.0)
                     r[active] = r_active
                     scale[active] = active_scale
 
