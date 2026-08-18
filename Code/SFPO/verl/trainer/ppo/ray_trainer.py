@@ -253,7 +253,34 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
 def ckpt_steps_to_remove(steps, keep, best_step=None):
     """Which global_step_* dirs to delete: keep the newest `keep` for resume, never the best one."""
     steps = sorted(steps)
+    keep = max(int(keep), 1)
     return [s for s in steps[:-keep] if s != best_step] if len(steps) > keep else []
+
+
+def write_retained_jsonl(path, value, keep):
+    """Write a bounded JSONL file atomically; keep<=0 preserves append-only behavior."""
+    keep = int(keep)
+    if keep <= 0:
+        append_jsonl(path, value)
+        return
+
+    lines = []
+    if os.path.exists(path) and keep > 1:
+        with open(path, 'r') as handle:
+            lines = [line.rstrip('\n') for line in handle if line.strip()]
+        lines = lines[-(keep - 1):]
+    lines.append(json.dumps(json_safe(value), sort_keys=True))
+
+    directory = os.path.dirname(path) or '.'
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = os.path.join(directory, f'.{os.path.basename(path)}.{uuid.uuid4().hex}.tmp')
+    try:
+        with open(temporary_path, 'w') as handle:
+            handle.write('\n'.join(lines) + '\n')
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
 
 
 @contextmanager
@@ -854,15 +881,16 @@ class RayPPOTrainer(object):
         # Record which step is the best-pass@1 one so it can be found (and pinned) after the run.
         best_step = getattr(self, '_best_val_step', None)
         if best_step is not None:
-            with open(osj(self.config.trainer.default_local_dir, 'best_ckpt.json'), 'w') as f:
+            with open(os.path.join(self.config.trainer.default_local_dir, 'best_ckpt.json'), 'w') as f:
                 json.dump({'best_step': best_step,
                            'best_score': getattr(self, '_best_val_score', None),
                            'metric': 'macro-mean val/pass_at_1',
                            'path': f'global_step_{best_step}'}, f)
 
         # Keep only the latest n checkpoints (for resume), plus the pinned best-pass@1 one.
-        n = self.config.trainer.get('keep_last_ckpts', 2)
-        if self.config.trainer.get('keep_all_ckpts', False):  # Remove old checkpoints
+        # GXPO sets n=1, so this is at most one resumable checkpoint plus one best checkpoint.
+        n = max(int(self.config.trainer.get('keep_last_ckpts', 1)), 1)
+        if self.config.trainer.get('keep_all_ckpts', False):
             return
 
         checkpoint_dirs = [d for d in os.listdir(self.config.trainer.default_local_dir)
@@ -876,7 +904,7 @@ class RayPPOTrainer(object):
                 continue  # Ignore malformed directories
 
         for step in ckpt_steps_to_remove(steps, n, best_step):
-            dir_to_remove = osj(self.config.trainer.default_local_dir, f'global_step_{step}')
+            dir_to_remove = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
             print(f"Removing old checkpoint directory: {dir_to_remove}")
             shutil.rmtree(dir_to_remove, ignore_errors=True)
 
@@ -908,6 +936,20 @@ class RayPPOTrainer(object):
                 if not os.path.isabs(global_step_folder):
                     working_dir = os.getcwd()
                     global_step_folder = os.path.join(working_dir, global_step_folder)
+
+        # Restore best-validation state before continuing, otherwise a resumed run
+        # could incorrectly replace the real best checkpoint with a lower score.
+        best_meta_path = os.path.join(self.config.trainer.default_local_dir, 'best_ckpt.json')
+        if os.path.exists(best_meta_path):
+            try:
+                with open(best_meta_path, 'r') as f:
+                    best_meta = json.load(f)
+                self._best_val_step = int(best_meta['best_step'])
+                self._best_val_score = float(best_meta['best_score'])
+                print(f"Restored best validation checkpoint: step={self._best_val_step}, "
+                      f"score={self._best_val_score:.6f}")
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+                print(f'Warning: could not restore best checkpoint metadata from {best_meta_path}: {exc}')
         print(f'Load from checkpoint folder: {global_step_folder}')
         # set global step
         self.global_steps = int(global_step_folder.split('global_step_')[-1])
@@ -1270,9 +1312,12 @@ class RayPPOTrainer(object):
         if did_validate:
             val_row = {'step': int(self.global_steps), 'eval_greedy/global_step': int(self.global_steps)}
             for key, value in metrics.items():
-                if key.startswith('eval_greedy/') or key.startswith('eff/') or key.startswith('time/'):
+                if (key.startswith('eval_greedy/') or key.startswith('eff/') or key.startswith('time/') or
+                        key.startswith('val/best_')):
                     val_row[key] = value
-            append_jsonl(os.path.join(self._efficiency_run_dir, 'greedy_validation.jsonl'), val_row)
+            validation_path = os.path.join(self._efficiency_run_dir, 'greedy_validation.jsonl')
+            keep_last_validations = self.config.trainer.get('keep_last_validations', 0)
+            write_retained_jsonl(validation_path, val_row, keep_last_validations)
 
     def fit(self):
         """

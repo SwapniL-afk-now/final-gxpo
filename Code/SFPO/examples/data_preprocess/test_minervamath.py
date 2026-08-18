@@ -45,7 +45,7 @@ if __name__ == '__main__':
 
     data_source = 'math-ai/minervamath'
 
-    dataset = datasets.load_dataset(data_source, trust_remote_code=True)
+    dataset = datasets.load_dataset(data_source)
 
     test_dataset = dataset['test']
 

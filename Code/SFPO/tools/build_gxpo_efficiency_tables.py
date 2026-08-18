@@ -101,11 +101,23 @@ def discover(args):
 
 
 def validation_rows(run):
-    rows = read_jsonl(run["dir"] / "greedy_validation.jsonl")
+    # The efficiency launcher keeps greedy_validation.jsonl bounded to the latest
+    # row. Historical validation rows are already present in train_metrics.jsonl
+    # (the same file used for all efficiency accounting), so recover them there
+    # without creating a second growing validation artifact.
     result = {}
+    rows = read_jsonl(run["dir"] / "greedy_validation.jsonl")
     for row in rows:
         step = step_of(row)
         if step is not None:
+            result[step] = row
+
+    rows = read_jsonl(run["dir"] / "train_metrics.jsonl")
+    if not rows:
+        rows = read_jsonl(run["dir"] / "metrics.jsonl")
+    for row in rows:
+        step = step_of(row)
+        if step is not None and "eval_greedy/avg_pass1" in row:
             result[step] = row
     return result
 

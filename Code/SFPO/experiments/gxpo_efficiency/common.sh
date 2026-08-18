@@ -7,12 +7,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.5}"
+REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.3}"
 K="${K:-10}"
 TRAIN_SEED="${TRAIN_SEED:-3407}"
 FINAL_EVAL_SEEDS="${FINAL_EVAL_SEEDS:-0 1 2 3}"
 MAX_STEPS="${MAX_STEPS:-400}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
+SAVE_FREQ="${SAVE_FREQ:-5}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 LR="${LR:-1e-6}"
 GPU_COUNT="${GPU_COUNT:-${N_GPUS:-1}}"
@@ -135,6 +136,7 @@ train_batch_size=$TRAIN_BATCH_SIZE
 rollout_n=$ROLLOUT_N
 learning_rate=$LR
 max_steps=$MAX_STEPS
+save_freq=$SAVE_FREQ
 validation_interval=5
 validation_decoding=greedy temperature=0 do_sample=false n=1
 final_decoding=stochastic temperature=1.0 top_p=0.7 do_sample=true n=4 seeds=$FINAL_EVAL_SEEDS
@@ -201,12 +203,13 @@ python -u -m verl.trainer.main_ppo \
   trainer.default_local_dir="$RUN_DIR" \
   trainer.n_gpus_per_node="$GPU_COUNT" \
   trainer.nnodes=1 \
-  trainer.save_freq=5 \
+  trainer.save_freq="$SAVE_FREQ" \
   +trainer.keep_last_ckpts=1 \
   +trainer.keep_all_ckpts=False \
   trainer.test_freq=5 \
-  +trainer.validation_seeds='[0,1,2,3,4]' \
-  +trainer.val_before_train=False \
+  +trainer.validation_seeds='[0]' \
+  +trainer.keep_last_validations=1 \
+  +trainer.val_before_train=True \
   +trainer.max_steps="$MAX_STEPS" \
   trainer.total_training_steps="$MAX_STEPS" \
   trainer.total_epochs=100 \

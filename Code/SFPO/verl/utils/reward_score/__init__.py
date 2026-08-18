@@ -20,13 +20,21 @@ def _default_compute_score(prompt_str, data_source, solution_str, ground_truth, 
         # res = gsm8k.compute_score(solution_str, ground_truth)
         from . import latex_math
         res = latex_math.compute_score(prompt_str, solution_str, ground_truth)
-    elif data_source in ['lighteval/MATH', 'DigitalLearningGmbH/MATH-lighteval']:
-        # Use Math-Verify (https://github.com/huggingface/Math-Verify) for better evaluation accuracy
+    elif data_source in {
+            'lighteval/MATH',
+            'DigitalLearningGmbH/MATH-lighteval',
+            'xDAN2099/lighteval-MATH',
+            'haizhongzheng/DAPO-Math-17K-cleaned',
+            'HuggingFaceH4/MATH-500',
+            'HuggingFaceH4/aime_2024',
+            'MathArena/aime_2025',
+            'AI-MO/aimo-validation-amc',
+            'math-ai/minervamath',
+            'math-ai/olympiadbench',
+    }:
+        # Use Math-Verify for all final GXPO math training/validation sources.
         from . import math_verify
         res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source in ['xDAN2099/lighteval-MATH', 'haizhongzheng/DAPO-Math-17K-cleaned']:
-        from . import latex_math
-        res = latex_math.compute_score(prompt_str, solution_str, ground_truth)
     elif data_source in [
             'numina_aops_forum', 'numina_synthetic_math', 'numina_amc_aime', 'numina_synthetic_amc', 'numina_cn_k12',
             'numina_olympiads'
