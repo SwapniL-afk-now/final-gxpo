@@ -14,6 +14,7 @@
 
 import os
 import logging
+import time
 import torch
 import numpy as np
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
@@ -36,6 +37,20 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
 
+def _memory_snapshot():
+    if not torch.cuda.is_available():
+        return {}
+    torch.cuda.synchronize()
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    return {
+        'allocated_gb': torch.cuda.memory_allocated() / (1024**3),
+        'reserved_gb': torch.cuda.memory_reserved() / (1024**3),
+        'free_device_gb': free_bytes / (1024**3),
+        'used_device_gb': (total_bytes - free_bytes) / (1024**3),
+        'total_device_gb': total_bytes / (1024**3),
+    }
+
+
 class FSDPVLLMShardingManager(BaseShardingManager):
 
     def __init__(self,
@@ -48,6 +63,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.inference_engine = inference_engine
         self.model_config = model_config
         self.device_mesh = device_mesh
+        self.performance_events = {}
 
         # Full params
         self.full_params = full_params
@@ -89,6 +105,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         # pytorch: https://pytorch.org/docs/stable/notes/cuda.html#memory-management
         # vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/device_allocator/cumem.py#L103
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        self.performance_events = {
+            'before_vllm_wake_memory': _memory_snapshot(),
+        }
+        wake_start = time.monotonic()
 
         log_gpu_memory_usage('Before state_dict() in sharding manager memory', logger=logger)
         params = self.module.state_dict()
@@ -111,6 +132,12 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
 
         del params
+        torch.cuda.synchronize()
+        self.performance_events.update({
+            'vllm_wake_and_weight_sync_s': time.monotonic() - wake_start,
+            'after_vllm_wake_memory': _memory_snapshot(),
+        })
+        self.performance_events['before_rollout_memory'] = _memory_snapshot()
         log_gpu_memory_usage('After del state_dict and empty_cache in sharding manager', logger=logger)
 
         # TODO: offload FSDP model weights
@@ -125,12 +152,30 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             torch.cuda.set_rng_state(self.gen_random_states)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        self.performance_events['after_rollout_memory'] = _memory_snapshot()
+        self.performance_events['before_vllm_sleep_memory'] = dict(
+            self.performance_events['after_rollout_memory'])
+        peak = {
+            'allocated_gb': torch.cuda.max_memory_allocated() / (1024**3),
+            'reserved_gb': torch.cuda.max_memory_reserved() / (1024**3),
+        }
+        self.performance_events['rollout_peak_memory'] = peak
         log_gpu_memory_usage('Before vllm offload in sharding manager', logger=logger)
-        # TODO(ZSL): check this
+        sleep_start = time.monotonic()
+        sleep_level = int(os.environ.get('VLLM_SLEEP_LEVEL', '1'))
+        # vLLM 0.27.1 supports level 2: discard weights and KV cache, which
+        # leaves the actor phase the largest possible amount of device memory.
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.offload_model_weights()
         else:
-            self.inference_engine.sleep(level=1)
+            self.inference_engine.sleep(level=sleep_level)
+        torch.cuda.empty_cache()
+        self.performance_events.update({
+            'vllm_sleep_s': time.monotonic() - sleep_start,
+            'vllm_sleep_level': sleep_level,
+            'after_vllm_sleep_memory': _memory_snapshot(),
+        })
+        self._rollout_lifecycle = dict(self.performance_events)
         log_gpu_memory_usage('After vllm offload in sharding manager', logger=logger)
 
         # self.module.to('cuda')

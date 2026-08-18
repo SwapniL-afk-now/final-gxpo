@@ -468,30 +468,38 @@ class RayPPOTrainer(object):
                                                    collate_fn=collate_fn,
                                                    sampler=sampler)
 
-        self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
-                                       tokenizer=self.tokenizer,
-                                       processor=self.processor,
-                                       prompt_key=self.config.data.prompt_key,
-                                       image_key=self.config.data.get('image_key', 'images'),
-                                       max_prompt_length=self.config.data.max_prompt_length,
-                                       filter_prompts=True,
-                                       return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                       truncation='error',
-                                       filter_overlong_prompts=self.config.data.filter_overlong_prompts)
-        self.val_dataloader = StatefulDataLoader(
-            dataset=self.val_dataset,
-            # Validation datasets are sent to inference engines as a whole batch,
-            # which will schedule the memory themselves.
-            batch_size=len(self.val_dataset),
-            num_workers=8,
-            shuffle=False,
-            drop_last=False,
-            collate_fn=collate_fn)
+        val_files = list(self.config.data.get('val_files') or [])
+        if val_files:
+            self.val_dataset = RLHFDataset(parquet_files=val_files,
+                                           tokenizer=self.tokenizer,
+                                           processor=self.processor,
+                                           prompt_key=self.config.data.prompt_key,
+                                           image_key=self.config.data.get('image_key', 'images'),
+                                           max_prompt_length=self.config.data.max_prompt_length,
+                                           filter_prompts=True,
+                                           return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                           truncation='error',
+                                           filter_overlong_prompts=self.config.data.filter_overlong_prompts)
+            self.val_dataloader = StatefulDataLoader(
+                dataset=self.val_dataset,
+                # Validation datasets are sent to inference engines as a whole batch,
+                # which will schedule the memory themselves.
+                batch_size=len(self.val_dataset),
+                num_workers=8,
+                shuffle=False,
+                drop_last=False,
+                collate_fn=collate_fn)
+        else:
+            # Performance smokes explicitly omit validation. Do not even open a
+            # validation parquet in that mode.
+            self.val_dataset = None
+            self.val_dataloader = ()
 
         assert len(self.train_dataloader) >= 1
-        assert len(
-            self.val_dataloader
-        ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
+        if val_files:
+            assert len(
+                self.val_dataloader
+            ) == 1, "Validation dataloader must have a single batch, which inference engines will schedule the memory themselves."
 
         print(f'Size of train dataloader: {len(self.train_dataloader)}')
 
@@ -1036,11 +1044,15 @@ class RayPPOTrainer(object):
 
         policy_step = scalar(metrics.get('actor/policy_grad_evals_step'), 0.0) or 0.0
         raw_step = scalar(metrics.get('actor/raw_backward_calls_step'), 0.0) or 0.0
-        rollout_s = float(timing_raw.get('gen', 0.0) or 0.0)
+        lifecycle = dict(batch.meta_info.get('vllm_lifecycle', {}))
+        generation_s = scalar(batch.meta_info.get('vllm_generation_time_s'))
+        rollout_s = float(generation_s if generation_s is not None else timing_raw.get('gen', 0.0) or 0.0)
         reward_s = float(timing_raw.get('reward', 0.0) or 0.0)
         ref_s = float(timing_raw.get('ref', 0.0) or 0.0)
         old_s = float(timing_raw.get('old_log_prob', 0.0) or 0.0)
         actor_s = float(timing_raw.get('update_actor', 0.0) or 0.0)
+        weight_sync_s = float(lifecycle.get('vllm_wake_and_weight_sync_s', 0.0) or 0.0)
+        total_step_s = float(timing_raw.get('step', active_s) or active_s)
         known_s = rollout_s + reward_s + ref_s + old_s + actor_s
         other_s = max(float(active_s) - known_s, 0.0)
         validation_s = float(timing_raw.get('testing', 0.0) or 0.0)
@@ -1097,6 +1109,17 @@ class RayPPOTrainer(object):
         actor_kl = scalar(metrics.get('actor/ppo_kl'))
         peak_alloc = scalar(metrics.get('perf/max_memory_allocated_gb'))
         peak_reserved = scalar(metrics.get('perf/max_memory_reserved_gb'))
+        actor_tokens = scalar(metrics.get('perf/actor_tokens_processed'), total_tokens) or total_tokens
+        rollout_tokens_per_second = total_tokens / rollout_s if rollout_s > 0 else None
+        rollout_sequences_per_second = generated_responses / rollout_s if rollout_s > 0 else None
+        actor_tokens_per_second = actor_tokens / actor_s if actor_s > 0 else None
+        memory_before_rollout = lifecycle.get('before_rollout_memory', {})
+        memory_rollout_peak = lifecycle.get('rollout_peak_memory', {})
+        memory_before_sleep = lifecycle.get('before_vllm_sleep_memory', {})
+        memory_after_sleep = lifecycle.get('after_vllm_sleep_memory', {})
+        memory_before_actor = metrics.get('perf/before_actor_update_memory', {})
+        memory_actor_peak = metrics.get('perf/actor_update_peak_memory', {})
+        memory_after_actor = metrics.get('perf/after_actor_update_memory', {})
 
         out = {
             'train/global_step': step,
@@ -1116,7 +1139,9 @@ class RayPPOTrainer(object):
             'eff/raw_backward_calls_step': raw_step,
             'eff/cum_raw_backward_calls': state['cum_raw_backward_calls'],
             'time/step_train_active_s': float(active_s),
+            'time/total_step_s': total_step_s,
             'time/rollout_s': rollout_s,
+            'time/weight_sync_s': weight_sync_s,
             'time/reward_s': reward_s,
             'time/ref_logprob_s': ref_s,
             'time/old_logprob_s': old_s,
@@ -1134,8 +1159,29 @@ class RayPPOTrainer(object):
             'time/cum_validation_s': state['cum_validation_s'],
             'time/cum_checkpoint_s': state['cum_checkpoint_s'],
             'time/cum_end_to_end_elapsed_s': time.monotonic() - fit_start_time,
+            'perf/total_step_time_s': total_step_s,
+            'perf/rollout_time_s': rollout_s,
+            'perf/rollout_generated_tokens': completion_tokens,
+            'perf/rollout_tokens_per_second': rollout_tokens_per_second,
+            'perf/rollout_sequences_per_second': rollout_sequences_per_second,
+            'perf/actor_update_time_s': actor_s,
+            'perf/actor_tokens_processed': actor_tokens,
+            'perf/actor_tokens_per_second': actor_tokens_per_second,
+            'perf/logprob_time_s': old_s,
+            'perf/weight_sync_time_s': weight_sync_s,
+            'perf/vllm_sleep_level': lifecycle.get('vllm_sleep_level'),
+            'perf/vllm_sleep_time_s': lifecycle.get('vllm_sleep_s'),
             'system/peak_vram_allocated_gb': peak_alloc,
             'system/peak_vram_reserved_gb': peak_reserved,
+            'system/before_rollout_memory': memory_before_rollout,
+            'system/rollout_peak_memory': memory_rollout_peak,
+            'system/after_rollout_memory': lifecycle.get('after_rollout_memory', {}),
+            'system/before_vllm_sleep_memory': memory_before_sleep,
+            'system/after_vllm_sleep_memory': memory_after_sleep,
+            'system/before_actor_update_memory': memory_before_actor,
+            'system/actor_update_peak_memory': memory_actor_peak,
+            'system/after_actor_update_memory': memory_after_actor,
+            'system/after_vllm_wake_memory': lifecycle.get('after_vllm_wake_memory', {}),
             'system/energy_kwh': state['energy_kwh'],
             'train/reward_mean': reward_mean,
             'train/reward_std': reward_std,
@@ -1163,6 +1209,8 @@ class RayPPOTrainer(object):
         # changing the exported columns between runs.
         out.update({
             'system/gpu_util_mean': None,
+            'system/gpu_util_p50': None,
+            'system/gpu_util_p90': None,
             'system/gpu_util_peak': None,
             'system/gpu_power_mean_w': None,
             'system/gpu_power_peak_w': None,
@@ -1589,7 +1637,22 @@ class RayPPOTrainer(object):
                             else:
                                 actor_output = self.actor_rollout_wg.update_actor(batch)
 
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        # reduce_metrics expects scalar/list values.  Performance
+                        # memory snapshots are intentionally nested dictionaries;
+                        # preserve them separately and merge them back after the
+                        # scalar reduction so they remain available to the
+                        # durable efficiency logger.
+                        actor_raw_metrics = actor_output.meta_info['metrics']
+                        actor_nested_metrics = {
+                            key: value for key, value in actor_raw_metrics.items()
+                            if isinstance(value, dict)
+                        }
+                        actor_scalar_metrics = {
+                            key: value for key, value in actor_raw_metrics.items()
+                            if not isinstance(value, dict)
+                        }
+                        actor_output_metrics = reduce_metrics(actor_scalar_metrics)
+                        actor_output_metrics.update(actor_nested_metrics)
                         if self.config.actor_rollout_ref.actor.get('use_sfpo', False) and self.stop_SFPO:
                             actor_output_metrics.update({
                                 'actor/sfpo_k': float(self.config.actor_rollout_ref.actor.get('sfpo_inner_steps', 10)),

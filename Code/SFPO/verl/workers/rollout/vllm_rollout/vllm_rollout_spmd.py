@@ -25,6 +25,8 @@ When working with Megatron:
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
 import numpy as np
+import os
+import time
 from typing import List
 from contextlib import contextmanager
 from omegaconf import DictConfig
@@ -83,10 +85,11 @@ class vLLMRollout(BaseRollout):
         assert tensor_parallel_size <= torch.distributed.get_world_size(), \
             "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get('max_num_batched_tokens', 8192)
+        max_num_seqs = self.config.get('max_num_seqs', None)
+        attention_backend = self.config.get('attention_backend', None)
 
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
-            import os
             os.environ['CUDA_TIMER_STREAM_KAFKA_ENABLE'] = '0'
             os.environ['MEGATRON_IMPORT_TIMERS'] = '0'
             train_tp = kwargs.get('train_tp', None)
@@ -110,13 +113,16 @@ class vLLMRollout(BaseRollout):
             max_model_len=config.prompt_length + config.response_length,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=max_num_seqs,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             seed=0,
+            **({'attention_backend': attention_backend} if attention_backend is not None else {}),
         )
 
-        # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        # Offload vLLM before the first actor phase using the installed sleep API.
+        sleep_level = int(os.environ.get('VLLM_SLEEP_LEVEL', '1'))
+        self.inference_engine.sleep(level=sleep_level)
 
         kwargs = dict(
             n=1,
@@ -211,6 +217,7 @@ class vLLMRollout(BaseRollout):
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             sampling_params = self.sampling_params
+            generation_start = time.monotonic()
             # Multi-seed validation: give each repeated sample its own reproducible
             # seed (base gen_seed offset by row index) so the val_kwargs.n copies of a
             # prompt stay diverse (real pass@n) yet identical across re-runs of a seed.
@@ -226,6 +233,7 @@ class vLLMRollout(BaseRollout):
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=sampling_params,
                 use_tqdm=False)
+            generation_time_s = time.monotonic() - generation_start
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
@@ -280,4 +288,10 @@ class vLLMRollout(BaseRollout):
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
 
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+        lifecycle = dict(getattr(self, '_rollout_lifecycle', {}))
+        lifecycle['vllm_generation_time_s'] = float(generation_time_s)
+        return DataProto(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info={'vllm_generation_time_s': float(generation_time_s), 'vllm_lifecycle': lifecycle},
+        )

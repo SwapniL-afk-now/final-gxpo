@@ -47,3 +47,10 @@ Code/SFPO/eval-results/
 !Code/SFPO/docs/H200_SETUP.md
 !Code/SFPO/env/h200-freeze.txt
 !Code/SFPO/env/h200-core-versions.txt
+
+# Local GXPO experiment assets and generated performance reports.
+Code/SFPO/data/
+Code/SFPO/models/
+Code/SFPO/results/
+Code/SFPO/.gxpo_pydeps/
+!Code/SFPO/experiments/gxpo_efficiency/qwen1p5b_perf.env

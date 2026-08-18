@@ -61,14 +61,28 @@ RESULT_ROOT="${GXPO_RESULTS_ROOT:-$REPO_ROOT/results/gxpo_efficiency}"
 RUN_DIR="$RESULT_ROOT/$RUN_NAME"
 mkdir -p "$RUN_DIR"
 
+# Keep vLLM and FlashInfer autotune artifacts writable and isolated per run.
+export VLLM_CACHE_ROOT="$RUN_DIR/vllm_cache"
+export VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR="$RUN_DIR/flashinfer_autotune_cache"
+export VLLM_SLEEP_LEVEL="${VLLM_SLEEP_LEVEL:-2}"
+mkdir -p "$VLLM_CACHE_ROOT" "$VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"
+
 export GXPO_EFFICIENCY_RUN=1
 export GXPO_RUN_NAME="$RUN_NAME"
 export GXPO_MODEL_ALIAS="$MODEL_ALIAS"
 export TRAIN_SEED
 export FINAL_EVAL_SEEDS
 export WANDB_PROJECT="$PROJECT"
-export WANDB_GROUP="$MODEL_ALIAS"
-export WANDB_TAGS="model:$MODEL_ALIAS,method:$METHOD${METHOD:+,k:$K}${METHOD:+,alpha:$REPOSITION_ALPHA},experiment:final-efficiency"
+if [[ ! -v WANDB_GROUP || -z "$WANDB_GROUP" ]]; then
+  export WANDB_GROUP="$MODEL_ALIAS"
+fi
+if [[ ! -v WANDB_TAGS || -z "$WANDB_TAGS" ]]; then
+  if [[ "$METHOD" == "grpo" ]]; then
+    export WANDB_TAGS="model:$MODEL_ALIAS,method:$METHOD,experiment:final-efficiency"
+  else
+    export WANDB_TAGS="model:$MODEL_ALIAS,method:$METHOD,k:$K,alpha:$REPOSITION_ALPHA,experiment:final-efficiency"
+  fi
+fi
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_DIR="$RUN_DIR"
 export RAY_ADDRESS=local
@@ -146,7 +160,7 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.model.path="$MODEL_ID" \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.model.enable_gradient_checkpointing=True \
-  actor_rollout_ref.model.attn_implementation="${ATTN_IMPL:-flash_attention_2}" \
+  actor_rollout_ref.model.attn_implementation="${ATTN_IMPL:-flash_attention_3}" \
   actor_rollout_ref.actor.optim.lr="$LR" \
   +actor_rollout_ref.actor.optim.name=adamw \
   +actor_rollout_ref.actor.data_loader_seed="$TRAIN_SEED" \
@@ -165,6 +179,10 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${TENSOR_PARALLEL_SIZE:-1}" \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.gpu_memory_utilization="${VLLM_GPU_MEMORY_UTILIZATION:-0.5}" \
+  actor_rollout_ref.rollout.max_num_batched_tokens="${VLLM_MAX_NUM_BATCHED_TOKENS:-98304}" \
+  actor_rollout_ref.rollout.max_num_seqs="${VLLM_MAX_NUM_SEQS:-1024}" \
+  actor_rollout_ref.rollout.enable_chunked_prefill="${VLLM_ENABLE_CHUNKED_PREFILL:-True}" \
+  actor_rollout_ref.rollout.attention_backend="${VLLM_ATTENTION_BACKEND:-FLASHINFER}" \
   actor_rollout_ref.rollout.n="$ROLLOUT_N" \
   actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE:-1.0}" \
   actor_rollout_ref.rollout.top_p="${ROLLOUT_TOP_P:-1.0}" \
@@ -184,9 +202,10 @@ python -u -m verl.trainer.main_ppo \
   trainer.n_gpus_per_node="$GPU_COUNT" \
   trainer.nnodes=1 \
   trainer.save_freq=5 \
-  +trainer.keep_last_ckpts=2 \
+  +trainer.keep_last_ckpts=1 \
   +trainer.keep_all_ckpts=False \
   trainer.test_freq=5 \
+  +trainer.validation_seeds='[0,1,2,3,4]' \
   +trainer.val_before_train=False \
   +trainer.max_steps="$MAX_STEPS" \
   trainer.total_training_steps="$MAX_STEPS" \

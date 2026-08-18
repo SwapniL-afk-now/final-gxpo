@@ -49,6 +49,20 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
 
 
+def _actor_memory_snapshot():
+    if not torch.cuda.is_available():
+        return {}
+    torch.cuda.synchronize()
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    return {
+        'allocated_gb': torch.cuda.memory_allocated() / (1024**3),
+        'reserved_gb': torch.cuda.memory_reserved() / (1024**3),
+        'free_device_gb': free_bytes / (1024**3),
+        'used_device_gb': (total_bytes - free_bytes) / (1024**3),
+        'total_device_gb': total_bytes / (1024**3),
+    }
+
+
 def create_device_mesh(world_size, fsdp_size):
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
@@ -155,7 +169,14 @@ class ActorRolloutRefWorker(Worker):
                                role='actor'):
         from verl.utils.model import print_model_size, update_model_config, get_generation_config
         from verl.utils.torch_dtypes import PrecisionType
-        from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForVision2Seq
+        from transformers import AutoModelForCausalLM, AutoConfig
+        try:
+            from transformers import AutoModelForVision2Seq
+        except ImportError:
+            # Transformers 5.x renamed the registry for image-text/vision
+            # causal models. Qwen2 causal loading still uses AutoModelForCausalLM;
+            # this alias only preserves the multimodal type check below.
+            from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
         from torch import optim
 
@@ -476,10 +497,34 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+            before_actor_update = _actor_memory_snapshot()
             with Timer(name='update_policy', logger=None) as timer:
                 metrics = self.actor.update_policy(data=data)
+            after_actor_update = _actor_memory_snapshot()
+            actor_update_peak = {
+                'allocated_gb': torch.cuda.max_memory_allocated() / (1024**3),
+                'reserved_gb': torch.cuda.max_memory_reserved() / (1024**3),
+                # CUDA exposes allocation peaks separately from the device
+                # free/used sample; retain the latter at the end of the update
+                # so peak and phase-level VRAM can be compared in one row.
+                'free_device_gb': after_actor_update.get('free_device_gb'),
+                'used_device_gb': after_actor_update.get('used_device_gb'),
+                'total_device_gb': after_actor_update.get('total_device_gb'),
+            }
             delta_time = timer.last
             global_num_tokens = data.meta_info['global_token_num']
+            if isinstance(global_num_tokens, (list, tuple)):
+                actor_tokens = float(sum(global_num_tokens))
+            else:
+                actor_tokens = float(global_num_tokens)
+            metrics['perf/actor_tokens_processed'] = actor_tokens
+            metrics.update({
+                'perf/before_actor_update_memory': before_actor_update,
+                'perf/actor_update_peak_memory': actor_update_peak,
+                'perf/after_actor_update_memory': after_actor_update,
+            })
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
             metrics[
                 'perf/mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
@@ -692,6 +737,12 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('After rollout generation', logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
+
+        # The manager records sleep/VRAM snapshots in __exit__, so merge its
+        # lifecycle only after leaving the context.
+        lifecycle = dict(output.meta_info.get('vllm_lifecycle', {}))
+        lifecycle.update(getattr(self.rollout_sharding_manager, '_rollout_lifecycle', {}))
+        output.meta_info['vllm_lifecycle'] = lifecycle
 
         output = output.to('cpu')
 

@@ -32,7 +32,34 @@ from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_u
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
 
-from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+except ImportError:
+    # The base vLLM image may omit FlashAttention while Transformers SDPA is
+    # available. Keep the actor importable for that supported path; the
+    # fallback is only used when remove-padding is explicitly enabled.
+    from einops import rearrange
+
+    def index_first_axis(hidden_states, indices):
+        return hidden_states[indices]
+
+    def unpad_input(hidden_states, attention_mask):
+        batch_size, seqlen = attention_mask.shape
+        indices = torch.nonzero(attention_mask.reshape(-1), as_tuple=False).flatten()
+        hidden_states = hidden_states.reshape(batch_size * seqlen, *hidden_states.shape[2:])[indices]
+        lengths = attention_mask.sum(dim=-1, dtype=torch.int32)
+        cu_seqlens = torch.zeros(batch_size + 1, device=attention_mask.device, dtype=torch.int32)
+        cu_seqlens[1:] = torch.cumsum(lengths, dim=0)
+        return hidden_states, indices, cu_seqlens, int(lengths.max().item()) if lengths.numel() else 0
+
+    def pad_input(hidden_states, indices, batch, seqlen):
+        output = torch.zeros(
+            (batch * seqlen, *hidden_states.shape[1:]),
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+        output.index_copy_(0, indices, hidden_states)
+        return output.view(batch, seqlen, *hidden_states.shape[1:])
 
 __all__ = ['DataParallelPPOActor']
 

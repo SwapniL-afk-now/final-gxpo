@@ -18,10 +18,35 @@ Preprocess the math dataset to parquet format
 import os
 import datasets
 
-from verl.utils.hdfs_io import copy, makedirs
 import argparse
 
-from verl.utils.reward_score.math_dataset import remove_boxed, last_boxed_only_string
+
+
+def last_boxed_only_string(string):
+    idx = string.rfind("\\boxed")
+    if "\\boxed " in string:
+        return "\\boxed " + string.split("\\boxed ")[-1].split("$")[0]
+    if idx < 0:
+        idx = string.rfind("\\fbox")
+        if idx < 0:
+            return None
+    i = idx
+    open_braces = 0
+    while i < len(string):
+        if string[i] == "{":
+            open_braces += 1
+        elif string[i] == "}":
+            open_braces -= 1
+            if open_braces == 0:
+                return string[idx:i + 1]
+        i += 1
+    return None
+
+
+def remove_boxed(s):
+    if "\\boxed " in s:
+        return s[len("\\boxed "):]
+    return s[len("\\boxed{"):-1]
 
 
 def extract_solution(solution_str):
@@ -47,6 +72,8 @@ if __name__ == '__main__':
     parser.add_argument('--hdfs_dir', default=None)
     parser.add_argument('--train_size', type=int, default=7500)
     parser.add_argument('--test_size', type=int, default=5000)
+    parser.add_argument('--train_only', action='store_true',
+                        help='Only write the selected train split; skip test preprocessing.')
     parser.add_argument('--template_type', type=str, default='base')
 
     args = parser.parse_args()
@@ -55,10 +82,10 @@ if __name__ == '__main__':
     TRAIN_SIZE = args.train_size
     TEST_SIZE = args.test_size
 
-    dataset = datasets.load_dataset(data_source, trust_remote_code=True)
+    dataset = datasets.load_dataset(data_source)
 
     train_dataset = dataset['train'].select(range(TRAIN_SIZE))
-    test_dataset = dataset['test'].select(range(TEST_SIZE))
+    test_dataset = None if args.train_only else dataset['test'].select(range(TEST_SIZE))
 
     # instruction_following = "Let's think step by step and output the final answer within \\boxed{}."
 
@@ -94,19 +121,23 @@ if __name__ == '__main__':
         return process_fn
 
     train_dataset = train_dataset.map(function=make_map_fn('train'), with_indices=True)
-    test_dataset = test_dataset.map(function=make_map_fn('test'), with_indices=True)
+    if test_dataset is not None:
+        test_dataset = test_dataset.map(function=make_map_fn('test'), with_indices=True)
 
     local_dir = args.local_dir
     hdfs_dir = args.hdfs_dir
+    os.makedirs(local_dir, exist_ok=True)
 
     train_dataset.to_parquet(os.path.join(local_dir, 'train.parquet'))
-    test_dataset.to_parquet(os.path.join(local_dir, 'test.parquet'))
+    if test_dataset is not None:
+        test_dataset.to_parquet(os.path.join(local_dir, 'test.parquet'))
 
     # print data source and length
     print(f"Data source: {data_source}")
     print(f"Length of train dataset: {len(train_dataset)}")
 
     if hdfs_dir is not None:
+        from verl.utils.hdfs_io import copy, makedirs
         makedirs(hdfs_dir)
 
         copy(src=local_dir, dst=hdfs_dir)

@@ -154,8 +154,14 @@ def sample_gpu_telemetry() -> dict[str, float] | None:
             return None
         utils = [row[0] for row in rows]
         powers = [row[1] for row in rows]
+        utils_sorted = sorted(utils)
+        mid = len(utils_sorted) // 2
+        p50 = utils_sorted[mid] if len(utils_sorted) % 2 else (utils_sorted[mid - 1] + utils_sorted[mid]) / 2.0
+        p90 = utils_sorted[min(len(utils_sorted) - 1, int(math.ceil(0.90 * len(utils_sorted))) - 1)]
         return {
             "system/gpu_util_mean": sum(utils) / len(utils),
+            "system/gpu_util_p50": p50,
+            "system/gpu_util_p90": p90,
             "system/gpu_util_peak": max(utils),
             "system/gpu_power_mean_w": sum(powers) / len(powers),
             "system/gpu_power_peak_w": max(powers),
