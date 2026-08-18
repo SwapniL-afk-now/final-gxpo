@@ -1,0 +1,13 @@
+# H200 core compatibility constraints.
+#
+# These packages are supplied by the validated H200 base image and must not be
+# replaced by installation of the local verl fork or its Python dependencies.
+torch==2.13.0+cu130
+triton==3.7.1
+vllm==0.27.1
+transformers==5.15.0
+
+# The repository's source imports this version's TensorDict APIs. Keep this
+# constraint visible until the full project test suite demonstrates that a
+# newer major line is safe.
+tensordict==0.6.2

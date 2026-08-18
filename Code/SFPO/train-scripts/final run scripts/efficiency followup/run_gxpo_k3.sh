@@ -13,6 +13,11 @@ GPU="${GPU:-0}"
 ALPHA="${ALPHA:-0.5}"
 SFPO_TAU=0.5      # SFPO entropy z-score shutoff threshold
 GXPO_TAU=2.0      # GXPO trajectory-aware shutoff threshold
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-True}"
+# vLLM requires cache-engine eviction when CUDA graphs are enabled.
+FREE_CACHE_ENGINE="${FREE_CACHE_ENGINE:-$ENFORCE_EAGER}"
+USE_LIGER="${USE_LIGER:-False}"
 TRAIN_SEED=3407                 # matched FEPO training seed
 VAL_SEEDS="[3407]"           # same single greedy evaluation seed as GSPO
 LR=1e-6
@@ -75,7 +80,8 @@ python -u -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="$MODEL" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
+    actor_rollout_ref.model.attn_implementation="$ATTN_IMPL" \
+    +actor_rollout_ref.model.use_liger="$USE_LIGER" \
     actor_rollout_ref.actor.optim.lr=$LR \
     +actor_rollout_ref.actor.data_loader_seed=$TRAIN_SEED \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
@@ -92,6 +98,8 @@ python -u -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.enforce_eager="$ENFORCE_EAGER" \
+    actor_rollout_ref.rollout.free_cache_engine="$FREE_CACHE_ENGINE" \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.n=$N \
     actor_rollout_ref.rollout.temperature=1.0 \

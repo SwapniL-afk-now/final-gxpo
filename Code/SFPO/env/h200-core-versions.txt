@@ -1,0 +1,16 @@
+# H200 core versions recorded after verification
+Python: 3.12.13
+GPU: NVIDIA H200 NVL
+Compute capability: 9.0
+NVIDIA driver: 595.71.05
+CUDA toolkit: 13.0
+torch: 2.13.0+cu130
+triton: 3.7.1
+vllm: 0.27.1
+transformers: 5.15.0
+flash-attn: 2.8.3.post1
+flash-attn-3: 3.0.0
+liger-kernel: 0.8.1
+ray: 2.57.0
+tensordict: 0.6.2
+pyarrow: 22.0.0

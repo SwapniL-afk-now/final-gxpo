@@ -11,6 +11,7 @@ data:
   balance_dp_token: False
   chat_template: null
 model:
+  attn_implementation: flash_attention_2
   partial_pretrain: ~/models/gemma-1.1-7b-it
   fsdp_config:
     wrap_policy:

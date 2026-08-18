@@ -71,6 +71,9 @@ class DataParallelPPOActor(BasePPOActor):
         # cumulative backward-pass counter (1 BP = one full gradient over a mini-batch)
         self.cumulative_bp = 0
 
+        # Keep algorithmic/full gradient evaluations separate from actual
+        # autograd calls. The latter includes gradient-accumulation microbatches.
+        self.raw_backward_calls = 0
         # GXPO: shutoff-gate state + lazily allocated per-parameter buffers
         self.gxpo_state = None
         self._gxpo_bufs = None
@@ -200,6 +203,67 @@ class DataParallelPPOActor(BasePPOActor):
         grad_norm = self._clip_grads()
         self.actor_optimizer.step()
         return grad_norm
+
+    def _optimizer_state_metrics(self, reposition_pairs=None):
+        """Return scalar AdamW-state diagnostics without changing optimizer state.
+
+        ``reposition_pairs`` contains ``(post_reposition, pre_reposition)``
+        tensors when the caller is measuring a SFPO/GXPO jump.  The tensors are
+        already available in those update paths; this helper only reduces scalar
+        sums and never copies a full model to the driver.
+        """
+        if self.actor_optimizer is None:
+            return {}
+        params = [p for p in self.actor_module.parameters() if p.requires_grad]
+        if reposition_pairs is not None and len(reposition_pairs) != len(params):
+            reposition_pairs = None
+
+        stats = None
+        for index, param in enumerate(params):
+            grad = param.grad
+            state = self.actor_optimizer.state.get(param, {})
+            exp_avg = state.get('exp_avg')
+            exp_avg_sq = state.get('exp_avg_sq')
+            if grad is None or exp_avg is None or exp_avg_sq is None:
+                continue
+            if grad.device != exp_avg.device or grad.device != exp_avg_sq.device:
+                # Optimizer offload can leave state on CPU.  Skipping this
+                # optional diagnostic avoids an extra full-model transfer.
+                continue
+            grad_f = grad.detach().float()
+            avg_f = exp_avg.detach().float()
+            avg_sq_f = exp_avg_sq.detach().float()
+            if stats is None:
+                stats = torch.zeros(6, dtype=torch.float32, device=grad_f.device)
+            stats[0] += grad_f.square().sum()
+            stats[1] += avg_f.square().sum()
+            stats[2] += avg_sq_f.square().sum()
+            stats[3] += (grad_f * avg_f).sum()
+            if reposition_pairs is not None:
+                post, pre = reposition_pairs[index]
+                if post.device != grad_f.device or pre.device != grad_f.device:
+                    continue
+                direction_f = post.detach().float() - pre.detach().float()
+                stats[4] += direction_f.square().sum()
+                stats[5] += (direction_f * avg_f).sum()
+
+        if stats is None:
+            return {}
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+        grad_norm = stats[0].sqrt().item()
+        avg_norm = stats[1].sqrt().item()
+        direction_norm = stats[4].sqrt().item()
+        eps = 1e-12
+        return {
+            'optimizer/exp_avg_norm': avg_norm,
+            'optimizer/exp_avg_sq_norm': stats[2].sqrt().item(),
+            'optimizer/fresh_grad_vs_momentum_cosine': stats[3].item() / (grad_norm * avg_norm + eps),
+            'optimizer/reposition_direction_vs_momentum_cosine': (
+                stats[5].item() / (direction_norm * avg_norm + eps)
+                if reposition_pairs is not None else float('nan')
+            ),
+        }
 
 
     def compute_entorpy(self, data: DataProto) -> torch.Tensor:
@@ -343,7 +407,8 @@ class DataParallelPPOActor(BasePPOActor):
                             has_multi_modal_inputs,
                             select_keys,
                             non_tensor_select_keys=None,
-                            recompute_old_log_probs=False):
+                            recompute_old_log_probs=False,
+                            collect_metrics=True):
         """Zero grads and run one full forward/backward over a PPO mini-batch.
 
         Counts as exactly one backward pass (gradient accumulation over
@@ -410,30 +475,37 @@ class DataParallelPPOActor(BasePPOActor):
                 kl_loss = masked_mean(kld, response_mask)
 
                 policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
-                metrics['actor/kl_loss'] = kl_loss.detach().item()
-                metrics['actor/kl_coef'] = self.config.kl_loss_coef
+                if collect_metrics:
+                    metrics['actor/kl_loss'] = kl_loss.detach().item()
+                    metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
             if self.config.use_dynamic_bsz:
                 # relative to the dynamic bsz
                 loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
             else:
                 loss = policy_loss / self.gradient_accumulation
+            # Authoritative raw backward call site; one policy gradient can
+            # contain many calls when gradients are accumulated.
             loss.backward()
+            self.raw_backward_calls += 1
 
-            micro_metrics = {
-                'actor/entropy_loss': entropy_loss.detach().item(),
-                'actor/pg_loss': pg_loss.detach().item(),
-                'actor/pg_clipfrac': pg_clipfrac.detach().item(),
-                'actor/ppo_kl': ppo_kl.detach().item(),
-            }
-            append_to_dict(metrics, micro_metrics)
+            if collect_metrics:
+                micro_metrics = {
+                    'actor/entropy_loss': entropy_loss.detach().item(),
+                    'actor/pg_loss': pg_loss.detach().item(),
+                    'actor/pg_clipfrac': pg_clipfrac.detach().item(),
+                    'actor/ppo_kl': ppo_kl.detach().item(),
+                }
+                append_to_dict(metrics, micro_metrics)
 
         self.cumulative_bp += 1
         return metrics
 
-    def update_policy(self, data: DataProto):
+    def update_policy(self, data: DataProto, reposition_pairs=None):
         # make sure we are in training mode
         self.actor_module.train()
+        bp_start = self.cumulative_bp
+        raw_backward_start = self.raw_backward_calls
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
         dataloader, has_multi_modal_inputs, select_keys, non_tensor_select_keys = self._make_minibatch_iterator(data)
@@ -443,12 +515,18 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, mini_batch in enumerate(dataloader):
                 mb_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
                                                       non_tensor_select_keys)
+                if reposition_pairs is not None:
+                    append_to_dict(mb_metrics, self._optimizer_state_metrics(reposition_pairs))
                 _merge_metrics(metrics, mb_metrics)
 
                 print('>>> Weight update!!!')
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
         metrics['actor/cumulative_bp'] = self.cumulative_bp
+        metrics['actor/policy_grad_evals_step'] = self.cumulative_bp - bp_start
+        metrics['actor/cumulative_policy_grad_evals'] = self.cumulative_bp
+        metrics['actor/raw_backward_calls_step'] = self.raw_backward_calls - raw_backward_start
+        metrics['actor/cumulative_raw_backward_calls'] = self.raw_backward_calls
         self.actor_optimizer.zero_grad()
         return metrics
 
@@ -527,17 +605,21 @@ class DataParallelPPOActor(BasePPOActor):
         recompute_old = self.config.get('gxpo_recompute_old_log_probs', False)
         skip_corrective = self.config.get('gxpo_skip_corrective', False)
 
-        def standard_step():
+        def standard_step(fallback_triggered=False):
             metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
                                                non_tensor_select_keys)
             grad_norm = self._optimizer_step()
             append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
             append_to_dict(metrics, self._gxpo_default_metrics(enabled=0.0))
+            append_to_dict(metrics, {'actor/gxpo_fallback_triggered': float(fallback_triggered)})
             state.step_count = step_idx + 1
             return metrics
 
         if force_standard or not state.is_enabled(step_idx):
-            return standard_step()
+            # A degenerate-batch skip is an actual GXPO fallback; a normal
+            # post-trigger GRPO step is a planned shutoff and is represented
+            # by prediction_active=0 plus fallback_step.
+            return standard_step(fallback_triggered=force_standard)
 
         self._gxpo_init_buffers()
         params = self._gxpo_params
@@ -551,12 +633,12 @@ class DataParallelPPOActor(BasePPOActor):
             # pollution is accepted (rare non-finite event), no optimizer-state deepcopy
             self._gxpo_restore_theta0()
             self.actor_optimizer.zero_grad(set_to_none=True)
-            return standard_step()
+            return standard_step(fallback_triggered=True)
 
         # Pass 1: g0 at theta0. Keep its loss metrics (actor/entropy_loss etc.) — the skip-corrective
         # ablation has no Pass 3 to source them from, and ray_trainer reads actor/entropy_loss every step.
         probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                 non_tensor_select_keys)
+                                 non_tensor_select_keys, collect_metrics=skip_corrective)
         # Capture raw gradients for the retention ratio; clip only the optimizer step.
         self._gxpo_capture_grads(g0_bufs)
         gn0 = self._clip_grads().detach().item()
@@ -566,7 +648,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Pass 2: g1 at theta_{t,1}
         self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                 non_tensor_select_keys, recompute_old_log_probs=recompute_old)
+                                 non_tensor_select_keys, recompute_old_log_probs=recompute_old,
+                                 collect_metrics=False)
         # Capture raw gradients before clipping, matching g0.
         self._gxpo_capture_grads(g1_bufs)
         gn1 = self._clip_grads().detach().item()
@@ -578,27 +661,36 @@ class DataParallelPPOActor(BasePPOActor):
         device = theta0[0].device
         # stats layout: [g0_sq, g1_sq, dot_g0_g1, disp2_sq, dispK_sq, sum_r, sum_r_sq,
         #                n_active, n_total, scale_sum, errK_sq, dot_ce, closed_sq, explicit_sq, ratio_clipped]
-        stats = torch.zeros(15, dtype=torch.float64, device=device)
-        scale_max = torch.zeros(1, dtype=torch.float64, device=device)
+        # These values are diagnostics only. FP64 widening of every model-sized gradient
+        # buffer made each GXPO step perform several extra full-model reads and reductions.
+        # FP32 accumulation is sufficient for the reported metrics and does not feed the
+        # retention scale, reposition, optimizer, or shutoff decision.
+        stats = torch.zeros(15, dtype=torch.float32, device=device)
+        scale_max = torch.zeros(1, dtype=torch.float32, device=device)
+        param_sq = torch.zeros(1, dtype=torch.float32, device=device)
         do_diag = self._gxpo_diag_freq > 0 and (step_idx % self._gxpo_diag_freq == 0)
 
         with torch.no_grad():
             for p, t0, g0b, g1b in zip(params, theta0, g0_bufs, g1_bufs):
-                stats[0] += g0b.double().pow(2).sum()
-                stats[1] += g1b.double().pow(2).sum()
-                stats[2] += (g0b.double() * g1b.double()).sum()
+                param_sq += t0.float().square().sum()
+                g0f = g0b.float()
+                g1f = g1b.float()
+                stats[0] += g0f.square().sum()
+                stats[1] += g1f.square().sum()
+                stats[2] += (g0f * g1f).sum()
                 r, scale, active, ratio_clipped = compute_gxpo_retention_scale(g0b, g1b, K, delta)
                 stats[7] += active.sum()
                 stats[8] += g0b.numel()
                 stats[14] += ratio_clipped.sum()
-                stats[9] += scale.double().sum()
-                scale_max = torch.maximum(scale_max, scale.max().double().reshape(1))
+                stats[9] += scale.float().sum()
+                scale_max = torch.maximum(scale_max, scale.float().amax().reshape(1))
 
-                stats[5] += r.double().sum()
-                stats[6] += r.double().pow(2).sum()
+                rf = r.float()
+                stats[5] += rf.sum()
+                stats[6] += rf.square().sum()
 
                 disp2 = p.data - t0
-                stats[3] += disp2.double().pow(2).sum()
+                stats[3] += disp2.float().square().sum()
 
                 if do_diag:
                     # Table 6: closed-form S_K/S_2 vs explicit Horner sums
@@ -609,13 +701,13 @@ class DataParallelPPOActor(BasePPOActor):
                     scale_expl = torch.where(s2_expl.abs() > delta, s_expl / s2_expl, scale)
                     d_closed = disp2 * scale
                     d_expl = disp2 * scale_expl
-                    stats[10] += (d_closed - d_expl).double().pow(2).sum()
-                    stats[11] += (d_closed.double() * d_expl.double()).sum()
-                    stats[12] += d_closed.double().pow(2).sum()
-                    stats[13] += d_expl.double().pow(2).sum()
+                    stats[10] += (d_closed - d_expl).float().square().sum()
+                    stats[11] += (d_closed.float() * d_expl.float()).sum()
+                    stats[12] += d_closed.float().square().sum()
+                    stats[13] += d_expl.float().square().sum()
 
                 dispK = disp2.mul_(scale)  # disp2 buffer becomes dispK
-                stats[4] += dispK.double().pow(2).sum()
+                stats[4] += dispK.float().square().sum()
                 p.data.copy_(dispK.mul_(alpha).add_(t0))
 
         # Pass 3: slow correction at theta_tilde. Skipped for the no-corrective ablation, where the
@@ -623,21 +715,26 @@ class DataParallelPPOActor(BasePPOActor):
         if skip_corrective:
             pass3_metrics = probe_metrics  # reuse g0-probe loss metrics; no Pass 3 exists here
             gn_slow = gn1  # report the last real probe norm; no corrective grad exists
-            gslow_stats = torch.zeros(2, dtype=torch.float64, device=device)
+            gslow_stats = torch.zeros(2, dtype=torch.float32, device=device)
         else:
             pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                                     non_tensor_select_keys, recompute_old_log_probs=recompute_old)
-            gn_slow = self._clip_grads().detach().item()
-            if not (gn_slow == gn_slow and abs(gn_slow) != float('inf')):
-                return fallback()
-
-            gslow_stats = torch.zeros(2, dtype=torch.float64, device=device)
+                                                     non_tensor_select_keys, recompute_old_log_probs=recompute_old,
+                                                     collect_metrics=True)
+            append_to_dict(pass3_metrics, self._optimizer_state_metrics())
+            # Capture corrective-gradient diagnostics before clipping, matching g0/g1.
+            # _clip_grads() returns the pre-clip norm but mutates p.grad in place.
+            gslow_stats = torch.zeros(2, dtype=torch.float32, device=device)
             with torch.no_grad():
                 for p, g0b in zip(params, g0_bufs):
                     if p.grad is None:
                         continue
-                    gslow_stats[0] += p.grad.double().pow(2).sum()
-                    gslow_stats[1] += (p.grad.double() * g0b.double()).sum()
+                    gradf = p.grad.float()
+                    g0f = g0b.float()
+                    gslow_stats[0] += gradf.square().sum()
+                    gslow_stats[1] += (gradf * g0f).sum()
+            gn_slow = self._clip_grads().detach().item()
+            if not (gn_slow == gn_slow and abs(gn_slow) != float('inf')):
+                return fallback()
             self.actor_optimizer.step()
 
         # single global reduction so every rank takes the identical gate decision
@@ -645,7 +742,9 @@ class DataParallelPPOActor(BasePPOActor):
             full = torch.cat([stats, gslow_stats])
             torch.distributed.all_reduce(full, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(scale_max, op=torch.distributed.ReduceOp.MAX)
-            stats, gslow_stats = full[:14], full[14:]
+            torch.distributed.all_reduce(param_sq, op=torch.distributed.ReduceOp.SUM)
+            stats, gslow_stats = full[:15], full[15:]
+        param_norm = float(param_sq.sqrt().item())
 
         vals = torch.cat([stats, gslow_stats, scale_max]).tolist()
         (g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq, n_active, n_total, scale_sum,
@@ -689,6 +788,9 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_cos_g0_gslow': dot0slow / (g0_norm * gslow_norm + eps),
             'actor/gxpo_inactive_frac': 1.0 - n_active / max(n_total, 1.0),
             'actor/gxpo_ratio_clip_frac': ratio_clipped / max(n_active, 1.0),
+            'actor/gxpo_fallback_triggered': 0.0,
+            'reposition/jump_norm': abs(alpha) * dispK_norm,
+            'reposition/jump_relative_to_param_norm': abs(alpha) * dispK_norm / (param_norm + eps),
         })
         if do_diag:
             errK = errK_sq**0.5
@@ -708,6 +810,8 @@ class DataParallelPPOActor(BasePPOActor):
         shutoff gate is open, single-pass GRPO afterwards."""
         assert self.gxpo_state is not None, 'update_policy_gxpo called without use_gxpo=True'
         self.actor_module.train()
+        bp_start = self.cumulative_bp
+        raw_backward_start = self.raw_backward_calls
 
         # Guard against degenerate batches (e.g. a format-parse collapse: most rollouts get
         # reward 0 because they failed to parse, not because the problem was hard). Such a batch
@@ -730,6 +834,18 @@ class DataParallelPPOActor(BasePPOActor):
         if force_standard:
             metrics['actor/gxpo_format_skip'] = 1.0
         metrics['actor/cumulative_bp'] = self.cumulative_bp
+        metrics['actor/policy_grad_evals_step'] = self.cumulative_bp - bp_start
+        metrics['actor/cumulative_policy_grad_evals'] = self.cumulative_bp
+        metrics['actor/raw_backward_calls_step'] = self.raw_backward_calls - raw_backward_start
+        metrics['actor/cumulative_raw_backward_calls'] = self.raw_backward_calls
+        enabled_values = metrics.get('actor/gxpo_enabled', 0.0)
+        if isinstance(enabled_values, list):
+            enabled_values = sum(enabled_values) / len(enabled_values) if enabled_values else 0.0
+        metrics['actor/gxpo_prediction_active'] = float(enabled_values)
+        metrics['actor/gxpo_fallback_step'] = (
+            float(self.gxpo_state.trigger_index)
+            if self.gxpo_state.trigger_index != float('inf') else float('nan')
+        )
         if self.gxpo_state.trigger_index != float('inf'):
             metrics['actor/gxpo_shutoff_step'] = float(self.gxpo_state.trigger_index)
         self.actor_optimizer.zero_grad()

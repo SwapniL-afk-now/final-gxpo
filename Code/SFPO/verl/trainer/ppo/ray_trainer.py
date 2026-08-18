@@ -50,6 +50,10 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from .presampling_selector import DataProfiler
+from tools.gxpo_efficiency_runtime import (
+    BENCHMARK_ORDER, append_jsonl, json_safe, make_run_manifest, sample_gpu_telemetry,
+    scalar, source_to_benchmark, write_json,
+)
 
 WorkerType = Type[Worker]
 
@@ -537,7 +541,7 @@ class RayPPOTrainer(object):
         """
         seeds = self.config.trainer.get('validation_seeds', None)
         if not seeds:
-            return self._validate_once(gen_seed=None)
+            return self._decorate_greedy_validation(self._validate_once(gen_seed=None))
 
         per_seed = {s: self._validate_once(gen_seed=int(s)) for s in seeds}
 
@@ -551,7 +555,31 @@ class RayPPOTrainer(object):
                     merged[f'{key}/seed{int(s)}'] = per_seed[s][key]
             merged[key] = float(np.mean(vals))
             merged[f'{key}/std'] = float(np.std(vals))
-        return merged
+        return self._decorate_greedy_validation(merged)
+
+    def _decorate_greedy_validation(self, metrics):
+        """Expose stable paper keys from the existing per-source validation."""
+        result = dict(metrics)
+        values = {}
+        for key, value in metrics.items():
+            if not key.startswith('val/pass_at_1/') or key.endswith('/std') or '/seed' in key:
+                continue
+            source = key[len('val/pass_at_1/'):]
+            benchmark = source_to_benchmark(source)
+            if benchmark is not None:
+                values[benchmark] = float(value)
+        for benchmark in BENCHMARK_ORDER:
+            if benchmark in values:
+                result[f'eval_greedy/{benchmark}_pass1'] = values[benchmark]
+        if os.environ.get('GXPO_EFFICIENCY_RUN') and set(values) != set(BENCHMARK_ORDER):
+            missing = sorted(set(BENCHMARK_ORDER) - set(values))
+            raise RuntimeError(f'GXPO efficiency validation requires all six benchmarks; missing {missing}')
+        if values:
+            # Macro-average across benchmark datasets, never across examples.
+            result['eval_greedy/avg_pass1'] = float(np.mean([values[k] for k in BENCHMARK_ORDER if k in values]))
+            result['eval_greedy/benchmark_count'] = len(values)
+        result['eval_greedy/global_step'] = int(self.global_steps)
+        return result
 
     def _validate_once(self, gen_seed=None):
         reward_tensor_lst = []
@@ -950,6 +978,254 @@ class RayPPOTrainer(object):
                                                     prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _init_efficiency_logging(self):
+        run_dir = self.config.trainer.get('default_local_dir', '.')
+        self._efficiency_run_dir = os.path.abspath(os.path.expanduser(str(run_dir)))
+        os.makedirs(self._efficiency_run_dir, exist_ok=True)
+        self._efficiency_state = {
+            'cum_prompts': 0.0,
+            'cum_responses': 0.0,
+            'cum_prompt_tokens': 0.0,
+            'cum_completion_tokens': 0.0,
+            'cum_total_tokens': 0.0,
+            'cum_policy_grad_evals': 0.0,
+            'cum_raw_backward_calls': 0.0,
+            'cum_train_active_s': 0.0,
+            'cum_rollout_s': 0.0,
+            'cum_reward_s': 0.0,
+            'cum_ref_logprob_s': 0.0,
+            'cum_old_logprob_s': 0.0,
+            'cum_actor_update_s': 0.0,
+            'cum_data_sync_other_s': 0.0,
+            'cum_validation_s': 0.0,
+            'cum_checkpoint_s': 0.0,
+            'energy_kwh': 0.0,
+            'last_telemetry_time': None,
+            'last_power_w': None,
+            'last_telemetry': {},
+        }
+        manifest = make_run_manifest(self.config, self._efficiency_run_dir, os.getcwd())
+        write_json(os.path.join(self._efficiency_run_dir, 'run_manifest.json'), manifest)
+        print('[fair comparison config]')
+        print(json.dumps({
+            'model': manifest.get('hyperparameters', {}).get('actor_rollout_ref', {}).get('model', {}).get('path'),
+            'method': manifest.get('method'),
+            'train_batch_size': manifest.get('hyperparameters', {}).get('data', {}).get('train_batch_size'),
+            'rollout_n': manifest.get('hyperparameters', {}).get('actor_rollout_ref', {}).get('rollout', {}).get('n'),
+            'learning_rate': manifest.get('hyperparameters', {}).get('actor_rollout_ref', {}).get('actor', {}).get('optim', {}).get('lr'),
+            'prompt_length': manifest.get('hyperparameters', {}).get('data', {}).get('max_prompt_length'),
+            'response_length': manifest.get('hyperparameters', {}).get('data', {}).get('max_response_length'),
+            'validation_interval': manifest.get('hyperparameters', {}).get('trainer', {}).get('test_freq'),
+            'gpu_count': manifest.get('gpu_count_configured'),
+        }, indent=2, sort_keys=True))
+
+    def _efficiency_step_metrics(self, batch, metrics, timing_raw, active_s, fit_start_time, did_validate):
+        state = self._efficiency_state
+        step = int(self.global_steps)
+        responses = batch.batch['responses']
+        response_length = responses.shape[-1]
+        attention_mask = batch.batch['attention_mask']
+        prompt_mask = attention_mask[:, :-response_length].bool()
+        response_mask = attention_mask[:, -response_length:].bool()
+        n_rollouts = int(self.config.actor_rollout_ref.rollout.n)
+        generated_responses = float(len(batch))
+        generated_prompts = generated_responses / max(n_rollouts, 1)
+        prompt_tokens = float(prompt_mask.sum().item())
+        completion_tokens = float(response_mask.sum().item())
+        total_tokens = prompt_tokens + completion_tokens
+
+        policy_step = scalar(metrics.get('actor/policy_grad_evals_step'), 0.0) or 0.0
+        raw_step = scalar(metrics.get('actor/raw_backward_calls_step'), 0.0) or 0.0
+        rollout_s = float(timing_raw.get('gen', 0.0) or 0.0)
+        reward_s = float(timing_raw.get('reward', 0.0) or 0.0)
+        ref_s = float(timing_raw.get('ref', 0.0) or 0.0)
+        old_s = float(timing_raw.get('old_log_prob', 0.0) or 0.0)
+        actor_s = float(timing_raw.get('update_actor', 0.0) or 0.0)
+        known_s = rollout_s + reward_s + ref_s + old_s + actor_s
+        other_s = max(float(active_s) - known_s, 0.0)
+        validation_s = float(timing_raw.get('testing', 0.0) or 0.0)
+        checkpoint_s = float(timing_raw.get('save_checkpoint', 0.0) or 0.0)
+
+        state['cum_prompts'] += generated_prompts
+        state['cum_responses'] += generated_responses
+        state['cum_prompt_tokens'] += prompt_tokens
+        state['cum_completion_tokens'] += completion_tokens
+        state['cum_total_tokens'] += total_tokens
+        state['cum_policy_grad_evals'] += policy_step
+        state['cum_raw_backward_calls'] += raw_step
+        state['cum_train_active_s'] += float(active_s)
+        state['cum_rollout_s'] += rollout_s
+        state['cum_reward_s'] += reward_s
+        state['cum_ref_logprob_s'] += ref_s
+        state['cum_old_logprob_s'] += old_s
+        state['cum_actor_update_s'] += actor_s
+        state['cum_data_sync_other_s'] += other_s
+        state['cum_validation_s'] += validation_s
+        state['cum_checkpoint_s'] += checkpoint_s
+
+        telemetry_interval = max(int(os.environ.get('GXPO_GPU_TELEMETRY_INTERVAL', '10')), 1)
+        if step % telemetry_interval == 0:
+            telemetry = sample_gpu_telemetry()
+            now = time.monotonic()
+            if telemetry:
+                if state['last_telemetry_time'] is not None and state['last_power_w'] is not None:
+                    state['energy_kwh'] += state['last_power_w'] * (now - state['last_telemetry_time']) / 3.6e6
+                state['last_telemetry_time'] = now
+                state['last_power_w'] = telemetry.get('system/gpu_power_mean_w')
+                state['last_telemetry'] = telemetry
+
+        rewards = batch.batch.get('reward')
+        reward_values = rewards.detach().float().reshape(-1) if rewards is not None else None
+        if reward_values is not None and reward_values.numel():
+            reward_mean = float(reward_values.mean().item())
+            reward_std = float(reward_values.std(unbiased=False).item())
+            reward_min = float(reward_values.min().item())
+            reward_max = float(reward_values.max().item())
+            reward_variance = float(reward_values.var(unbiased=False).item())
+            positive_fraction = float((reward_values > 0).float().mean().item())
+        else:
+            reward_mean = reward_std = reward_min = reward_max = reward_variance = positive_fraction = float('nan')
+
+        valid_adv = batch.batch['advantages'][response_mask].detach().float()
+        advantage_mean = float(valid_adv.mean().item()) if valid_adv.numel() else float('nan')
+        advantage_std = float(valid_adv.std(unbiased=False).item()) if valid_adv.numel() else float('nan')
+        nonzero_advantage = float((valid_adv != 0).float().mean().item()) if valid_adv.numel() else float('nan')
+        response_lengths = response_mask.sum(-1).detach().float().cpu().numpy()
+        actor_entropy = scalar(metrics.get('actor/entropy_loss'))
+        actor_grad = scalar(metrics.get('actor/grad_norm'))
+        actor_clip = scalar(metrics.get('actor/pg_clipfrac'))
+        actor_kl = scalar(metrics.get('actor/ppo_kl'))
+        peak_alloc = scalar(metrics.get('perf/max_memory_allocated_gb'))
+        peak_reserved = scalar(metrics.get('perf/max_memory_reserved_gb'))
+
+        out = {
+            'train/global_step': step,
+            'eff/outer_step': step,
+            'eff/generated_prompts_step': generated_prompts,
+            'eff/generated_responses_step': generated_responses,
+            'eff/generated_prompt_tokens_step': prompt_tokens,
+            'eff/generated_completion_tokens_step': completion_tokens,
+            'eff/generated_total_tokens_step': total_tokens,
+            'eff/cum_prompts': state['cum_prompts'],
+            'eff/cum_responses': state['cum_responses'],
+            'eff/cum_prompt_tokens': state['cum_prompt_tokens'],
+            'eff/cum_completion_tokens': state['cum_completion_tokens'],
+            'eff/cum_total_tokens': state['cum_total_tokens'],
+            'eff/policy_grad_evals_step': policy_step,
+            'eff/cum_policy_grad_evals': state['cum_policy_grad_evals'],
+            'eff/raw_backward_calls_step': raw_step,
+            'eff/cum_raw_backward_calls': state['cum_raw_backward_calls'],
+            'time/step_train_active_s': float(active_s),
+            'time/rollout_s': rollout_s,
+            'time/reward_s': reward_s,
+            'time/ref_logprob_s': ref_s,
+            'time/old_logprob_s': old_s,
+            'time/actor_update_s': actor_s,
+            'time/data_sync_other_s': other_s,
+            'time/validation_s': validation_s,
+            'time/checkpoint_s': checkpoint_s,
+            'time/cum_train_active_s': state['cum_train_active_s'],
+            'time/cum_rollout_s': state['cum_rollout_s'],
+            'time/cum_reward_s': state['cum_reward_s'],
+            'time/cum_ref_logprob_s': state['cum_ref_logprob_s'],
+            'time/cum_old_logprob_s': state['cum_old_logprob_s'],
+            'time/cum_actor_update_s': state['cum_actor_update_s'],
+            'time/cum_data_sync_other_s': state['cum_data_sync_other_s'],
+            'time/cum_validation_s': state['cum_validation_s'],
+            'time/cum_checkpoint_s': state['cum_checkpoint_s'],
+            'time/cum_end_to_end_elapsed_s': time.monotonic() - fit_start_time,
+            'system/peak_vram_allocated_gb': peak_alloc,
+            'system/peak_vram_reserved_gb': peak_reserved,
+            'system/energy_kwh': state['energy_kwh'],
+            'train/reward_mean': reward_mean,
+            'train/reward_std': reward_std,
+            'train/reward_min': reward_min,
+            'train/reward_max': reward_max,
+            'train/reward_variance': reward_variance,
+            'train/positive_reward_fraction': positive_fraction,
+            'train/advantage_mean': advantage_mean,
+            'train/advantage_std': advantage_std,
+            'train/nonzero_advantage_fraction': nonzero_advantage,
+            'train/entropy_mean': actor_entropy,
+            'train/entropy_std': 0.0,
+            'train/response_length_mean': float(np.mean(response_lengths)),
+            'train/response_length_std': float(np.std(response_lengths)),
+            'train/response_length_p50': float(np.percentile(response_lengths, 50)),
+            'train/response_length_p90': float(np.percentile(response_lengths, 90)),
+            'train/response_length_max': float(np.max(response_lengths)),
+            'train/grad_norm': actor_grad,
+            'train/grad_norm_pre_clip': actor_grad,
+            'train/clip_fraction': actor_clip,
+            'train/approx_kl': actor_kl,
+        }
+        # Keep the schema stable even on hosts without nvidia-smi. Missing
+        # telemetry is represented as null in local JSON instead of silently
+        # changing the exported columns between runs.
+        out.update({
+            'system/gpu_util_mean': None,
+            'system/gpu_util_peak': None,
+            'system/gpu_power_mean_w': None,
+            'system/gpu_power_peak_w': None,
+        })
+        out.update(state['last_telemetry'])
+
+        actor_cfg = self.config.actor_rollout_ref.actor
+        if actor_cfg.get('use_gxpo', False):
+            alpha = scalar(actor_cfg.get('gxpo_alpha'), 0.5)
+            out.update({
+                'gxpo/k': scalar(actor_cfg.get('gxpo_k'), 10),
+                'gxpo/alpha': alpha,
+                'gxpo/prediction_active': scalar(metrics.get('actor/gxpo_prediction_active'), scalar(metrics.get('actor/gxpo_enabled'), 0.0)),
+                'gxpo/fallback_triggered': scalar(metrics.get('actor/gxpo_fallback_triggered'), 0.0),
+                'gxpo/fallback_step': scalar(metrics.get('actor/gxpo_fallback_step')),
+                'gxpo/g0_norm': scalar(metrics.get('actor/gxpo_g0_norm')),
+                'gxpo/g1_norm': scalar(metrics.get('actor/gxpo_g1_norm')),
+                'gxpo/fresh_grad_norm': scalar(metrics.get('actor/gxpo_gslow_norm')),
+                'gxpo/g0_g1_cosine': scalar(metrics.get('actor/gxpo_cos_g0_g1')),
+                'gxpo/g1_fresh_cosine': scalar(metrics.get('actor/gxpo_cos_g0_gslow')),
+                'gxpo/two_step_displacement_norm': scalar(metrics.get('actor/gxpo_disp2_norm')),
+                'gxpo/predicted_displacement_norm': scalar(metrics.get('actor/gxpo_dispK_norm')),
+                'gxpo/reposition_displacement_norm': (alpha or 0.0) * (scalar(metrics.get('actor/gxpo_dispK_norm'), 0.0) or 0.0),
+                'gxpo/prediction_to_observed_displacement_ratio': scalar(metrics.get('actor/gxpo_dispK_over_disp2')),
+                'gxpo/prediction_scale_mean': scalar(metrics.get('actor/gxpo_scale_mean')),
+                'gxpo/prediction_scale_std': scalar(metrics.get('actor/gxpo_r_std')),
+                'gxpo/prediction_scale_max': scalar(metrics.get('actor/gxpo_scale_max')),
+                'gxpo/retention_mean': scalar(metrics.get('actor/gxpo_r_mean')),
+                'gxpo/retention_std': scalar(metrics.get('actor/gxpo_r_std')),
+                'gxpo/retention_abs_mean': scalar(metrics.get('actor/gxpo_r_mean')),
+                'gxpo/active_coordinate_fraction': 1.0 - (scalar(metrics.get('actor/gxpo_inactive_frac'), 0.0) or 0.0),
+                'gxpo/unsafe_coordinate_fraction': scalar(metrics.get('actor/gxpo_ratio_clip_frac')),
+                'gxpo/reliability_stat': scalar(metrics.get('actor/gxpo_trigger_stat')),
+                'gxpo/reliability_threshold': scalar(actor_cfg.get('gxpo_tau'), 0.0),
+            })
+        elif actor_cfg.get('use_sfpo', False):
+            alpha = scalar(actor_cfg.get('sfpo_step_size'), 0.5)
+            out.update({
+                'sfpo/k': scalar(actor_cfg.get('sfpo_inner_steps'), 10),
+                'sfpo/alpha': alpha,
+                'sfpo/fast_phase_active': scalar(metrics.get('actor/sfpo_fast_phase_active'), 0.0),
+                'sfpo/fallback_triggered': scalar(metrics.get('actor/sfpo_fallback_triggered'), 1.0 if self.stop_SFPO else 0.0),
+                'sfpo/fallback_step': float(step) if self.stop_SFPO else None,
+                'sfpo/fast_updates_executed_step': scalar(metrics.get('actor/sfpo_fast_updates_executed_step'), 0.0),
+                'sfpo/reposition_displacement_norm': scalar(metrics.get('actor/sfpo_reposition_displacement_norm')),
+                'sfpo/fresh_grad_norm': scalar(metrics.get('actor/grad_norm')),
+            })
+
+        return out
+
+    def _write_efficiency_rows(self, metrics, did_validate):
+        row = {'step': int(self.global_steps)}
+        row.update(metrics)
+        append_jsonl(os.path.join(self._efficiency_run_dir, 'train_metrics.jsonl'), row)
+        # Keep the pre-existing filename for older analysis scripts.
+        append_jsonl(os.path.join(self._efficiency_run_dir, 'metrics.jsonl'), row)
+        if did_validate:
+            val_row = {'step': int(self.global_steps), 'eval_greedy/global_step': int(self.global_steps)}
+            for key, value in metrics.items():
+                if key.startswith('eval_greedy/') or key.startswith('eff/') or key.startswith('time/'):
+                    val_row[key] = value
+            append_jsonl(os.path.join(self._efficiency_run_dir, 'greedy_validation.jsonl'), val_row)
+
     def fit(self):
         """
         The training loop of PPO.
@@ -963,6 +1239,7 @@ class RayPPOTrainer(object):
                           experiment_name=self.config.trainer.experiment_name,
                           default_backend=self.config.trainer.logger,
                           config=OmegaConf.to_container(self.config, resolve=True))
+        self._init_efficiency_logging()
 
         self.global_steps = 0
         self.sampling_num = 0
@@ -986,7 +1263,7 @@ class RayPPOTrainer(object):
 
         # rebuttal backbone: durable per-step metrics log (independent of wandb)
         fit_start_time = time.monotonic()
-        metrics_jsonl_path = os.path.join(self.config.trainer.get('default_local_dir', '.'), 'metrics.jsonl')
+        metrics_jsonl_path = os.path.join(self._efficiency_run_dir, 'train_metrics.jsonl')
         os.makedirs(os.path.dirname(metrics_jsonl_path) or '.', exist_ok=True)
 
         sq_start = 0
@@ -1093,6 +1370,7 @@ class RayPPOTrainer(object):
                     )
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                active_train_start = time.monotonic()
 
                 with _timer('step', timing_raw):
                     # generate a batch
@@ -1149,7 +1427,8 @@ class RayPPOTrainer(object):
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
+                        with _timer('reward', timing_raw):
+                            reward_tensor = self.reward_fn(batch)
                         batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
@@ -1311,10 +1590,20 @@ class RayPPOTrainer(object):
                                 actor_output = self.actor_rollout_wg.update_actor(batch)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        if self.config.actor_rollout_ref.actor.get('use_sfpo', False) and self.stop_SFPO:
+                            actor_output_metrics.update({
+                                'actor/sfpo_k': float(self.config.actor_rollout_ref.actor.get('sfpo_inner_steps', 10)),
+                                'actor/sfpo_alpha': float(self.config.actor_rollout_ref.actor.get('sfpo_step_size', 0.5)),
+                                'actor/sfpo_fast_phase_active': 0.0,
+                                'actor/sfpo_fallback_triggered': 1.0,
+                                'actor/sfpo_fallback_step': float(self.global_steps),
+                                'actor/sfpo_fast_updates_executed_step': 0.0,
+                            })
                         metrics.update(actor_output_metrics)
                     ####################################MODIFICATION####################################
 
                     self.entropy_container.append(float(actor_output_metrics['actor/entropy_loss']))
+                    active_train_elapsed_s = time.monotonic() - active_train_start
 
                     # validate
                     did_validate = False
@@ -1355,7 +1644,11 @@ class RayPPOTrainer(object):
 
                     # reward_metrics = compute_reward_metrics(batch, self.config)
 
-                # TODO: implement actual tflpo and theoretical tflpo
+                # Efficiency timing intentionally excludes validation and checkpoint overhead.
+                metrics.update(self._efficiency_step_metrics(
+                    batch=batch, metrics=metrics, timing_raw=timing_raw,
+                    active_s=active_train_elapsed_s, fit_start_time=fit_start_time,
+                    did_validate=did_validate))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
@@ -1368,13 +1661,18 @@ class RayPPOTrainer(object):
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
-
-                with open(metrics_jsonl_path, 'a') as f:
-                    row = {'step': self.global_steps}
-                    row.update({k: (v.item() if hasattr(v, 'item') else v) for k, v in metrics.items()})
-                    f.write(json.dumps(row, default=float) + '\n')
+                self._write_efficiency_rows(metrics, did_validate)
 
                 if is_last_step:
+                    write_json(os.path.join(self._efficiency_run_dir, 'summary.json'), {
+                        'run_name': os.environ.get('GXPO_RUN_NAME', self.config.trainer.experiment_name),
+                        'terminal_step': int(self.global_steps),
+                        'terminal_checkpoint': os.path.join(self._efficiency_run_dir, f'global_step_{self.global_steps}'),
+                        'final_eval_pending': True,
+                        'greedy_validation_only_for_efficiency': True,
+                        'headline_wall_clock_metric': 'time/cum_train_active_s',
+                        'headline_bp_metric': 'eff/cum_policy_grad_evals',
+                    })
                     pprint(f'Final validation metrics: {last_val_metrics}')
                     return
 

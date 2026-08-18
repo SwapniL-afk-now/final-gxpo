@@ -37,3 +37,13 @@ global_step_*/
 *.jsonl
 *.pdf
 Code/SFPO/eval-results/
+
+# H200 build/cache artifacts
+.h200-build/
+
+# H200 environment contract and generated verification records
+!Code/SFPO/constraints-h200.txt
+!Code/SFPO/requirements-h200.txt
+!Code/SFPO/docs/H200_SETUP.md
+!Code/SFPO/env/h200-freeze.txt
+!Code/SFPO/env/h200-core-versions.txt

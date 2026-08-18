@@ -20,6 +20,8 @@ actor_rollout_ref:
     path: ~/models/deepseek-llm-7b-chat
     external_lib: null
     override_config: { }
+    # FA2 preserves legacy behavior; set to flash_attention_3 only on Hopper.
+    attn_implementation: flash_attention_2
     enable_gradient_checkpointing: True
     use_remove_padding: False
   actor:
@@ -113,6 +115,7 @@ critic:
     path: ~/models/deepseek-llm-7b-chat
     tokenizer_path: ${actor_rollout_ref.model.path}
     override_config: { }
+    attn_implementation: ${actor_rollout_ref.model.attn_implementation}
     external_lib: ${actor_rollout_ref.model.external_lib}
     enable_gradient_checkpointing: True
     use_remove_padding: False
@@ -144,6 +147,7 @@ reward_model:
     input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
     path: ~/models/FsfairX-LLaMA3-RM-v0.1
     external_lib: ${actor_rollout_ref.model.external_lib}
+    attn_implementation: ${actor_rollout_ref.model.attn_implementation}
     use_remove_padding: False
     fsdp_config:
       wrap_policy:

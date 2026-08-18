@@ -2,6 +2,7 @@
 # Storage-safe final main-table run: SFPO vs GXPO, Qwen2.5-1.5B-Instruct, full fine-tune, DAPO-17k train / AMC23 eval.
 # Dedicated final main-table run; set GPU=0 or GPU=1.
 set -euo pipefail
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 
 # /etc/environment ships RAY_ADDRESS="127.0.0.1" (no port) which is an invalid
 # bootstrap address; clear it so ray.init() starts a fresh local cluster.
@@ -75,7 +76,7 @@ python -u -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="$MODEL" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    +actor_rollout_ref.model.override_config.attn_implementation=flash_attention_2 \
+    actor_rollout_ref.model.attn_implementation="$ATTN_IMPL" \
     actor_rollout_ref.actor.optim.lr=$LR \
     +actor_rollout_ref.actor.data_loader_seed=$TRAIN_SEED \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \

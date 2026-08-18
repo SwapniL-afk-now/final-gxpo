@@ -40,6 +40,8 @@ class Tracking(object):
         if 'tracking' in default_backend or 'wandb' in default_backend:
             import wandb
             import os
+            wandb_group = os.environ.get("WANDB_GROUP") or None
+            wandb_tags = [tag for tag in os.environ.get("WANDB_TAGS", "").split(",") if tag]
             #check and create config.default_local_dir
             if not os.path.exists(config['trainer']['default_local_dir']):
                 os.makedirs(config['trainer']['default_local_dir'])
@@ -51,7 +53,7 @@ class Tracking(object):
                     wandb_id = f.read().strip()
                 if wandb_id:
                     try:
-                        wandb.init(project=project_name, id=wandb_id, resume="allow", mode=os.environ.get("WANDB_MODE", "online"))
+                        wandb.init(project=project_name, id=wandb_id, resume="allow", mode=os.environ.get("WANDB_MODE", "online"), group=wandb_group, tags=wandb_tags)
                         wandb_resume_flag = True
                         print("wandb resume success with id: ", wandb_id)
                     except:
@@ -59,7 +61,7 @@ class Tracking(object):
                 self.logger['wandb'] = wandb
 
             if not wandb_resume_flag:
-                wandb.init(project=project_name, name=experiment_name, config=config, mode=os.environ.get("WANDB_MODE", "online"))
+                wandb.init(project=project_name, name=experiment_name, config=config, mode=os.environ.get("WANDB_MODE", "online"), group=wandb_group, tags=wandb_tags)
                 with open(wandb_id_file, "w") as f:
                     f.write(wandb.run.id)
                     self.logger['wandb'] = wandb

@@ -121,11 +121,41 @@ def test_fixed_old_log_probs_wiring_and_checkpointing():
 
 def test_scale_diagnostics_are_accumulated_and_bounded():
     source = ACTOR_PATH.read_text()
-    assert 'stats[9] += scale.double().sum()' in source
-    assert 'scale_max = torch.maximum(scale_max, scale.max().double().reshape(1))' in source
+    assert 'dtype=torch.float32' in source
+    assert 'stats[9] += scale.float().sum()' in source
+    assert 'scale_max = torch.maximum(scale_max, scale.float().amax().reshape(1))' in source
+    assert '.double()' not in ast.get_source_segment(
+        source,
+        next(node for node in ast.walk(ast.parse(source))
+             if isinstance(node, ast.FunctionDef) and node.name == '_gxpo_minibatch_step'))
     _, scale, _, _ = production_ratio_scale(torch.ones(8), torch.ones(8), K=5)
     assert scale.mean().item() == 2.5
     assert scale.max().item() == 2.5
+
+
+def test_probe_passes_skip_discarded_metrics():
+    source = ACTOR_PATH.read_text()
+    tree = ast.parse(source)
+    backward = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == '_backward_minibatch')
+    collect_arg = next(arg for arg in backward.args.args if arg.arg == 'collect_metrics')
+    assert collect_arg is not None
+    step = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == '_gxpo_minibatch_step')
+    step_source = ast.get_source_segment(source, step)
+    assert 'collect_metrics=skip_corrective' in step_source
+    assert 'collect_metrics=False' in step_source
+    assert 'collect_metrics=True' in step_source
+
+
+def test_attention_backend_is_configurable_with_fa2_default():
+    worker_source = (REPO / 'verl' / 'workers' / 'fsdp_workers.py').read_text()
+    helper_source = (REPO / 'verl' / 'utils' / 'attention.py').read_text()
+    assert 'resolve_attention_implementation' in worker_source
+    assert 'DEFAULT_ATTENTION_IMPLEMENTATION = "flash_attention_2"' in helper_source
+    assert 'flash_attention_3' in helper_source
+    assert "attn_implementation=attn_implementation" in worker_source
+    assert "attn_implementation='flash_attention_2'" not in worker_source
 
 
 def test_reposition_uses_two_step_displacement_at_correct_location():

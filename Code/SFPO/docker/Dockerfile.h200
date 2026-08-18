@@ -1,0 +1,31 @@
+# H200 build option for the customized GXPO/verl fork.
+# The vLLM image is the binary-stack source of truth; setup_h200.sh refuses to
+# replace its Torch/Triton/vLLM combination with legacy project pins.
+FROM vllm/vllm-openai:v0.27.1
+
+ENV PYTHONUNBUFFERED=1 \
+    CUDA_DEVICE_ORDER=PCI_BUS_ID \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    MAX_JOBS=8 \
+    FLASH_ATTN_CUDA_ARCHS=90 \
+    FLASH_ATTENTION_DISABLE_SM80=TRUE
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git ninja-build ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && python -m pip install --no-cache-dir uv==0.12.3
+
+WORKDIR /opt/gradient-extrapolation-based-policy-optimization
+
+# Copy only source/config needed by setup and tests. No model, dataset, raw-data,
+# cache, or checkpoint directory is copied into this image.
+COPY Code/SFPO/pyproject.toml Code/SFPO/requirements-h200.txt Code/SFPO/constraints-h200.txt Code/SFPO/
+COPY Code/SFPO/verl/ Code/SFPO/verl/
+COPY Code/SFPO/scripts/ Code/SFPO/scripts/
+COPY Code/SFPO/tests/gxpo/ Code/SFPO/tests/gxpo/
+COPY Code/SFPO/train-scripts/ Code/SFPO/train-scripts/
+
+RUN bash Code/SFPO/scripts/setup_h200.sh --verbose
+
+# The setup script is verification-only at runtime; no model is loaded here.
+ENTRYPOINT ["/opt/gradient-extrapolation-based-policy-optimization/.venv-h200/bin/python", "Code/SFPO/scripts/verify_h200_env.py"]

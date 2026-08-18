@@ -40,6 +40,7 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+from verl.utils.attention import resolve_attention_implementation
 import numpy as np
 
 from codetiming import Timer
@@ -193,9 +194,12 @@ class ActorRolloutRefWorker(Worker):
             'pad_token_id': self.tokenizer.pad_token_id,
         }
         override_config_kwargs.update(override_model_config)
+        attn_implementation = resolve_attention_implementation(self.config.model, override_model_config)
+        override_config_kwargs['attn_implementation'] = attn_implementation
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
             print(f'Model config after override: {actor_model_config}')
+            print(f'Attention backend: {attn_implementation}')
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
         init_context = get_init_weight_context_manager(use_meta_tensor=not actor_model_config.tie_word_embeddings,
@@ -211,7 +215,7 @@ class ActorRolloutRefWorker(Worker):
             actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
                                                               torch_dtype=torch_dtype,
                                                               config=actor_model_config,
-                                                              attn_implementation='flash_attention_2',
+                                                              attn_implementation=attn_implementation,
                                                               trust_remote_code=trust_remote_code)
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
@@ -549,17 +553,17 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def sfpo_update_actor(self, data: DataProto):
-        # Support all hardwares
+        """Run the existing SFPO fast trajectory/reposition/slow update.
+
+        The method is intentionally mathematically unchanged.  The additional
+        values returned here are scalar accounting for the work that actually
+        executed, including any future actor fallback behavior.
+        """
         self.training_step += 1
         num_inner_steps = self.config.actor.get('sfpo_inner_steps', self.config.actor.get('lookahead_inner_steps', 3))
         step_size = self.config.actor.get('sfpo_step_size', self.config.actor.get('lookahead_step_size', 0.8))
         data = data.to(torch.cuda.current_device())
 
-        print("*********************************************")
-        print("num_inner_steps: ", num_inner_steps)
-        print("step_size: ", step_size)
-        print("*********************************************")
-                
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -567,6 +571,8 @@ class ActorRolloutRefWorker(Worker):
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
 
         data.batch = data.batch.cuda()
+        bp_start = self.actor.cumulative_bp
+        raw_backward_start = self.actor.raw_backward_calls
 
         with torch.no_grad():
             slow_weights = [p.detach().clone() for p in self.actor_module_fsdp.parameters() if p.requires_grad]
@@ -574,45 +580,72 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
 
-            # Step 1: Fast Trajectory
-            with Timer(name='update_policy', logger=None) as timer: 
-                for _ in range(num_inner_steps):
-                    metrics = self.actor.update_policy(data=data)
+            # Fast trajectory: preserve the existing K actual updates.
+            for _ in range(num_inner_steps):
+                metrics = self.actor.update_policy(data=data)
 
             with torch.no_grad():
                 fast_weights = [p.detach().clone() for p in self.actor_module_fsdp.parameters() if p.requires_grad]
+                jump_sq = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
+                param_sq = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
+                for slow, fast in zip(slow_weights, fast_weights):
+                    jump_sq += (fast.float() - slow.float()).square().sum()
+                    param_sq += slow.float().square().sum()
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(jump_sq, op=torch.distributed.ReduceOp.SUM)
+                    torch.distributed.all_reduce(param_sq, op=torch.distributed.ReduceOp.SUM)
+                jump_norm = float(jump_sq.sqrt().item())
+                param_norm = float(param_sq.sqrt().item())
+                # Reuse the already-cloned endpoints for the optimizer-state
+                # direction diagnostic; this does not allocate another model copy.
+                reposition_pairs = list(zip(fast_weights, slow_weights))
 
-            # Step 1: Reposition
+            # Reposition: the existing optimizer state is deliberately untouched.
             with torch.no_grad():
                 idx = 0
                 for param in self.actor_module_fsdp.parameters():
                     if not param.requires_grad:
                         continue
                     param_tmp = slow_weights[idx] + step_size * (fast_weights[idx] - slow_weights[idx])
-                    param_old = param.data.clone()
                     param.data.copy_(param_tmp)
                     idx += 1
 
-            # Step 3: Slow Update
+            # Slow correction update.
             with Timer(name='update_policy', logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                metrics = self.actor.update_policy(data=data, reposition_pairs=reposition_pairs)
 
             delta_time = timer.last
             global_num_tokens = data.meta_info['global_token_num']
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
-            metrics[
-                'perf/mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            metrics['perf/mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
             metrics['perf/max_memory_allocated_gb'] = torch.cuda.max_memory_allocated() / (1024**3)
             metrics['perf/max_memory_reserved_gb'] = torch.cuda.max_memory_reserved() / (1024**3)
             metrics['perf/cpu_memory_used_gb'] = psutil.virtual_memory().used / (1024**3)
 
+            # Actual work accounting across all K fast updates plus the slow update.
+            metrics['actor/policy_grad_evals_step'] = self.actor.cumulative_bp - bp_start
+            metrics['actor/cumulative_policy_grad_evals'] = self.actor.cumulative_bp
+            metrics['actor/raw_backward_calls_step'] = self.actor.raw_backward_calls - raw_backward_start
+            metrics['actor/cumulative_raw_backward_calls'] = self.actor.raw_backward_calls
+            metrics['actor/sfpo_k'] = float(num_inner_steps)
+            metrics['actor/sfpo_alpha'] = float(step_size)
+            metrics['actor/sfpo_fast_phase_active'] = 1.0
+            metrics['actor/sfpo_fallback_triggered'] = 0.0
+            metrics['actor/sfpo_fast_updates_executed_step'] = float(num_inner_steps)
+            metrics['actor/sfpo_reposition_displacement_norm'] = abs(float(step_size)) * jump_norm
+            metrics['actor/sfpo_jump_norm'] = abs(float(step_size)) * jump_norm
+            metrics['actor/sfpo_jump_relative_to_param_norm'] = (
+                abs(float(step_size)) * jump_norm / (param_norm + 1e-12)
+            )
+            metrics['reposition/jump_norm'] = abs(float(step_size)) * jump_norm
+            metrics['reposition/jump_relative_to_param_norm'] = (
+                abs(float(step_size)) * jump_norm / (param_norm + 1e-12)
+            )
+
             self.actor_lr_scheduler.step()
-            lr = self.actor_lr_scheduler.get_last_lr()[0]
-            metrics['actor/lr'] = lr
+            metrics['actor/lr'] = self.actor_lr_scheduler.get_last_lr()[0]
 
-            # TODO: here, we should return all metrics
             output = DataProto(meta_info={'metrics': metrics})
-
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
             output = output.to('cpu')
 
@@ -622,7 +655,6 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
 
         torch.cuda.empty_cache()
-
         return output
 
 
@@ -826,8 +858,11 @@ class CriticWorker(Worker):
             'pad_token_id': self.tokenizer.pad_token_id,
         }
         override_config_kwargs.update(override_config)
+        attn_implementation = resolve_attention_implementation(config.model, override_config)
+        override_config_kwargs['attn_implementation'] = attn_implementation
         if self.rank == 0:
             print(f'Critic overriding config {override_config_kwargs}')
+            print(f'Attention backend: {attn_implementation}')
 
         torch_dtype = self.config.model.fsdp_config.get('model_dtype', 'fp32')
         torch_dtype = PrecisionType.to_dtype(torch_dtype)
@@ -858,7 +893,7 @@ class CriticWorker(Worker):
             critic_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             torch_dtype=torch_dtype,
                                                                             config=critic_model_config,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation=attn_implementation,
                                                                             trust_remote_code=trust_remote_code)
 
             # some parameters may not in torch_dtype
@@ -1098,6 +1133,9 @@ class RewardModelWorker(Worker):
         trust_remote_code = config.model.get('trust_remote_code', False)
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         model_config.num_labels = 1
+        attn_implementation = resolve_attention_implementation(config.model, config.model.get('override_config', {}))
+        if self.rank == 0:
+            print(f'Attention backend: {attn_implementation}')
 
         use_remove_padding = config.model.get('use_remove_padding', False)
         if use_remove_padding:
@@ -1118,7 +1156,7 @@ class RewardModelWorker(Worker):
             reward_module = AutoModelForTokenClassification.from_pretrained(pretrained_model_name_or_path=local_path,
                                                                             config=model_config,
                                                                             torch_dtype=torch.bfloat16,
-                                                                            attn_implementation='flash_attention_2',
+                                                                            attn_implementation=attn_implementation,
                                                                             trust_remote_code=trust_remote_code)
             reward_module.to(torch.bfloat16)
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)

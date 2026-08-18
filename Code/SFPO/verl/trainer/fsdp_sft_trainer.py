@@ -47,6 +47,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.debug import log_gpu_memory_usage
+from verl.utils.attention import resolve_attention_implementation
 from peft import LoraConfig, TaskType, get_peft_model
 
 from verl.workers.sharding_manager import FSDPUlyssesShardingManager
@@ -224,6 +225,8 @@ class FSDPSFTTrainer(object):
             apply_monkey_patch(config, verbose=True)
 
         # This may be very large
+        attn_implementation = resolve_attention_implementation(self.config.model, self.config.model.get('override_config', {}))
+        print(f'Attention backend: {attn_implementation}')
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings,
                                                        mesh=self.device_mesh)
 
@@ -231,7 +234,7 @@ class FSDPSFTTrainer(object):
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(local_model_path,
                                                                                config=config,
                                                                                torch_dtype=torch.float32,
-                                                                               attn_implementation='flash_attention_2',
+                                                                               attn_implementation=attn_implementation,
                                                                                trust_remote_code=trust_remote_code)
 
             # Apply Liger kernel if use_liger is enabled
