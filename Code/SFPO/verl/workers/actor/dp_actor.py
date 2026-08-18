@@ -25,7 +25,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.actor import BasePPOActor
-from verl.workers.actor.gxpo_state import GXPOState
+from verl.workers.actor.gxpo_state import GXPOState, compute_gxpo_retention_scale
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
@@ -487,24 +487,33 @@ class DataParallelPPOActor(BasePPOActor):
         }
 
     def _gxpo_capture_grads(self, bufs):
-        for p, buf in zip(self._gxpo_params, bufs):
-            if p.grad is None:
+        grads = [p.grad for p in self._gxpo_params]
+        if all(grad is not None for grad in grads):
+            torch._foreach_copy_(bufs, grads)
+            return
+        for grad, buf in zip(grads, bufs):
+            if grad is None:
                 buf.zero_()
             else:
-                buf.copy_(p.grad)
+                buf.copy_(grad)
+
+    @staticmethod
+    def _gxpo_copy_parameters(destinations, sources):
+        """Copy cached parameter tensors with one foreach dispatch."""
+        torch._foreach_copy_(destinations, sources)
 
     def _gxpo_restore_theta0(self):
         with torch.no_grad():
-            for p, t0 in zip(self._gxpo_params, self._gxpo_bufs['theta0']):
-                p.data.copy_(t0)
+            self._gxpo_copy_parameters([p.data for p in self._gxpo_params],
+                                        self._gxpo_bufs['theta0'])
 
     def _gxpo_minibatch_step(self, mini_batch, temperature, has_multi_modal_inputs, select_keys,
                              non_tensor_select_keys, force_standard=False):
         """One GXPO 3-pass update on a single PPO mini-batch (Algorithm 1 of the paper).
 
         Faithful port of gxpo_single_minibatch_update from the reference
-        implementation: probe passes capture g0/g1 post-clip, retention ratio
-        r = g1/g0_safe is clamped to [-2, 3], the geometric scale
+        implementation: probe passes capture raw g0/g1 before optimizer-gradient
+        clipping, retention ratio r = g1/g0_safe is clamped to [-2, 3], and the geometric scale
         S_K/S_2 is clamped to [1, K/2+1], and the slow correction is taken at
         theta_tilde = theta0 + alpha * scale * (theta2 - theta0).
 
@@ -535,8 +544,7 @@ class DataParallelPPOActor(BasePPOActor):
         theta0, g0_bufs, g1_bufs = (self._gxpo_bufs[k] for k in ('theta0', 'g0', 'g1'))
 
         with torch.no_grad():
-            for p, t0 in zip(params, theta0):
-                t0.copy_(p.data)
+            self._gxpo_copy_parameters(theta0, [p.data for p in params])
 
         def fallback():
             # ponytail: light fallback — restore theta0 only; probe-step optimizer-moment
@@ -579,50 +587,12 @@ class DataParallelPPOActor(BasePPOActor):
                 stats[0] += g0b.double().pow(2).sum()
                 stats[1] += g1b.double().pow(2).sum()
                 stats[2] += (g0b.double() * g1b.double()).sum()
-                stats[7] += (g0b.abs() > delta).sum()
+                r, scale, active, ratio_clipped = compute_gxpo_retention_scale(g0b, g1b, K, delta)
+                stats[7] += active.sum()
                 stats[8] += g0b.numel()
-
-                # Algorithm 1: extrapolate only sufficiently active coordinates.
-                # Inactive coordinates retain the observed two-step displacement
-                # (scale=1); fabricating r=g1/delta for them injects arbitrary
-                # extrapolation noise into near-zero gradients.
-                active = g0b.abs() > delta
-                scale = torch.ones_like(g0b)
-                r = torch.ones_like(g0b)
-                if active.any():
-                    r_active = g1b[active] / g0b[active]
-                    # Numerical safeguard only; the geometric rule itself is
-                    # unchanged and, importantly, scale is not forced >= 1.
-                    finite_r = torch.isfinite(r_active)
-                    clipped_r = (~finite_r) | (r_active < -2.0) | (r_active > 3.0)
-                    stats[14] += clipped_r.sum()
-                    r_active.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
-
-                    # Horner form of S_n(r)=1+r+...+r^(n-1), stable near r=1.
-                    def geometric_sum(value, n):
-                        result = torch.ones_like(value)
-                        for _ in range(1, n):
-                            result.mul_(value).add_(1.0)
-                        return result
-
-                    s_k = geometric_sum(r_active, K)
-                    s_2 = geometric_sum(r_active, 2)
-                    active_scale = s_k / s_2
-                    # S_2 is zero at r=-1, where the geometric conversion is
-                    # undefined. Fall back to the observed displacement there.
-                    active_scale = torch.where(
-                        s_2.abs() > delta,
-                        active_scale,
-                        torch.ones_like(active_scale),
-                    ).nan_to_num(nan=1.0, posinf=1.0, neginf=1.0)
-                    # Bound the geometric extrapolation factor. Without this,
-                    # ratios near the configured clip limits can produce enormous
-                    # K-step scales (especially for K=10), destabilizing the
-                    # repositioning step. Keep this consistent with the SFT GXPO
-                    # implementation and the documented safety range.
-                    active_scale.clamp_(1.0, K / 2.0 + 1.0)
-                    r[active] = r_active
-                    scale[active] = active_scale
+                stats[14] += ratio_clipped.sum()
+                stats[9] += scale.double().sum()
+                scale_max = torch.maximum(scale_max, scale.max().double().reshape(1))
 
                 stats[5] += r.double().sum()
                 stats[6] += r.double().pow(2).sum()

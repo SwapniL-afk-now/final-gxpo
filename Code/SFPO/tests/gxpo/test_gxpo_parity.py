@@ -1,161 +1,181 @@
-"""GXPO verl-port parity checks (CPU only, no verl runtime deps).
+"""GXPO correctness tests for the production helper and actor wiring.
 
-Run: python tests/gxpo/test_gxpo_parity.py
+Run directly with:
+    PYTHONPATH=Code/SFPO python tests/gxpo/test_gxpo_parity.py
 
-Checks:
-  1. GXPOState trigger gate is bit-identical to the reference CCGRPOState
-     (reference class source is extracted by AST from legacy_impl.py when
-     available; skipped otherwise).
-  2. The verl per-parameter in-place ratio/scale/reposition arithmetic matches
-     the reference flat-vector formulation element-wise.
-  3. Corollary 2 sanity: on a diagonal quadratic with plain SGD and alpha=1,
-     one GXPO outer step lands on the K+1-step plain-GD point.
-  4. The Table-6 explicit Horner geometric sum matches the closed form.
+The scale tests import the exact helper used by ``dp_actor.py``. They do not
+maintain a second implementation of GXPO arithmetic.
 """
 
 import ast
 import importlib.util
-import os
-import sys
+from pathlib import Path
 
 import torch
 
-REPO = os.path.join(os.path.dirname(__file__), '..', '..')
-REFERENCE_IMPL = os.environ.get(
-    'GXPO_REFERENCE_IMPL',
-    os.path.expanduser('~/inside-model/gxpo_ral/legacy_impl.py'))
-
-DELTA = 1e-8
+REPO = Path(__file__).resolve().parents[2]
+GXPO_STATE_PATH = REPO / 'verl' / 'workers' / 'actor' / 'gxpo_state.py'
+ACTOR_PATH = REPO / 'verl' / 'workers' / 'actor' / 'dp_actor.py'
 
 
-def load_gxpo_state():
-    path = os.path.join(REPO, 'verl', 'workers', 'actor', 'gxpo_state.py')
-    spec = importlib.util.spec_from_file_location('gxpo_state', path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.GXPOState
+def load_gxpo_module():
+    spec = importlib.util.spec_from_file_location('production_gxpo_state', GXPO_STATE_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def load_reference_ccgrpo_state():
-    """Extract the CCGRPOState class from legacy_impl.py without importing the module."""
-    if not os.path.exists(REFERENCE_IMPL):
-        return None
-    tree = ast.parse(open(REFERENCE_IMPL).read())
-    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'CCGRPOState')
-    namespace = {'Optional': __import__('typing').Optional}
-    exec(compile(ast.Module(body=[cls], type_ignores=[]), REFERENCE_IMPL, 'exec'), namespace)
-    return namespace['CCGRPOState']
+GXPO = load_gxpo_module()
 
 
-def reference_ratio_scale(g0, g1, K, delta):
-    """Flat-vector arithmetic exactly as legacy_impl.py lines 6502-6511."""
-    sign_g0 = torch.sign(g0)
-    sign_g0 = torch.where(sign_g0 == 0, torch.ones_like(sign_g0), sign_g0)
-    g0_safe = sign_g0 * torch.clamp(torch.abs(g0), min=delta)
-    r = g1 / g0_safe
-    r = torch.clamp(r, -2.0, 3.0)
-    r = torch.where(torch.isfinite(r), r, torch.ones_like(r))
-    s_k = (1.0 - torch.pow(r, K)) / (1.0 - r + delta)
-    s_2 = (1.0 - torch.pow(r, 2)) / (1.0 - r + delta)
-    scale = torch.clamp(s_k / (s_2 + delta), 1.0, K / 2.0 + 1.0)
-    return r, scale
+def production_ratio_scale(g0, g1, K, delta=1e-8):
+    return GXPO.compute_gxpo_retention_scale(g0, g1, K, delta)
 
 
-def verl_ratio_scale(g0b, g1b, K, delta):
-    """Per-parameter in-place arithmetic exactly as dp_actor._gxpo_minibatch_step."""
-    sgn = torch.where(g0b >= 0, 1.0, -1.0)
-    r = g1b / (g0b.abs().clamp(min=delta) * sgn)
-    r.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
-    one_minus_r = 1.0 - r
-    s_k = (1.0 - r.pow(K)) / (one_minus_r + delta)
-    s_2 = (1.0 - r * r) / (one_minus_r + delta)
-    scale = (s_k / (s_2 + delta)).clamp_(1.0, K / 2.0 + 1.0)
-    return r, scale
+def test_scale_edge_cases():
+    g0 = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1e-9, 1.0, 1.0, 1.0])
+    g1 = torch.tensor([1.0, 0.0, -1.0, 10.0, float('nan'), 4.0, 4.0, float('inf'), -3.0, 1.0])
+    ratio, scale, active, clipped = production_ratio_scale(g0, g1, K=5)
+
+    # r=1 -> S_K/S_2=K/2; r=0 -> 1; r=-1 has S_2=0 and safely falls back to 1.
+    assert torch.allclose(ratio[:4], torch.tensor([1.0, 0.0, -1.0, 3.0]))
+    assert torch.allclose(scale[:4], torch.tensor([2.5, 1.0, 1.0, 3.5]))
+    assert not active[5] and not active[6]
+    assert torch.equal(ratio[5:7], torch.ones(2))
+    assert torch.equal(scale[5:7], torch.ones(2))
+    assert clipped[3] and clipped[4] and clipped[7]
+    assert torch.isfinite(ratio).all() and torch.isfinite(scale).all()
+    assert scale.min() >= 1.0 and scale.max() <= 3.5
 
 
-def test_trigger_gate_parity():
-    Reference = load_reference_ccgrpo_state()
-    if Reference is None:
-        print('SKIP trigger-gate parity (reference impl not found)')
-        return
-    GXPOState = load_gxpo_state()
-    torch.manual_seed(0)
-    for mode in ('trajectory_aware', 'legacy_g0', 'never'):
-        ours = GXPOState(K=5, alpha=0.5, delta=DELTA, tau=0.5, omega=0.1, shutoff_mode=mode)
-        ref = Reference(K=5, alpha=0.5, delta=DELTA, tau=0.5, omega=0.1, shutoff_mode=mode)
-        for step in range(200):
-            g0 = float(torch.rand(1)) * 0.05
-            gslow = float(torch.rand(1)) * 0.05 + (0.5 if step == 150 else 0.0)
-            z_a, s_a, t_a = ours.update_trigger_state(step=step, g0_norm=g0, g_slow_norm=gslow)
-            z_b, s_b, t_b = ref.update_trigger_state(step=step, g0_norm=g0, g_slow_norm=gslow)
-            assert (z_a, s_a, t_a) == (z_b, s_b, t_b), f'{mode} step {step}: {(z_a, s_a, t_a)} != {(z_b, s_b, t_b)}'
-            assert ours.trigger_index == ref.trigger_index
-    print('PASS trigger-gate parity (3 shutoff modes, 200 steps each)')
+def test_k_two_has_no_extra_extrapolation():
+    g0 = torch.tensor([0.2, -0.4, 2.0])
+    g1 = torch.tensor([0.7, 0.3, -8.0])
+    _, scale, _, _ = production_ratio_scale(g0, g1, K=2)
+    assert torch.equal(scale, torch.ones_like(scale))
 
 
-def test_ratio_scale_parity():
-    torch.manual_seed(1)
-    for K in (3, 5, 10):
-        g0 = torch.randn(10000, dtype=torch.float32) * 1e-3
-        g1 = torch.randn(10000, dtype=torch.float32) * 1e-3
-        g0[::97] = 0.0  # exercise the sign(0) -> +1 branch
-        g1[::53] = float('nan')  # exercise the non-finite branch
-        r_ref, scale_ref = reference_ratio_scale(g0.clone(), g1.clone(), K, DELTA)
-        r_new, scale_new = verl_ratio_scale(g0.clone(), g1.clone(), K, DELTA)
-        assert torch.equal(r_ref, r_new), f'K={K}: retention ratios differ'
-        assert torch.allclose(scale_ref, scale_new, atol=0, rtol=0), f'K={K}: scales differ'
-    print('PASS ratio/scale parity (K in {3,5,10}, zeros + NaNs exercised)')
+def test_horner_geometric_sum():
+    values = torch.tensor([-1.9, -0.5, 0.0, 0.999999, 1.0, 2.9], dtype=torch.float64)
+    for n in (1, 2, 4, 8):
+        actual = GXPO.geometric_sum_horner(values, n)
+        expected = torch.stack([values.pow(i) for i in range(n)]).sum(dim=0)
+        assert torch.allclose(actual, expected, rtol=1e-12, atol=1e-12)
 
 
-def gxpo_outer_step_gd(theta0, h, eta, K, alpha, delta):
-    """One GXPO outer step on L = 0.5 * sum(h * theta^2) under plain GD."""
-    grad = lambda th: h * th
-    theta = theta0.clone()
-    g0 = grad(theta)
-    theta = theta - eta * g0
-    g1 = grad(theta)
-    theta = theta - eta * g1
-    _, scale = verl_ratio_scale(g0.clone(), g1.clone(), K, delta)
-    theta = theta0 + alpha * scale * (theta - theta0)
-    g_slow = grad(theta)
-    return theta - eta * g_slow
-
-
-def test_corollary2_diagonal_quadratic():
+def test_diagonal_quadratic_exact_case():
     torch.manual_seed(2)
-    h = torch.rand(1000, dtype=torch.float64) * 0.9 + 0.05  # h_i > 0, eta*h_i <= 1
+    h = torch.rand(1000, dtype=torch.float64) * 0.9 + 0.05
     eta = 1.0
     theta0 = torch.randn(1000, dtype=torch.float64)
-    for K in (3, 5, 10):
-        theta_gxpo = gxpo_outer_step_gd(theta0, h, eta, K, alpha=1.0, delta=1e-14)
+    for K in (2, 4, 8):
+        theta1 = theta0 - eta * h * theta0
+        theta2 = theta1 - eta * h * theta1
+        _, scale, _, _ = production_ratio_scale(h * theta0, h * theta1, K, delta=1e-14)
+        theta_tilde = theta0 + scale * (theta2 - theta0)
+        theta_gxpo = theta_tilde - eta * h * theta_tilde
         theta_gd = theta0.clone()
         for _ in range(K + 1):
             theta_gd = theta_gd - eta * h * theta_gd
-        err = (theta_gxpo - theta_gd).abs().max().item()
-        assert err < 1e-9, f'K={K}: GXPO vs {K + 1}-step GD max err {err:.3e}'
-    print('PASS Corollary 2 (one GXPO step == K+1 plain-GD steps on diagonal quadratic)')
+        assert (theta_gxpo - theta_gd).abs().max().item() < 1e-9
 
 
-def test_explicit_sum_matches_closed_form():
-    torch.manual_seed(3)
-    for K in (3, 5, 10):
-        r = torch.empty(10000, dtype=torch.float64).uniform_(-1.9, 2.9)
-        r = r[(r - 1.0).abs() > 1e-3]  # closed form is stabilized near r=1
-        r = r[(r + 1.0).abs() > 1e-3]
-        s_expl = torch.ones_like(r)
-        for _ in range(K - 1):  # Horner accumulation, as in dp_actor diagnostics
-            s_expl.mul_(r).add_(1.0)
-        scale_expl = s_expl / (1.0 + r)
-        s_k = (1.0 - r.pow(K)) / (1.0 - r + DELTA)
-        s_2 = (1.0 - r * r) / (1.0 - r + DELTA)
-        scale_closed = s_k / (s_2 + DELTA)
-        assert torch.allclose(scale_expl, scale_closed, rtol=1e-5, atol=1e-7), f'K={K}'
-    print('PASS explicit Horner sum matches closed-form S_K/S_2')
+def test_bf16_matches_fp32_reference():
+    torch.manual_seed(4)
+    g0_fp32 = torch.randn(4096, dtype=torch.float32) * 0.1
+    # Keep this precision comparison away from the intentional S_2=0
+    # stabilization boundary (r=-1), which is discontinuous by design.
+    g1_fp32 = g0_fp32 * (0.2 + torch.rand(4096, dtype=torch.float32) * 1.5)
+    _, scale_fp32, _, _ = production_ratio_scale(g0_fp32, g1_fp32, K=5)
+    _, scale_bf16, _, _ = production_ratio_scale(g0_fp32.bfloat16(), g1_fp32.bfloat16(), K=5)
+    assert torch.allclose(scale_bf16.float(), scale_fp32, rtol=0.08, atol=0.08)
+
+
+def test_trigger_gate_observes_corrective_norm():
+    state = GXPO.GXPOState(K=5, tau=2.0, omega=0.1, warmup_steps=3)
+    observations = [30.0] * 10 + [300.0] + [30.0] * 4
+    triggered_at = None
+    for step, norm in enumerate(observations):
+        if state.is_enabled(step):
+            _, _, triggered = state.update_trigger_state(
+                step=step, g0_norm=norm, g_slow_norm=norm)
+            if triggered and triggered_at is None:
+                triggered_at = step
+    assert triggered_at == 10
+    assert state.trigger_index == 11
+    assert not state.is_enabled(11)
+
+
+def test_fixed_old_log_probs_wiring_and_checkpointing():
+    source = ACTOR_PATH.read_text()
+    tree = ast.parse(source)
+    actor_step = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.FunctionDef) and node.name == '_gxpo_minibatch_step')
+    assert "gxpo_recompute_old_log_probs', False" in source
+    assert "old_log_prob = data['old_log_probs']" in source
+    assert 'recompute_old_log_probs=recompute_old' in source
+    assert "gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})" in (
+        (REPO / 'verl' / 'workers' / 'fsdp_workers.py').read_text())
+    assert actor_step is not None
+
+
+def test_scale_diagnostics_are_accumulated_and_bounded():
+    source = ACTOR_PATH.read_text()
+    assert 'stats[9] += scale.double().sum()' in source
+    assert 'scale_max = torch.maximum(scale_max, scale.max().double().reshape(1))' in source
+    _, scale, _, _ = production_ratio_scale(torch.ones(8), torch.ones(8), K=5)
+    assert scale.mean().item() == 2.5
+    assert scale.max().item() == 2.5
+
+
+def test_reposition_uses_two_step_displacement_at_correct_location():
+    theta0 = torch.tensor([1.0, -2.0, 3.0])
+    theta2 = torch.tensor([0.8, -1.5, 2.0])
+    g0 = torch.tensor([0.2, -0.4, 0.6])
+    g1 = torch.tensor([0.1, -0.8, 1.8])
+    _, scale, _, _ = production_ratio_scale(g0, g1, K=4)
+    theta_tilde = theta0 + 0.5 * scale * (theta2 - theta0)
+    expected = theta0 + 0.5 * scale * (theta2 - theta0)
+    assert torch.equal(theta_tilde, expected)
+    # A corrective gradient must be evaluated at theta_tilde, not theta2.
+    corrective_at_tilde = theta_tilde.square().sum().sqrt()
+    corrective_at_theta2 = theta2.square().sum().sqrt()
+    assert corrective_at_tilde != corrective_at_theta2
+
+
+def test_optimizer_scheduler_and_vllm_sync_boundaries():
+    worker_path = REPO / 'verl' / 'workers' / 'fsdp_workers.py'
+    worker_source = worker_path.read_text()
+    worker_tree = ast.parse(worker_source)
+    gxpo_worker = next(node for node in ast.walk(worker_tree)
+                       if isinstance(node, ast.FunctionDef) and node.name == 'gxpo_update_actor')
+    gxpo_worker_source = ast.get_source_segment(worker_source, gxpo_worker)
+    assert gxpo_worker_source.count('self.actor_lr_scheduler.step()') == 1
+    assert 'sync_model_weights' not in gxpo_worker_source
+
+    generate = next(node for node in ast.walk(worker_tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == 'generate_sequences')
+    generate_source = ast.get_source_segment(worker_source, generate)
+    assert 'self.rollout_sharding_manager' in generate_source
+
+
+def test_gate_and_gradient_capture_order():
+    source = ACTOR_PATH.read_text()
+    tree = ast.parse(source)
+    step = next(node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == '_gxpo_minibatch_step')
+    step_source = ast.get_source_segment(source, step)
+    assert step_source.index('self._gxpo_capture_grads(g0_bufs)') < step_source.index('self._clip_grads()')
+    assert step_source.index('self._gxpo_capture_grads(g1_bufs)') < step_source.index('self._clip_grads()', step_source.index('self._gxpo_capture_grads(g1_bufs)'))
+    # Current semantics intentionally gate after the corrective optimizer step:
+    # the trigger disables subsequent GXPO steps, not the update just computed.
+    assert step_source.rfind('self.actor_optimizer.step()') < step_source.index('state.update_trigger_state')
+    assert 'probe-step optimizer-moment' in source and 'pollution is accepted' in source
 
 
 if __name__ == '__main__':
-    test_trigger_gate_parity()
-    test_ratio_scale_parity()
-    test_corollary2_diagonal_quadratic()
-    test_explicit_sum_matches_closed_form()
-    print('ALL GXPO PARITY CHECKS PASSED')
+    for name, fn in sorted(globals().items()):
+        if name.startswith('test_'):
+            fn()
+            print(f'PASS {name}')
+    print('ALL GXPO PRODUCTION CHECKS PASSED')

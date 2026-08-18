@@ -21,7 +21,54 @@ subsequent updates fall back to single-pass GRPO.
 
 from typing import Optional, Tuple
 
-__all__ = ['GXPOState']
+import torch
+
+__all__ = ['GXPOState', 'geometric_sum_horner', 'compute_gxpo_retention_scale']
+
+
+def geometric_sum_horner(value: torch.Tensor, n: int) -> torch.Tensor:
+    """Return ``1 + value + ... + value**(n - 1)`` using Horner's rule."""
+    if n < 1:
+        raise ValueError(f'geometric sum length must be positive, got {n}')
+    result = torch.ones_like(value)
+    for _ in range(1, n):
+        result.mul_(value).add_(1.0)
+    return result
+
+
+def compute_gxpo_retention_scale(g0: torch.Tensor, g1: torch.Tensor, K: int,
+                                 delta: float) -> Tuple[torch.Tensor, torch.Tensor,
+                                                         torch.Tensor, torch.Tensor]:
+    """Compute production GXPO ratio/scale and diagnostic masks.
+
+    Inactive coordinates retain the observed two-step displacement. Active
+    ratios are clipped to [-2, 3], non-finite ratios are replaced with one,
+    and the geometric scale is bounded to [1, K / 2 + 1].
+    """
+    if K < 2:
+        raise ValueError(f'GXPO K must be at least two, got {K}')
+    if g0.shape != g1.shape:
+        raise ValueError(f'g0 and g1 must have the same shape, got {g0.shape} and {g1.shape}')
+
+    one = torch.ones_like(g0)
+    active = g0.abs() > delta
+    # Branchless active-mask arithmetic avoids a CUDA scalar active.any()
+    # synchronization while retaining the old sign convention for g0 == 0.
+    sign_g0 = torch.where(g0 >= 0, one, -one)
+    denominator = g0.abs().clamp_min(delta) * sign_g0
+    candidate = g1 / denominator
+    finite = torch.isfinite(candidate)
+    ratio_clipped = active & ((~finite) | (candidate < -2.0) | (candidate > 3.0))
+    candidate.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
+    ratio = torch.where(active, candidate, one)
+
+    s_k = geometric_sum_horner(ratio, K)
+    s_2 = geometric_sum_horner(ratio, 2)
+    active_scale = torch.where(s_2.abs() > delta, s_k / s_2, one)
+    active_scale = active_scale.nan_to_num(nan=1.0, posinf=1.0, neginf=1.0)
+    active_scale.clamp_(1.0, K / 2.0 + 1.0)
+    scale = torch.where(active, active_scale, one)
+    return ratio, scale, active, ratio_clipped
 
 
 class GXPOState:
