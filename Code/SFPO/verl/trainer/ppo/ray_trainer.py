@@ -482,6 +482,7 @@ class RayPPOTrainer(object):
                                          image_key=self.config.data.get('image_key', 'images'),
                                          max_prompt_length=self.config.data.max_prompt_length,
                                          filter_prompts=True,
+                                         system_prompt=self.config.data.get('system_prompt', None),
                                          return_raw_chat=self.config.data.get('return_raw_chat', False),
                                          truncation='error',
                                          filter_overlong_prompts=self.config.data.filter_overlong_prompts)
@@ -515,6 +516,7 @@ class RayPPOTrainer(object):
                                            image_key=self.config.data.get('image_key', 'images'),
                                            max_prompt_length=self.config.data.max_prompt_length,
                                            filter_prompts=True,
+                                           system_prompt=self.config.data.get('system_prompt', None),
                                            return_raw_chat=self.config.data.get('return_raw_chat', False),
                                            truncation='error',
                                            filter_overlong_prompts=self.config.data.filter_overlong_prompts)

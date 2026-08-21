@@ -18,6 +18,12 @@ if [[ -d /workspace/.gxpo_pydeps ]]; then
   export PYTHONPATH="/workspace/.gxpo_pydeps:$PYTHONPATH"
 fi
 export HF_HOME="${HF_HOME:-$REPO_ROOT/.hf_home}"
+# A system-provided HF_HOME can exist but still be unwritable by the training
+# user.  Fall back to the repository cache instead of failing inside Ray's
+# remote main task with an opaque worker shutdown.
+if [[ ! -w "$HF_HOME/hub" ]]; then
+  export HF_HOME="$REPO_ROOT/.hf_home"
+fi
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 mkdir -p "$HF_HUB_CACHE"
 python - <<'PY'
@@ -43,8 +49,19 @@ SFPO_ZSCORE_THRESHOLD="${SFPO_ZSCORE_THRESHOLD:-2.5}"
 SFPO_TRIGGER_PATIENCE="${SFPO_TRIGGER_PATIENCE:-3}"
 SFPO_RESET_ENTROPY_AFTER_WARMUP="${SFPO_RESET_ENTROPY_AFTER_WARMUP:-True}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-3072}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 LR="${LR:-1e-6}"
+USE_LIGER="${USE_LIGER:-True}"
+OPTIM_FUSED="${OPTIM_FUSED:-False}"
+ENABLE_GRADIENT_CHECKPOINTING="${ENABLE_GRADIENT_CHECKPOINTING:-True}"
+USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-True}"
+ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-False}"
+ACTOR_OPTIMIZER_OFFLOAD="${ACTOR_OPTIMIZER_OFFLOAD:-False}"
+ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-}"
 GPU_COUNT="${GPU_COUNT:-${N_GPUS:-1}}"
 PROJECT="${WANDB_PROJECT:-gxpo-efficiency-final}"
 
@@ -201,18 +218,22 @@ python -u -m verl.trainer.main_ppo \
   data.train_files="$TRAIN_FILES" \
   data.val_files="$VAL_FILES" \
   data.train_batch_size="$TRAIN_BATCH_SIZE" \
-  data.val_batch_size=128 \
+  data.val_batch_size="$VAL_BATCH_SIZE" \
   data.max_prompt_length=1024 \
-  data.max_response_length=3072 \
+  data.max_response_length="$MAX_RESPONSE_LENGTH" \
   data.filter_overlong_prompts=True \
   data.truncation=error \
   +data.seed="$TRAIN_SEED" \
+  data.system_prompt="$SYSTEM_PROMPT" \
   actor_rollout_ref.model.path="$MODEL_ID" \
   actor_rollout_ref.model.use_remove_padding=True \
-  actor_rollout_ref.model.enable_gradient_checkpointing=True \
+  actor_rollout_ref.model.enable_gradient_checkpointing="$ENABLE_GRADIENT_CHECKPOINTING" \
   actor_rollout_ref.model.attn_implementation="${ATTN_IMPL:-flash_attention_3}" \
+  +actor_rollout_ref.model.use_liger="$USE_LIGER" \
   actor_rollout_ref.actor.optim.lr="$LR" \
   +actor_rollout_ref.actor.optim.name=adamw \
+  +actor_rollout_ref.actor.optim.fused="$OPTIM_FUSED" \
+  actor_rollout_ref.actor.use_torch_compile="$USE_TORCH_COMPILE" \
   +actor_rollout_ref.actor.data_loader_seed="$TRAIN_SEED" \
   actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE:-16}" \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
@@ -223,8 +244,9 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.kl_loss_coef=0.0 \
   actor_rollout_ref.actor.kl_loss_type=low_var_kl \
   actor_rollout_ref.actor.fsdp_config.fsdp_size=1 \
-  actor_rollout_ref.actor.fsdp_config.param_offload=False \
-  actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+  actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_PARAM_OFFLOAD" \
+  actor_rollout_ref.actor.fsdp_config.optimizer_offload="$ACTOR_OPTIMIZER_OFFLOAD" \
+  ${ACTOR_MODEL_DTYPE:+\+actor_rollout_ref.actor.fsdp_config.model_dtype="$ACTOR_MODEL_DTYPE"} \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE:-8}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${TENSOR_PARALLEL_SIZE:-1}" \
   actor_rollout_ref.rollout.name=vllm \
@@ -257,7 +279,7 @@ python -u -m verl.trainer.main_ppo \
   trainer.test_freq=5 \
   +trainer.validation_seeds='[0]' \
   +trainer.keep_last_validations=1 \
-  +trainer.val_before_train=True \
+  +trainer.val_before_train="$VAL_BEFORE_TRAIN" \
   +trainer.max_steps="$MAX_STEPS" \
   trainer.total_training_steps="$MAX_STEPS" \
   trainer.total_epochs=100 \

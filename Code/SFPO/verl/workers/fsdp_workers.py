@@ -339,10 +339,20 @@ class ActorRolloutRefWorker(Worker):
                 from verl.workers.muon import build_muon
                 actor_optimizer = build_muon(actor_module_fsdp, optim_config)
             else:
+                optimizer_kwargs = dict(
+                    lr=optim_config.lr,
+                    betas=optim_config.get('betas', (0.9, 0.999)),
+                    weight_decay=optim_config.get('weight_decay', 1e-2),
+                )
+                # PyTorch's fused AdamW reduces the optimizer-kernel launch and
+                # parameter-update overhead on CUDA.  Keep it opt-in because the
+                # flag must be validated separately for every FSDP/Torch stack.
+                if optim_config.get('fused', False):
+                    optimizer_kwargs['fused'] = True
+                    if self.rank == 0:
+                        print('Actor optimizer: fused AdamW')
                 actor_optimizer = optim.AdamW(filter(lambda p: p.requires_grad, actor_module_fsdp.parameters()),
-                                              lr=optim_config.lr,
-                                              betas=optim_config.get('betas', (0.9, 0.999)),
-                                              weight_decay=optim_config.get('weight_decay', 1e-2))
+                                              **optimizer_kwargs)
 
             total_steps = optim_config.get('total_training_steps', 0)
             num_warmup_steps = int(optim_config.get('lr_warmup_steps', -1))

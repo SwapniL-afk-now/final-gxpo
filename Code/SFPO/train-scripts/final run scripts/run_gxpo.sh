@@ -17,7 +17,7 @@ ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-True}"
 # vLLM requires cache-engine eviction when CUDA graphs are enabled.
 FREE_CACHE_ENGINE="${FREE_CACHE_ENGINE:-$ENFORCE_EAGER}"
-USE_LIGER="${USE_LIGER:-False}"
+USE_LIGER="${USE_LIGER:-True}"
 TRAIN_SEED=3407                 # matched FEPO training seed
 VAL_SEEDS="[3407]"           # same single greedy evaluation seed as GSPO
 LR=1e-6

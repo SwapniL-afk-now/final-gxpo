@@ -87,6 +87,7 @@ class RLHFDataset(Dataset):
                  filter_prompts=True,
                  cache_dir='~/.cache/verl/rlhf',
                  chat_template_func=None,
+                 system_prompt: Optional[str] = None,
                  return_raw_chat=False,
                  truncation='error',
                  filter_overlong_prompts=False):
@@ -106,6 +107,7 @@ class RLHFDataset(Dataset):
 
         self.return_raw_chat = return_raw_chat
         self.chat_template_func = chat_template_func
+        self.system_prompt = system_prompt or ''
         self.truncation = truncation
         self.filter_overlong_prompts = filter_overlong_prompts
 
@@ -114,6 +116,21 @@ class RLHFDataset(Dataset):
         self.serialize_dataset = False
         self._download()
         self._read_files_and_tokenize()
+
+    def _prepare_chat(self, chat):
+        """Add an optional system instruction before applying the model template."""
+        messages = list(chat)
+        if not self.system_prompt:
+            return messages
+
+        instruction = {'role': 'system', 'content': self.system_prompt}
+        if messages and isinstance(messages[0], dict) and messages[0].get('role') == 'system':
+            messages[0] = dict(messages[0])
+            existing = messages[0].get('content', '')
+            messages[0]['content'] = f'{existing}\n\n{self.system_prompt}' if existing else self.system_prompt
+        else:
+            messages.insert(0, instruction)
+        return messages
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -136,7 +153,7 @@ class RLHFDataset(Dataset):
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
             self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
-                tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
+                tokenizer.apply_chat_template(self._prepare_chat(doc[prompt_key]), add_generation_prompt=True)) <= self.max_prompt_length,
                                                                  axis=1)]
 
             print(f'filter dataset len: {len(self.dataframe)}')
@@ -159,7 +176,7 @@ class RLHFDataset(Dataset):
         """
         row_dict: dict = self.dataframe.iloc[item].to_dict()
 
-        chat = row_dict.pop(self.prompt_key)
+        chat = self._prepare_chat(row_dict.pop(self.prompt_key))
 
         prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
 
@@ -217,7 +234,7 @@ class RLHFDataset(Dataset):
 
         # encode prompts without chat template
         if self.return_raw_chat:
-            row_dict['raw_prompt'] = chat.tolist()
+            row_dict['raw_prompt'] = chat
 
         # add index for each prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
