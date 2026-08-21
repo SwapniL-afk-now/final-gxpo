@@ -109,11 +109,13 @@ class DataParallelPPOActor(BasePPOActor):
                 K=self.config.get('gxpo_k', 5),
                 alpha=self.config.get('gxpo_alpha', 0.5),
                 delta=self.config.get('gxpo_delta', 1e-8),
-                tau=self.config.get('gxpo_tau', 0.5),
+                tau=self.config.get('gxpo_tau', 3.0),
                 omega=self.config.get('gxpo_omega', 0.1),
+                zscore_w=self.config.get('gxpo_zscore_w', 30),
                 shutoff_mode=self.config.get('gxpo_shutoff_mode', 'trajectory_aware'),
                 fallback_mode=self.config.get('gxpo_fallback_mode', 'permanent'),
                 fallback_window=self.config.get('gxpo_fallback_window', 10),
+                trigger_patience=self.config.get('gxpo_trigger_patience', 1),
             )
             self._gxpo_diag_freq = int(self.config.get('gxpo_diag_freq', 10))
 
@@ -567,6 +569,7 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_enabled': enabled,
             'actor/gxpo_trigger_z': z_score,
             'actor/gxpo_trigger_stat': 0.0,
+            'actor/gxpo_trigger_streak': 0.0,
             'actor/gxpo_g0_norm': 0.0,
             'actor/gxpo_g1_norm': 0.0,
             'actor/gxpo_gslow_norm': 0.0,
@@ -613,7 +616,8 @@ class DataParallelPPOActor(BasePPOActor):
                                         self._gxpo_bufs['theta0'])
 
     def _gxpo_minibatch_step(self, mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                             non_tensor_select_keys, force_standard=False):
+                             non_tensor_select_keys, force_standard=False, trigger_enabled=True,
+                             defer_trigger=False):
         """One GXPO 3-pass update on a single PPO mini-batch (Algorithm 1 of the paper).
 
         Faithful port of gxpo_single_minibatch_update from the reference
@@ -623,8 +627,11 @@ class DataParallelPPOActor(BasePPOActor):
         theta_tilde = theta0 + alpha * scale * (theta2 - theta0).
 
         force_standard: skip extrapolation for this one step (degenerate batch, e.g. mass
-        format-parse failures) without touching the shutoff gate's EMA/trigger state -- the
+        format-parse failures) without touching the shutoff gate's rolling baseline/trigger state -- the
         step is simply not fed into the gate at all, since it was never asked to.
+
+        trigger_enabled: whether the outer training-step warmup has completed. During
+        warmup, GXPO still updates its rolling baseline but cannot trip the shutoff gate.
         """
         state = self.gxpo_state
         step_idx = state.step_count
@@ -639,7 +646,8 @@ class DataParallelPPOActor(BasePPOActor):
             append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
             append_to_dict(metrics, self._gxpo_default_metrics(enabled=0.0))
             append_to_dict(metrics, {'actor/gxpo_fallback_triggered': float(fallback_triggered)})
-            state.step_count = step_idx + 1
+            if not defer_trigger:
+                state.step_count = step_idx + 1
             return metrics
 
         if force_standard or not state.is_enabled(step_idx):
@@ -790,10 +798,21 @@ class DataParallelPPOActor(BasePPOActor):
         # where raw grad_norm hit 2.2 while trigger_stat sat at 1.0 and z fell 0.77 -> 0.51.
         # gn_slow is already gn1 in the no-corrective ablation (see above), so this covers both.
         gate_slow_norm = gn_slow
-        z_score, trigger_stat, triggered = state.update_trigger_state(step=step_idx,
-                                                                      g0_norm=gn0,
-                                                                      g_slow_norm=gate_slow_norm)
-        state.step_count = step_idx + 1
+        if defer_trigger:
+            # Outer granularity defers the gate update until all minibatches in
+            # this full batch have been reduced to one trigger statistic.
+            z_score = 0.0
+            trigger_stat = state.resolve_trigger_observation(
+                g0_norm=gn0, g_slow_norm=gate_slow_norm)
+            triggered = False
+        else:
+            z_score, trigger_stat, triggered = state.update_trigger_state(
+                step=step_idx,
+                g0_norm=gn0,
+                g_slow_norm=gate_slow_norm,
+                allow_trigger=trigger_enabled,
+                defer_trigger=False)
+            state.step_count = step_idx + 1
 
         metrics = pass3_metrics
         append_to_dict(metrics, {'actor/grad_norm': float(gn_slow)})
@@ -801,6 +820,7 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_enabled': 1.0,
             'actor/gxpo_trigger_z': float(z_score),
             'actor/gxpo_trigger_stat': float(trigger_stat),
+            'actor/gxpo_trigger_streak': float(state.trigger_streak),
             'actor/gxpo_g0_norm': g0_norm,
             'actor/gxpo_g1_norm': g1_norm,
             'actor/gxpo_gslow_norm': gslow_norm,
@@ -829,10 +849,12 @@ class DataParallelPPOActor(BasePPOActor):
             })
         if triggered:
             print(f'[GXPO] shutoff triggered at minibatch step {step_idx}: '
-                  f'|z|={abs(z_score):.3f} >= tau={state.tau} -> single-pass GRPO from now on')
+                  f'z={z_score:.3f} >= tau={state.tau} after '
+                  f'{state.trigger_patience} consecutive observations -> single-pass GRPO from now on')
         return metrics
 
-    def update_policy_gxpo(self, data: DataProto):
+    def update_policy_gxpo(self, data: DataProto, trigger_enabled: bool = True,
+                           trigger_stop: bool = False):
         """GXPO actor update: 3-pass extrapolated step per mini-batch while the
         shutoff gate is open, single-pass GRPO afterwards."""
         assert self.gxpo_state is not None, 'update_policy_gxpo called without use_gxpo=True'
@@ -844,22 +866,79 @@ class DataParallelPPOActor(BasePPOActor):
         # reward 0 because they failed to parse, not because the problem was hard). Such a batch
         # has near-uniform reward -> near-zero-magnitude probe gradients g0/g1 -> a spurious,
         # huge z-score that permanently trips the shutoff gate on a fluke rather than a real
-        # divergence. Skip extrapolation for this step only; the gate's EMA is left untouched
+        # divergence. Skip extrapolation for this step only; the gate's rolling baseline is left untouched
         # since a degenerate batch was never a valid observation of the gate's trigger statistic.
         format_error_ratio = (data.batch['token_level_scores'].sum(-1) == 0).float().mean().item()
-        force_standard = format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5)
+        force_standard = (
+            format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5)
+            or trigger_stop
+        )
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
         dataloader, has_multi_modal_inputs, select_keys, non_tensor_select_keys = self._make_minibatch_iterator(data)
 
         metrics = {}
+        # GXPO's fallback gate follows SFPO exactly: entropy is computed by the
+        # trainer from completed outer batches. The actor must never replace it
+        # with a minibatch gradient-norm gate.
+        entropy_trigger = self.config.get('gxpo_trigger_signal', 'entropy') == 'entropy'
+        defer_trigger = entropy_trigger or self.config.get('gxpo_trigger_granularity', 'outer') == 'outer'
         for epoch in range(self.config.ppo_epochs):
             for mini_batch in dataloader:
                 mb_metrics = self._gxpo_minibatch_step(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                                       non_tensor_select_keys, force_standard=force_standard)
+                                                       non_tensor_select_keys, force_standard=force_standard,
+                                                       trigger_enabled=trigger_enabled,
+                                                       defer_trigger=defer_trigger)
                 _merge_metrics(metrics, mb_metrics)
         if force_standard:
             metrics['actor/gxpo_format_skip'] = 1.0
+        if defer_trigger:
+            # Match SFPO: reduce minibatch trigger statistics to exactly one
+            # scalar for this outer batch, score it against the preceding
+            # rolling window, then append it to that window.
+            stat_values = metrics.get('actor/gxpo_trigger_stat', [])
+            if not isinstance(stat_values, list):
+                stat_values = [stat_values]
+            stat_values = [float(value) for value in stat_values
+                           if value == value and abs(value) != float('inf')]
+            outer_stat = sum(stat_values) / len(stat_values) if stat_values else 0.0
+
+            if entropy_trigger:
+                # The trainer already computed the SFPO-style entropy gate
+                # before this actor update. Preserve those values verbatim;
+                # no gradient statistic is fed into GXPOState.
+                outer_z = float(data.meta_info.get('gxpo_trigger_z', 0.0))
+                outer_stat = float(data.meta_info.get('gxpo_trigger_stat', 0.0))
+                triggered = False
+                self.gxpo_state.step_count += 1
+            elif force_standard:
+                outer_z = 0.0
+                triggered = False
+                self.gxpo_state.step_count += 1
+            elif self.gxpo_state.trigger_index != float('inf'):
+                # The gate is permanently closed; this outer batch is still
+                # one training step, but it is not a new gate observation.
+                outer_z = 0.0
+                triggered = False
+                self.gxpo_state.step_count += 1
+            else:
+                outer_step = self.gxpo_state.step_count
+                outer_z, outer_stat, triggered = self.gxpo_state.update_trigger_state(
+                    step=outer_step,
+                    g0_norm=outer_stat,
+                    g_slow_norm=outer_stat,
+                    allow_trigger=trigger_enabled,
+                    defer_trigger=False)
+                self.gxpo_state.step_count = outer_step + 1
+
+            metrics['actor/gxpo_trigger_z'] = float(outer_z)
+            metrics['actor/gxpo_trigger_stat'] = float(outer_stat)
+            metrics['actor/gxpo_trigger_candidate'] = float(outer_z >= self.gxpo_state.tau)
+            metrics['actor/gxpo_trigger_streak'] = float(self.gxpo_state.trigger_streak)
+            if triggered:
+                print(f'[GXPO] outer-batch shutoff triggered after '
+                      f'{self.gxpo_state.trigger_patience} consecutive violating batches: '
+                      f'z={outer_z:.3f} >= tau={self.gxpo_state.tau}')
         metrics['actor/cumulative_bp'] = self.cumulative_bp
         metrics['actor/policy_grad_evals_step'] = self.cumulative_bp - bp_start
         metrics['actor/cumulative_policy_grad_evals'] = self.cumulative_bp
@@ -869,6 +948,8 @@ class DataParallelPPOActor(BasePPOActor):
         if isinstance(enabled_values, list):
             enabled_values = sum(enabled_values) / len(enabled_values) if enabled_values else 0.0
         metrics['actor/gxpo_prediction_active'] = float(enabled_values)
+        metrics['actor/gxpo_trigger_warmup_active'] = float(not trigger_enabled)
+        metrics['actor/gxpo_trigger_patience'] = float(self.gxpo_state.trigger_patience)
         metrics['actor/gxpo_fallback_step'] = (
             float(self.gxpo_state.trigger_index)
             if self.gxpo_state.trigger_index != float('inf') else float('nan')

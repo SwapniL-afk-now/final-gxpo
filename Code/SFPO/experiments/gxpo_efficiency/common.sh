@@ -7,12 +7,41 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.3}"
-K="${K:-10}"
+# Make every launch reproducible from a fresh tmux shell.  The base image's
+# venv is not automatically activated, and FA3/dependency wheels are kept in
+# user-writable workspace paths on this unprivileged instance.
+if [[ -f /venv/main/bin/activate ]]; then
+  source /venv/main/bin/activate
+fi
+export PYTHONPATH="$REPO_ROOT/.runtime_deps:${PYTHONPATH:-}"
+if [[ -d /workspace/.gxpo_pydeps ]]; then
+  export PYTHONPATH="/workspace/.gxpo_pydeps:$PYTHONPATH"
+fi
+export HF_HOME="${HF_HOME:-$REPO_ROOT/.hf_home}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+mkdir -p "$HF_HUB_CACHE"
+python - <<'PY'
+import importlib.util
+required = ('pandas', 'wandb', 'tensordict', 'flash_attn_3', 'flash_attn_interface')
+missing = [name for name in required if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit('Missing runtime dependencies: ' + ', '.join(missing))
+PY
+
+REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.5}"
+K="${K:-5}"
 TRAIN_SEED="${TRAIN_SEED:-3407}"
 FINAL_EVAL_SEEDS="${FINAL_EVAL_SEEDS:-0 1 2 3}"
 MAX_STEPS="${MAX_STEPS:-400}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
+SFPO_WARMUP_STEPS="${SFPO_WARMUP_STEPS:-50}"
+GXPO_WARMUP_STEPS="${GXPO_WARMUP_STEPS:-50}"
+GXPO_TAU="${GXPO_TAU:-3.0}"
+GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
+GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-3}"
+SFPO_ZSCORE_THRESHOLD="${SFPO_ZSCORE_THRESHOLD:-2.5}"
+SFPO_TRIGGER_PATIENCE="${SFPO_TRIGGER_PATIENCE:-3}"
+SFPO_RESET_ENTROPY_AFTER_WARMUP="${SFPO_RESET_ENTROPY_AFTER_WARMUP:-True}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 LR="${LR:-1e-6}"
@@ -106,7 +135,10 @@ case "$METHOD" in
       +actor_rollout_ref.actor.sfpo_inner_steps="$K"
       +actor_rollout_ref.actor.sfpo_step_size="$REPOSITION_ALPHA"
       +actor_rollout_ref.actor.zscore_w=30
-      +actor_rollout_ref.actor.zscore_threshold="${SFPO_ZSCORE_THRESHOLD:-0.5}"
+      +actor_rollout_ref.actor.zscore_threshold="$SFPO_ZSCORE_THRESHOLD"
+      +actor_rollout_ref.actor.sfpo_warmup_steps="$SFPO_WARMUP_STEPS"
+      +actor_rollout_ref.actor.sfpo_trigger_patience="$SFPO_TRIGGER_PATIENCE"
+      +actor_rollout_ref.actor.sfpo_reset_entropy_after_warmup="$SFPO_RESET_ENTROPY_AFTER_WARMUP"
     )
     ;;
   gxpo)
@@ -115,7 +147,13 @@ case "$METHOD" in
       +actor_rollout_ref.actor.gxpo_k="$K"
       +actor_rollout_ref.actor.gxpo_alpha="$REPOSITION_ALPHA"
       +actor_rollout_ref.actor.gxpo_delta=1e-8
-      +actor_rollout_ref.actor.gxpo_tau="${GXPO_TAU:-2.0}"
+      +actor_rollout_ref.actor.gxpo_tau="$GXPO_TAU"
+      +actor_rollout_ref.actor.gxpo_zscore_w="$GXPO_ZSCORE_W"
+      +actor_rollout_ref.actor.gxpo_trigger_signal=entropy
+      +actor_rollout_ref.actor.gxpo_trigger_patience="$GXPO_TRIGGER_PATIENCE"
+      +actor_rollout_ref.actor.gxpo_trigger_granularity=outer
+      +actor_rollout_ref.actor.gxpo_warmup_steps="$GXPO_WARMUP_STEPS"
+      +actor_rollout_ref.actor.gxpo_reset_entropy_after_warmup=True
       +actor_rollout_ref.actor.gxpo_omega=0.1
       +actor_rollout_ref.actor.gxpo_shutoff_mode=trajectory_aware
       +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=False
@@ -137,6 +175,16 @@ rollout_n=$ROLLOUT_N
 learning_rate=$LR
 max_steps=$MAX_STEPS
 save_freq=$SAVE_FREQ
+sfpo_warmup_steps=$SFPO_WARMUP_STEPS
+sfpo_zscore_threshold=$SFPO_ZSCORE_THRESHOLD
+sfpo_trigger_patience=$SFPO_TRIGGER_PATIENCE
+sfpo_reset_entropy_after_warmup=$SFPO_RESET_ENTROPY_AFTER_WARMUP
+gxpo_warmup_steps=$GXPO_WARMUP_STEPS
+gxpo_tau=$GXPO_TAU
+gxpo_zscore_w=$GXPO_ZSCORE_W
+gxpo_trigger_signal=entropy
+gxpo_trigger_patience=$GXPO_TRIGGER_PATIENCE
+gxpo_trigger_granularity=outer
 validation_interval=5
 validation_decoding=greedy temperature=0 do_sample=false n=1
 final_decoding=stochastic temperature=1.0 top_p=0.7 do_sample=true n=4 seeds=$FINAL_EVAL_SEEDS

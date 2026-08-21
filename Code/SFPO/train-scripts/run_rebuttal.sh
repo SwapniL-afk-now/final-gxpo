@@ -9,7 +9,7 @@ export RAY_ADDRESS=local   # force an isolated Ray cluster per job -- unaddresse
 
 METHOD="${METHOD:?set METHOD=sfpo|gxpo}"
 GPU="${GPU:?set GPU=0|1}"
-K=10
+K=5
 ALPHA="${ALPHA:-0.5}"
 SFPO_TAU=0.5      # SFPO entropy z-score shutoff threshold
 GXPO_TAU=2.0      # GXPO trajectory-aware shutoff threshold

@@ -117,6 +117,7 @@ class FSDPSFTTrainer(object):
                 delta=self.config.optim.get('gxpo_delta', 1e-8),
                 tau=self.config.optim.get('gxpo_tau', 0.5),
                 omega=self.config.optim.get('gxpo_omega', 0.1),
+                zscore_w=self.config.optim.get('gxpo_zscore_w', 30),
                 shutoff_mode=self.config.optim.get('gxpo_shutoff_mode', 'trajectory_aware'),
                 warmup_steps=self.config.optim.get('gxpo_warmup', 0),
             )

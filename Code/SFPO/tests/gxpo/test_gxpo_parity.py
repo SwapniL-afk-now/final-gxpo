@@ -92,7 +92,7 @@ def test_bf16_matches_fp32_reference():
 
 
 def test_trigger_gate_observes_corrective_norm():
-    state = GXPO.GXPOState(K=5, tau=2.0, omega=0.1, warmup_steps=3)
+    state = GXPO.GXPOState(K=5, tau=2.0, omega=0.1, zscore_w=10, warmup_steps=0)
     observations = [30.0] * 10 + [300.0] + [30.0] * 4
     triggered_at = None
     for step, norm in enumerate(observations):
@@ -104,6 +104,86 @@ def test_trigger_gate_observes_corrective_norm():
     assert triggered_at == 10
     assert state.trigger_index == 11
     assert not state.is_enabled(11)
+
+
+def test_trigger_gate_uses_rolling_window_mean_and_std():
+    state = GXPO.GXPOState(K=5, tau=1.0, zscore_w=3, warmup_steps=0,
+                           trigger_patience=2)
+    for step, norm in enumerate((10.0, 10.0, 10.0)):
+        z, _, triggered = state.update_trigger_state(
+            step=step, g0_norm=norm, g_slow_norm=norm)
+        assert z == 0.0
+        assert not triggered
+
+    z, _, triggered = state.update_trigger_state(
+        step=3, g0_norm=30.0, g_slow_norm=30.0)
+    assert not triggered
+    # SFPO scores the current value against the preceding window; the spike
+    # itself is not allowed to inflate its own rolling mean/std.
+    assert state.mu == 10.0
+    assert state.sigma == 0.0
+    assert z > 1e9
+
+    z, _, triggered = state.update_trigger_state(
+        step=4, g0_norm=10.0, g_slow_norm=10.0)
+    assert not triggered
+    assert state.mu == 50.0 / 3.0
+    assert z < 0.0
+
+
+def test_trigger_patience_requires_consecutive_violations():
+    state = GXPO.GXPOState(K=5, tau=2.0, omega=0.1, warmup_steps=0,
+                           trigger_patience=3)
+    assert not state.check_trigger(2.1, 10)
+    assert state.trigger_streak == 1
+    assert not state.check_trigger(2.2, 11)
+    assert state.trigger_streak == 2
+    assert state.check_trigger(2.3, 12)
+    assert state.trigger_streak == 3
+    assert state.trigger_index == 13
+
+
+def test_deferred_trigger_does_not_consume_a_minibatch_observation():
+    state = GXPO.GXPOState(K=5, tau=2.0, zscore_w=1, omega=0.1, warmup_steps=0,
+                           trigger_patience=3)
+    z, _, triggered = state.update_trigger_state(
+        step=10, g0_norm=30.0, g_slow_norm=30.0,
+        allow_trigger=True, defer_trigger=True)
+    assert not triggered and state.trigger_streak == 0
+    assert z == 0.0
+    assert state.observation_count == 0
+    assert state.trigger_history == []
+
+
+def test_warmup_observations_are_reset_before_the_post_warmup_window():
+    state = GXPO.GXPOState(K=5, tau=1.0, zscore_w=2, warmup_steps=2)
+    state.update_trigger_state(step=0, g0_norm=1.0, g_slow_norm=1.0,
+                               allow_trigger=False)
+    state.update_trigger_state(step=1, g0_norm=1.0, g_slow_norm=1.0,
+                               allow_trigger=False)
+    z, _, triggered = state.update_trigger_state(
+        step=2, g0_norm=10.0, g_slow_norm=10.0, allow_trigger=True)
+    assert z == 0.0 and not triggered
+    assert state.trigger_history == [10.0]
+
+
+def test_outer_trigger_reduces_minibatches_to_one_mean_scalar():
+    source = ACTOR_PATH.read_text()
+    assert "outer_stat = sum(stat_values) / len(stat_values) if stat_values else 0.0" in source
+    assert "outer_z = max(z_values, default=0.0)" not in source
+    assert "score it against the preceding" in source
+
+
+def test_gxpo_fallback_uses_sfpo_entropy_gate_in_trainer():
+    trainer_source = (REPO / 'verl' / 'trainer' / 'ppo' / 'ray_trainer.py').read_text()
+    worker_source = (REPO / 'verl' / 'workers' / 'fsdp_workers.py').read_text()
+    actor_source = ACTOR_PATH.read_text()
+    assert 'self.gxpo_entropy_container = []' in trainer_source
+    assert 'gxpo_trigger_z = (gxpo_trigger_stat - u) / std' in trainer_source
+    assert "batch.meta_info['gxpo_trigger_stop'] = self.stop_GXPO" in trainer_source
+    assert "data.meta_info.get('gxpo_trigger_stop', False)" in worker_source
+    assert "self.config.get('gxpo_trigger_signal', 'entropy') == 'entropy'" in actor_source
+    assert "data.meta_info.get('gxpo_trigger_z', 0.0)" in actor_source
 
 
 def test_fixed_old_log_probs_wiring_and_checkpointing():

@@ -22,8 +22,16 @@ sd = torch.load(os.path.join(args.actor_dir, pt), map_location="cpu")
 sd = {k: v.to(torch.bfloat16) for k, v in sd.items()}
 
 config = AutoConfig.from_pretrained(hf_dir)
+original_attn_implementation = getattr(config, '_attn_implementation_internal', None)
+if original_attn_implementation == 'flash_attention_3':
+    # Checkpoint conversion only needs a parameter-free model skeleton.  Keep
+    # conversion usable in environments that do not install the optional FA3
+    # Python package, while preserving the runtime preference in config.json.
+    config._attn_implementation_internal = 'eager'
 with torch.device("meta"):
     model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
+if original_attn_implementation is not None:
+    config._attn_implementation_internal = original_attn_implementation
 model.to_empty(device="cpu")
 missing, unexpected = model.load_state_dict(sd, strict=False)
 assert not unexpected, f"unexpected keys: {unexpected[:5]}"

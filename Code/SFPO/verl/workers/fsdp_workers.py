@@ -566,9 +566,14 @@ class ActorRolloutRefWorker(Worker):
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+            trigger_enabled = bool(data.meta_info.get('gxpo_trigger_enabled', True))
+            trigger_stop = bool(data.meta_info.get('gxpo_trigger_stop', False))
             # perform training
             with Timer(name='update_policy', logger=None) as timer:
-                metrics = self.actor.update_policy_gxpo(data=data)
+                metrics = self.actor.update_policy_gxpo(
+                    data=data,
+                    trigger_enabled=trigger_enabled,
+                    trigger_stop=trigger_stop)
             delta_time = timer.last
             global_num_tokens = data.meta_info['global_token_num']
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)

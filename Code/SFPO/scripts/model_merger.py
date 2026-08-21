@@ -17,7 +17,15 @@ import re
 import os
 import torch
 import argparse
-from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForVision2Seq
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForTokenClassification
+
+try:
+    # Optional: causal-LM checkpoints (including Qwen2.5-Math) do not need the
+    # vision auto-model class, which is absent from some supported Transformers
+    # versions used by the training environment.
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    AutoModelForVision2Seq = None
 from concurrent.futures import ThreadPoolExecutor
 from torch.distributed._tensor import DTensor, Shard, Placement
 
@@ -52,29 +60,45 @@ if __name__ == '__main__':
             break  
     assert world_size, "No model file with the proper format"
         
+    model_shard_files = [
+        filename for filename in os.listdir(local_dir)
+        if re.fullmatch(rf'model_world_size_{world_size}_rank_\d+\.pt', filename)
+    ]
     state_dict = torch.load(os.path.join(local_dir, f'model_world_size_{world_size}_rank_{rank}.pt'), map_location='cpu')
     pivot_key = sorted(list(state_dict.keys()))[0]
     weight = state_dict[pivot_key]
-    assert isinstance(weight, torch.distributed._tensor.DTensor)
-    # get sharding info
-    device_mesh = weight.device_mesh
-    mesh = device_mesh.mesh
-    mesh_dim_names = device_mesh.mesh_dim_names
 
-    print(f'Got device mesh {mesh}, mesh_dim_names {mesh_dim_names}')
+    if isinstance(weight, DTensor):
+        # Get sharding info for distributed checkpoints.
+        device_mesh = weight.device_mesh
+        mesh = device_mesh.mesh
+        mesh_dim_names = device_mesh.mesh_dim_names
 
-    assert mesh_dim_names in (
-        ('fsdp',),
-    ), f'Unsupported mesh_dim_names {mesh_dim_names}'
+        print(f'Got device mesh {mesh}, mesh_dim_names {mesh_dim_names}')
 
-    if 'tp' in mesh_dim_names:
-        # fsdp * tp
-        total_shards = mesh.shape[-1] * mesh.shape[-2]
-        mesh_shape = (mesh.shape[-2], mesh.shape[-1])
+        assert mesh_dim_names in (
+            ('fsdp',),
+        ), f'Unsupported mesh_dim_names {mesh_dim_names}'
+
+        if 'tp' in mesh_dim_names:
+            # fsdp * tp
+            total_shards = mesh.shape[-1] * mesh.shape[-2]
+            mesh_shape = (mesh.shape[-2], mesh.shape[-1])
+        else:
+            # fsdp
+            total_shards = mesh.shape[-1]
+            mesh_shape = (mesh.shape[-1],)
     else:
-        # fsdp
-        total_shards = mesh.shape[-1]
-        mesh_shape = (mesh.shape[-1],)
+        # A one-rank verl save may already contain ordinary tensors.
+        if len(model_shard_files) != 1:
+            raise ValueError(
+                'Ordinary tensor checkpoints require exactly one model shard; '
+                f'found {len(model_shard_files)}'
+            )
+        total_shards = 1
+        mesh_shape = ()
+        mesh_dim_names = ()
+        print('Checkpoint contains ordinary tensors; no shard merge is required')
 
     print(f'Processing model shards with {total_shards} {mesh_shape} in total')
 
@@ -141,12 +165,27 @@ if __name__ == '__main__':
     elif 'ForCausalLM' in config.architectures[0]:
         auto_model = AutoModelForCausalLM
     elif 'ForConditionalGeneration' in config.architectures[0]:
+        if AutoModelForVision2Seq is None:
+            raise ImportError(
+                'This checkpoint requires AutoModelForVision2Seq, but the installed '
+                'Transformers version does not provide it.'
+            )
         auto_model = AutoModelForVision2Seq
     else:
         raise NotImplementedError(f'Unknown architecture {config["architectures"]}')
 
+    # Finalization only needs a parameter-free model skeleton.  The training
+    # config may request FA3 even when the evaluator's Transformers process
+    # does not have the optional FA3 package installed.  Use eager attention
+    # while constructing the skeleton, then restore the original config before
+    # saving so the checkpoint's runtime preference is preserved.
+    original_attn_implementation = getattr(config, '_attn_implementation_internal', None)
+    if original_attn_implementation == 'flash_attention_3':
+        config._attn_implementation_internal = 'eager'
     with torch.device('meta'):
         model = auto_model.from_config(config, torch_dtype=torch.bfloat16)
+    if original_attn_implementation is not None:
+        config._attn_implementation_internal = original_attn_implementation
     model.to_empty(device='cpu')
 
     print(f'Saving model to {hf_path}')
@@ -165,8 +204,6 @@ if __name__ == '__main__':
         )
     
     
-
-
 
 
 

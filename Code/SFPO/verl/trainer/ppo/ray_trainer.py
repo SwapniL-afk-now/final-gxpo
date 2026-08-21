@@ -332,6 +332,17 @@ class RayPPOTrainer(object):
         self.current_epoch = 0
         self.entropy_container = []
         self.stop_SFPO = False
+        self.sfpo_trigger_streak = 0
+        self.sfpo_trigger_step = None
+        self.sfpo_entropy_reset_done = False
+        # GXPO uses the same entropy-trigger gate as SFPO.  Keep a separate
+        # history so the two algorithms cannot affect one another when runs
+        # share trainer code.
+        self.gxpo_entropy_container = []
+        self.stop_GXPO = False
+        self.gxpo_trigger_streak = 0
+        self.gxpo_trigger_step = None
+        self.gxpo_entropy_reset_done = False
 
         self.targeted_easy = self.config.data.get('target_zero_variance', 0.25) / 3
         self.targeted_hard = self.config.data.get('target_zero_variance', 0.25) * 2 / 3 # more exploration on hard examples, because they are more likely to change (conidering that overall reward is increasing.)
@@ -1287,6 +1298,12 @@ class RayPPOTrainer(object):
                 'gxpo/unsafe_coordinate_fraction': scalar(metrics.get('actor/gxpo_ratio_clip_frac')),
                 'gxpo/reliability_stat': scalar(metrics.get('actor/gxpo_trigger_stat')),
                 'gxpo/reliability_threshold': scalar(actor_cfg.get('gxpo_tau'), 0.0),
+                'gxpo/zscore_window': scalar(actor_cfg.get('gxpo_zscore_w'), 30.0),
+                'gxpo/trigger_streak': scalar(metrics.get('actor/gxpo_trigger_streak'), 0.0),
+                'gxpo/trigger_candidate': scalar(metrics.get('actor/gxpo_trigger_candidate'), 0.0),
+                'gxpo/trigger_patience': scalar(actor_cfg.get('gxpo_trigger_patience'), 1.0),
+                'gxpo/entropy_window_ready': scalar(metrics.get('actor/gxpo_entropy_window_ready'), 0.0),
+                'gxpo/trigger_warmup_active': scalar(metrics.get('actor/gxpo_trigger_warmup_active'), 0.0),
             })
         elif actor_cfg.get('use_sfpo', False):
             alpha = scalar(actor_cfg.get('sfpo_step_size'), 0.5)
@@ -1295,7 +1312,12 @@ class RayPPOTrainer(object):
                 'sfpo/alpha': alpha,
                 'sfpo/fast_phase_active': scalar(metrics.get('actor/sfpo_fast_phase_active'), 0.0),
                 'sfpo/fallback_triggered': scalar(metrics.get('actor/sfpo_fallback_triggered'), 1.0 if self.stop_SFPO else 0.0),
-                'sfpo/fallback_step': float(step) if self.stop_SFPO else None,
+                'sfpo/fallback_step': float(self.sfpo_trigger_step) if self.stop_SFPO and self.sfpo_trigger_step is not None else None,
+                'sfpo/trigger_z': scalar(metrics.get('actor/sfpo_trigger_z'), 0.0),
+                'sfpo/trigger_streak': scalar(metrics.get('actor/sfpo_trigger_streak'), 0.0),
+                'sfpo/trigger_candidate': scalar(metrics.get('actor/sfpo_trigger_candidate'), 0.0),
+                'sfpo/trigger_patience': scalar(actor_cfg.get('sfpo_trigger_patience'), 1.0),
+                'sfpo/entropy_window_ready': scalar(metrics.get('actor/sfpo_entropy_window_ready'), 0.0),
                 'sfpo/fast_updates_executed_step': scalar(metrics.get('actor/sfpo_fast_updates_executed_step'), 0.0),
                 'sfpo/reposition_displacement_norm': scalar(metrics.get('actor/sfpo_reposition_displacement_norm')),
                 'sfpo/fresh_grad_norm': scalar(metrics.get('actor/grad_norm')),
@@ -1661,14 +1683,90 @@ class RayPPOTrainer(object):
                         critic_output_metrics = reduce_metrics(critic_output.meta_info['metrics'])
                         metrics.update(critic_output_metrics)
                         
-                    zscore_w = self.config.actor_rollout_ref.actor.get('zscore_w', 0)
-                    if zscore_w > 0 and len(self.entropy_container) >= zscore_w:
+                    actor_cfg = self.config.actor_rollout_ref.actor
+                    sfpo_warmup_steps = int(actor_cfg.get('sfpo_warmup_steps', 0))
+                    sfpo_trigger_enabled = self.global_steps > sfpo_warmup_steps
+                    zscore_w = actor_cfg.get('zscore_w', 0)
+                    sfpo_reset_after_warmup = bool(actor_cfg.get('sfpo_reset_entropy_after_warmup', True))
+                    if (sfpo_trigger_enabled and sfpo_reset_after_warmup and
+                            not self.sfpo_entropy_reset_done):
+                        # Do not compare the first post-warmup observation with a
+                        # distribution produced during the fast phase.  Start a
+                        # fresh baseline and wait for one complete rolling window.
+                        self.entropy_container.clear()
+                        self.sfpo_entropy_reset_done = True
+                        self.sfpo_trigger_streak = 0
+
+                    sfpo_baseline_ready = zscore_w > 0 and len(self.entropy_container) >= zscore_w
+                    sfpo_trigger_z = 0.0
+                    sfpo_trigger_candidate = False
+                    if sfpo_trigger_enabled and sfpo_baseline_ready:
                         u = float(np.mean(self.entropy_container[-zscore_w:]))
                         std = float(np.std(self.entropy_container[-zscore_w:])) + 1e-9
-                        z = (self.entropy_container[-1] - u) / std
+                        sfpo_trigger_z = (self.entropy_container[-1] - u) / std
 
-                        if z >= self.config.actor_rollout_ref.actor.zscore_threshold:
+                        sfpo_trigger_candidate = sfpo_trigger_z >= actor_cfg.zscore_threshold
+                        if sfpo_trigger_candidate:
+                            self.sfpo_trigger_streak += 1
+                        else:
+                            self.sfpo_trigger_streak = 0
+                        sfpo_trigger_patience = max(1, int(actor_cfg.get('sfpo_trigger_patience', 1)))
+                        if self.sfpo_trigger_streak >= sfpo_trigger_patience:
                             self.stop_SFPO = True
+                            if self.sfpo_trigger_step is None:
+                                self.sfpo_trigger_step = int(self.global_steps)
+
+                    gxpo_trigger_enabled = False
+                    gxpo_baseline_ready = False
+                    gxpo_trigger_z = 0.0
+                    gxpo_trigger_candidate = False
+                    gxpo_trigger_stat = (
+                        float(self.gxpo_entropy_container[-1])
+                        if self.gxpo_entropy_container else 0.0
+                    )
+                    if actor_cfg.get('use_gxpo', False):
+                        gxpo_warmup_steps = int(actor_cfg.get('gxpo_warmup_steps', 0))
+                        gxpo_trigger_enabled = self.global_steps > gxpo_warmup_steps
+                        gxpo_zscore_w = int(actor_cfg.get('gxpo_zscore_w', 30))
+                        gxpo_reset_after_warmup = bool(
+                            actor_cfg.get('gxpo_reset_entropy_after_warmup', True))
+                        if (gxpo_trigger_enabled and gxpo_reset_after_warmup and
+                                not self.gxpo_entropy_reset_done):
+                            # Exactly SFPO's warmup boundary: do not compare a
+                            # post-warmup value with the fast-phase entropy.
+                            self.gxpo_entropy_container.clear()
+                            self.gxpo_entropy_reset_done = True
+                            self.gxpo_trigger_streak = 0
+                            gxpo_trigger_stat = 0.0
+
+                        gxpo_baseline_ready = (
+                            gxpo_zscore_w > 0 and
+                            len(self.gxpo_entropy_container) >= gxpo_zscore_w)
+                        if gxpo_trigger_enabled and gxpo_baseline_ready:
+                            # SFPO ordering: score the latest completed outer
+                            # batch against the preceding rolling window.
+                            u = float(np.mean(self.gxpo_entropy_container[-gxpo_zscore_w:]))
+                            std = float(np.std(self.gxpo_entropy_container[-gxpo_zscore_w:])) + 1e-9
+                            gxpo_trigger_z = (gxpo_trigger_stat - u) / std
+                            gxpo_trigger_candidate = gxpo_trigger_z >= float(
+                                actor_cfg.get('gxpo_tau', 3.0))
+                            if gxpo_trigger_candidate:
+                                self.gxpo_trigger_streak += 1
+                            else:
+                                self.gxpo_trigger_streak = 0
+                            gxpo_trigger_patience = max(
+                                1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
+                            if (self.gxpo_trigger_streak >= gxpo_trigger_patience and
+                                    not self.stop_GXPO):
+                                self.stop_GXPO = True
+                                if self.gxpo_trigger_step is None:
+                                    self.gxpo_trigger_step = int(self.global_steps)
+                                print(
+                                    f'[GXPO] entropy shutoff triggered at outer batch '
+                                    f'{self.global_steps}: z={gxpo_trigger_z:.3f} '
+                                    f'>= tau={float(actor_cfg.get("gxpo_tau", 3.0)):.3f} '
+                                    f'after {gxpo_trigger_patience} consecutive observations '
+                                    f'-> single-pass GRPO from now on')
 
                     # implement critic warmup
                     ####################################MODIFICATION####################################
@@ -1676,6 +1774,15 @@ class RayPPOTrainer(object):
                         # update actor
                         with _timer('update_actor', timing_raw):
                             if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
+                                batch.meta_info['gxpo_trigger_enabled'] = (
+                                    gxpo_trigger_enabled
+                                )
+                                batch.meta_info['gxpo_trigger_stop'] = self.stop_GXPO
+                                batch.meta_info['gxpo_trigger_z'] = gxpo_trigger_z
+                                batch.meta_info['gxpo_trigger_stat'] = gxpo_trigger_stat
+                                batch.meta_info['gxpo_trigger_streak'] = self.gxpo_trigger_streak
+                                batch.meta_info['gxpo_trigger_candidate'] = gxpo_trigger_candidate
+                                batch.meta_info['gxpo_entropy_window_ready'] = gxpo_baseline_ready
                                 actor_output = self.actor_rollout_wg.gxpo_update_actor(batch)
                             elif self.config.actor_rollout_ref.actor.get('use_sfpo', False) and not self.stop_SFPO:
                                 actor_output = self.actor_rollout_wg.sfpo_update_actor(batch)
@@ -1698,19 +1805,56 @@ class RayPPOTrainer(object):
                         }
                         actor_output_metrics = reduce_metrics(actor_scalar_metrics)
                         actor_output_metrics.update(actor_nested_metrics)
+                        if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
+                            actor_output_metrics.update({
+                                'actor/gxpo_trigger_z': gxpo_trigger_z,
+                                'actor/gxpo_trigger_stat': gxpo_trigger_stat,
+                                'actor/gxpo_trigger_streak': float(self.gxpo_trigger_streak),
+                                'actor/gxpo_trigger_candidate': float(gxpo_trigger_candidate),
+                                'actor/gxpo_trigger_warmup_active': float(
+                                    not (gxpo_trigger_enabled and gxpo_baseline_ready)),
+                                'actor/gxpo_entropy_window_ready': float(gxpo_baseline_ready),
+                                'actor/gxpo_trigger_patience': float(
+                                    max(1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
+                                ),
+                            })
+                            if self.stop_GXPO:
+                                actor_output_metrics.update({
+                                    'actor/gxpo_fallback_triggered': 1.0,
+                                    'actor/gxpo_fallback_step': float(
+                                        self.gxpo_trigger_step or self.global_steps),
+                                    'actor/gxpo_shutoff_step': float(
+                                        self.gxpo_trigger_step or self.global_steps),
+                                })
+                        if self.config.actor_rollout_ref.actor.get('use_sfpo', False):
+                            actor_output_metrics['actor/sfpo_trigger_warmup_active'] = float(
+                                not (sfpo_trigger_enabled and sfpo_baseline_ready)
+                            )
+                            actor_output_metrics.update({
+                                'actor/sfpo_trigger_z': sfpo_trigger_z,
+                                'actor/sfpo_trigger_streak': float(self.sfpo_trigger_streak),
+                                'actor/sfpo_trigger_candidate': float(sfpo_trigger_candidate),
+                                'actor/sfpo_trigger_patience': float(
+                                    max(1, int(actor_cfg.get('sfpo_trigger_patience', 1)))
+                                ),
+                                'actor/sfpo_entropy_window_ready': float(sfpo_baseline_ready),
+                            })
                         if self.config.actor_rollout_ref.actor.get('use_sfpo', False) and self.stop_SFPO:
                             actor_output_metrics.update({
                                 'actor/sfpo_k': float(self.config.actor_rollout_ref.actor.get('sfpo_inner_steps', 10)),
                                 'actor/sfpo_alpha': float(self.config.actor_rollout_ref.actor.get('sfpo_step_size', 0.5)),
                                 'actor/sfpo_fast_phase_active': 0.0,
                                 'actor/sfpo_fallback_triggered': 1.0,
-                                'actor/sfpo_fallback_step': float(self.global_steps),
+                                'actor/sfpo_fallback_step': float(self.sfpo_trigger_step or self.global_steps),
                                 'actor/sfpo_fast_updates_executed_step': 0.0,
                             })
                         metrics.update(actor_output_metrics)
                     ####################################MODIFICATION####################################
 
                     self.entropy_container.append(float(actor_output_metrics['actor/entropy_loss']))
+                    if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
+                        self.gxpo_entropy_container.append(
+                            float(actor_output_metrics['actor/entropy_loss']))
                     active_train_elapsed_s = time.monotonic() - active_train_start
 
                     # validate
