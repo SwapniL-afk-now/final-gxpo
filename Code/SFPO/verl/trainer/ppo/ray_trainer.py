@@ -637,9 +637,11 @@ class RayPPOTrainer(object):
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
-        print('Repeated validation with n={}'.format(self.config.actor_rollout_ref.rollout.val_kwargs.n))
-        print('Validation config:')
-        pprint(self.config.actor_rollout_ref.rollout.val_kwargs)
+        concise_logs = os.environ.get("GXPO_CONCISE_LOGS") == "1"
+        if not concise_logs:
+            print("Repeated validation with n={}".format(self.config.actor_rollout_ref.rollout.val_kwargs.n))
+            print("Validation config:")
+            pprint(self.config.actor_rollout_ref.rollout.val_kwargs)
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -676,7 +678,8 @@ class RayPPOTrainer(object):
                 'validate': True,
                 'gen_seed': gen_seed,
             }
-            print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
+            if not concise_logs:
+                print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
@@ -684,7 +687,8 @@ class RayPPOTrainer(object):
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-            print('validation generation end')
+            if not concise_logs:
+                print("validation generation end")
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch['responses']
@@ -726,7 +730,8 @@ class RayPPOTrainer(object):
             #ignore the format score
             rewards[rewards < 0.95] = 0
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
-            print(f'>>> Test: val/test_score/{data_source}: {np.mean(rewards)}')
+            if not concise_logs:
+                print(f"validation test_score: {np.mean(rewards):.3f}")
             sum_acc += np.mean(rewards)
             sum_count += 1
 
@@ -739,9 +744,19 @@ class RayPPOTrainer(object):
                 metric_dict[f'val/pass_at_{val_n}/{data_source}'] = float(per_prompt.max(axis=1).mean())
                 # avg@n: mean accuracy across the n samples, averaged over prompts
                 metric_dict[f'val/avg_at_{val_n}/{data_source}'] = float(per_prompt.mean(axis=1).mean())
-        metric_dict['val/test_score/average'] = sum_acc / sum_count
-        print(f'>>> Test: val/test_score/average: {sum_acc / sum_count}')
-        print(metric_dict)
+        metric_dict["val/test_score/average"] = sum_acc / sum_count
+        if concise_logs:
+            pass_values = [value for key, value in metric_dict.items()
+                           if key.startswith("val/pass_at_1/") and not key.endswith("/std")]
+            pass_at_1_avg = float(np.mean(pass_values)) if pass_values else float("nan")
+            avg_test_score = float(metric_dict["val/test_score/average"])
+            print("Validation summary: "
+                  f"test_score_avg={avg_test_score:.3f} "
+                  f"pass_at_1_avg={pass_at_1_avg:.3f} "
+                  f"datasets={len(pass_values)}")
+        else:
+            print(f"validation test_score_avg: {sum_acc / sum_count:.3f}")
+            print(metric_dict)
 
         return metric_dict
 
@@ -1369,7 +1384,13 @@ class RayPPOTrainer(object):
         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', False) and self.global_steps == 0:
             print('Start Initial Eval...')
             val_metrics = self._validate()
-            pprint(f'Initial validation metrics: {val_metrics}')
+            if os.environ.get("GXPO_CONCISE_LOGS") == "1":
+                avg_pass1 = float(val_metrics.get("eval_greedy/avg_pass1", float("nan")))
+                avg_test_score = float(val_metrics.get("val/test_score/average", float("nan")))
+                benchmark_count = int(val_metrics.get("eval_greedy/benchmark_count", 0))
+                print(f"Initial validation summary: avg_pass1={avg_pass1:.3f} avg_test_score={avg_test_score:.3f} benchmarks={benchmark_count}")
+            else:
+                pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get('val_only', False):
                 return
@@ -1460,8 +1481,8 @@ class RayPPOTrainer(object):
                     else:
                         acc_batch = DataProto.concat([acc_batch, batch])
 
-                    print(f'Dynamic Filtering: len(batch): {len(batch)}')
-                    print(f'Dynamic Filtering: len(acc_batch): {len(acc_batch)}')
+                    if os.environ.get('GXPO_CONCISE_LOGS') != '1':                     print(f'Dynamic Filtering: len(batch): {len(batch)}')
+                    if os.environ.get('GXPO_CONCISE_LOGS') != '1':                     print(f'Dynamic Filtering: len(acc_batch): {len(acc_batch)}')
                     if len(acc_batch) >= adaptive_sampling_bs:
                         batch = acc_batch
                         acc_batch = None
@@ -1470,7 +1491,7 @@ class RayPPOTrainer(object):
                         else:
                             remainder = len(batch) % self.config.trainer.n_gpus_per_node
                             batch = select_batch_slice(batch, len(batch) - remainder)
-                        print(f'Dynamic Filtering for Sampling: len(batch): {len(batch)}')
+                        if os.environ.get('GXPO_CONCISE_LOGS') != '1':                         print(f'Dynamic Filtering for Sampling: len(batch): {len(batch)}')
                     else:
                         continue
 
@@ -1491,7 +1512,7 @@ class RayPPOTrainer(object):
 
                 with _timer('step', timing_raw):
                     # generate a batch
-                    print('start generation...')
+                    if os.environ.get('GXPO_CONCISE_LOGS') != '1': print('start generation...')
                     with _timer('gen', timing_raw):
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
@@ -1524,12 +1545,12 @@ class RayPPOTrainer(object):
                     if generation_accumulation is not None:
                         if len(question_scale_batch_list) < generation_accumulation - 1:
                             question_scale_batch_list.append(batch)
-                            print('Append batch.')
-                            print(f'buffer size: {len(question_scale_batch_list)}')
+                            if os.environ.get('GXPO_CONCISE_LOGS') != '1':                             print('Append batch.')
+                            if os.environ.get('GXPO_CONCISE_LOGS') != '1':                             print(f'buffer size: {len(question_scale_batch_list)}')
                             continue
                         else:
-                            print('Use buffered batch.')
-                            print(f'buffer size: {len(question_scale_batch_list)}')
+                            if os.environ.get('GXPO_CONCISE_LOGS') != '1':                             print('Use buffered batch.')
+                            if os.environ.get('GXPO_CONCISE_LOGS') != '1':                             print(f'buffer size: {len(question_scale_batch_list)}')
                             question_scale_batch_list.append(batch)
                             batch = DataProto.concat(question_scale_batch_list)
                             question_scale_batch_list = []
@@ -1604,7 +1625,7 @@ class RayPPOTrainer(object):
 
                     data_id_list = self.data_profiler.get_data_id_list(log_data_source, log_index_tensor)
                     self.data_profiler.add_reward_list(epoch, data_id_list, log_avg_reward)
-                    print(f'len(self.data_profiler): {len(self.data_profiler)}')
+                    if os.environ.get('GXPO_CONCISE_LOGS') != '1':                     print(f'len(self.data_profiler): {len(self.data_profiler)}')
 
                     #### Important point: Generation completed!!!!!!!! #####
                     # When we reach this point, we have finish the example generation and adv computation.
@@ -1613,7 +1634,7 @@ class RayPPOTrainer(object):
                     # Compute generation time
                     generation_time += time.time() - generation_start
                     refresh_generation_time_flag = True
-                    print(f'Total generation time: {generation_time}')
+                    if os.environ.get('GXPO_CONCISE_LOGS') != '1':                     print(f'Total generation time: {generation_time}')
                     # log generation time in metrics
                     metrics.update({'timing_s/total_generation_time': generation_time})
                     # import ipdb; ipdb.set_trace()
@@ -1624,7 +1645,7 @@ class RayPPOTrainer(object):
 
                     min_p = self.config.data.get('min_p', 0.05)
                     max_p = self.config.data.get('max_p', 0.95)
-                    print(f'min_p: {min_p}, max_p: {max_p}')
+                    if os.environ.get('GXPO_CONCISE_LOGS') != '1':                     print(f'min_p: {min_p}, max_p: {max_p}')
 
                     if epoch > 0 and self.config.data.get('dynamic_filtering_strategy', 'None') == 'all_probabilistic':
                         min_p = self.config.data.get('min_p', 0.05)
@@ -1649,7 +1670,7 @@ class RayPPOTrainer(object):
                     if self.config.data.get('dynamic_filtering_strategy', 'None') == 'all_probabilistic':
                         examples_log['examples/p_easy'] = self.p_easy
                         examples_log['examples/p_hard'] = self.p_hard
-                        print(f'p_easy: {self.p_easy}, p_hard: {self.p_hard}')
+                        if os.environ.get('GXPO_CONCISE_LOGS') != '1':                         print(f'p_easy: {self.p_easy}, p_hard: {self.p_hard}')
 
                     metrics.update(examples_log)
 
@@ -1741,34 +1762,60 @@ class RayPPOTrainer(object):
                             self.gxpo_trigger_streak = 0
                             gxpo_trigger_stat = 0.0
 
-                        gxpo_baseline_ready = (
-                            gxpo_zscore_w > 0 and
-                            len(self.gxpo_entropy_container) >= gxpo_zscore_w)
-                        if gxpo_trigger_enabled and gxpo_baseline_ready:
-                            # SFPO ordering: score the latest completed outer
-                            # batch against the preceding rolling window.
-                            u = float(np.mean(self.gxpo_entropy_container[-gxpo_zscore_w:]))
-                            std = float(np.std(self.gxpo_entropy_container[-gxpo_zscore_w:])) + 1e-9
-                            gxpo_trigger_z = (gxpo_trigger_stat - u) / std
-                            gxpo_trigger_candidate = gxpo_trigger_z >= float(
-                                actor_cfg.get('gxpo_tau', 3.0))
-                            if gxpo_trigger_candidate:
-                                self.gxpo_trigger_streak += 1
-                            else:
-                                self.gxpo_trigger_streak = 0
-                            gxpo_trigger_patience = max(
-                                1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
-                            if (self.gxpo_trigger_streak >= gxpo_trigger_patience and
-                                    not self.stop_GXPO):
-                                self.stop_GXPO = True
-                                if self.gxpo_trigger_step is None:
-                                    self.gxpo_trigger_step = int(self.global_steps)
-                                print(
-                                    f'[GXPO] entropy shutoff triggered at outer batch '
-                                    f'{self.global_steps}: z={gxpo_trigger_z:.3f} '
-                                    f'>= tau={float(actor_cfg.get("gxpo_tau", 3.0)):.3f} '
-                                    f'after {gxpo_trigger_patience} consecutive observations '
-                                    f'-> single-pass GRPO from now on')
+                        gxpo_fallback_mode = str(
+                        actor_cfg.get('gxpo_fallback_mode', 'permanent')).lower()
+                    gxpo_fallback_window = max(
+                        1, int(actor_cfg.get('gxpo_fallback_window', 10)))
+                    # The previous trainer path permanently set stop_GXPO after
+                    # one trigger, bypassing GXPOState's temporary fallback mode.
+                    # Re-arm only after the configured GRPO fallback window; keep
+                    # the entropy history so the next gate uses the retained window.
+                    if (self.stop_GXPO and gxpo_fallback_mode == 'temporary' and
+                            self.gxpo_trigger_step is not None and
+                            self.global_steps >= self.gxpo_trigger_step + gxpo_fallback_window):
+                        self.stop_GXPO = False
+                        self.gxpo_trigger_step = None
+                        self.gxpo_trigger_streak = 0
+                        print(
+                            f'[GXPO] temporary fallback ended at outer batch '
+                            f'{self.global_steps}; re-arming GXPO')
+
+                    gxpo_baseline_ready = (
+                        gxpo_zscore_w > 0 and
+                        len(self.gxpo_entropy_container) >= gxpo_zscore_w)
+                    if (gxpo_trigger_enabled and gxpo_baseline_ready and
+                            not self.stop_GXPO):
+                        # SFPO ordering: score the latest completed outer
+                        # batch against the preceding rolling window.
+                        u = float(np.mean(self.gxpo_entropy_container[-gxpo_zscore_w:]))
+                        std = float(np.std(self.gxpo_entropy_container[-gxpo_zscore_w:])) + 1e-9
+                        gxpo_trigger_z = (gxpo_trigger_stat - u) / std
+                        gxpo_trigger_candidate = gxpo_trigger_z >= float(
+                            actor_cfg.get('gxpo_tau', 3.0))
+                        if gxpo_trigger_candidate:
+                            self.gxpo_trigger_streak += 1
+                        else:
+                            self.gxpo_trigger_streak = 0
+                        gxpo_trigger_patience = max(
+                            1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
+                        if (self.gxpo_trigger_streak >= gxpo_trigger_patience and
+                                not self.stop_GXPO):
+                            self.stop_GXPO = True
+                            if self.gxpo_trigger_step is None:
+                                self.gxpo_trigger_step = int(self.global_steps)
+                            print(
+                                f'[GXPO] entropy shutoff triggered at outer batch '
+                                f'{self.global_steps}: z={gxpo_trigger_z:.3f} '
+                                f'>= tau={float(actor_cfg.get("gxpo_tau", 3.0)):.3f} '
+                                f'after {gxpo_trigger_patience} consecutive observations '
+                                f'-> {gxpo_fallback_mode} fallback')
+                    elif self.stop_GXPO:
+                        # Do not accumulate trigger streaks while temporary GRPO
+                        # fallback is active; the gate is re-armed only at the
+                        # explicit fallback-window boundary above.
+                        gxpo_trigger_z = 0.0
+                        gxpo_trigger_candidate = False
+                        self.gxpo_trigger_streak = 0
 
                     # implement critic warmup
                     ####################################MODIFICATION####################################
@@ -1927,21 +1974,21 @@ class RayPPOTrainer(object):
                         'headline_wall_clock_metric': 'time/cum_train_active_s',
                         'headline_bp_metric': 'eff/cum_policy_grad_evals',
                     })
-                    pprint(f'Final validation metrics: {last_val_metrics}')
+                    if os.environ.get('GXPO_CONCISE_LOGS') != '1': pprint(f'Final validation metrics: {last_val_metrics}')
                     return
 
-                print(f'epoch: {epoch}')
-                print(f'Global_steps done: {self.global_steps}')
-                print(f'sampling_num: {self.sampling_num}')
+                if os.environ.get('GXPO_CONCISE_LOGS') != '1':                 print(f'epoch: {epoch}')
+                if os.environ.get('GXPO_CONCISE_LOGS') != '1':                 print(f'Global_steps done: {self.global_steps}')
+                if os.environ.get('GXPO_CONCISE_LOGS') != '1':                 print(f'sampling_num: {self.sampling_num}')
                 # reward_metrics = {}
                 self.global_steps += 1
-                print(f'Start global_steps: {self.global_steps}')
+                if os.environ.get('GXPO_CONCISE_LOGS') != '1':                 print(f'Start global_steps: {self.global_steps}')
 
-            print(f'Epoch {epoch} done!')
+            if os.environ.get('GXPO_CONCISE_LOGS') != '1':             print(f'Epoch {epoch} done!')
             if hasattr(self.config.trainer, 'save_dir') and self.config.trainer.save_dir:
                 if not os.path.exists(self.config.trainer.save_dir):
                     os.makedirs(self.config.trainer.save_dir)
-                print(f'Saving data_avg_reward and data_full_reward at {self.config.trainer.save_dir}')
+                if os.environ.get('GXPO_CONCISE_LOGS') != '1':                 print(f'Saving data_avg_reward and data_full_reward at {self.config.trainer.save_dir}')
                 torch.save(data_avg_reward, f'{self.config.trainer.save_dir}/data_avg_reward.pt')
                 torch.save(data_full_reward, f'{self.config.trainer.save_dir}/data_full_reward.pt')
                 torch.save(data_correct_num, f'{self.config.trainer.save_dir}/data_correct_num.pt')

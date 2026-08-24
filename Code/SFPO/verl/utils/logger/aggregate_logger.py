@@ -15,12 +15,18 @@
 A Ray logger will receive logging info from different processes.
 """
 import numbers
+import os
 from typing import Dict
 
 
 def concat_dict_to_str(dict: Dict, step):
     output = [f'step:{step}']
-    for k, v in dict.items():
+    if os.environ.get("GXPO_CONCISE_LOGS") == "1":
+        keys = ("reward/mean", "train/accuracy", "actor/entropy_loss", "perf/throughput", "timing_s/total_step", "timing_s/total_generation_time", "time/total_step_s", "eff/outer_step", "actor/gxpo_prediction_active", "actor/gxpo_trigger_streak", "actor/gxpo_entropy_window_ready", "actor/gxpo_fallback_triggered", "gxpo/trigger_streak", "gxpo/entropy_window_ready", "gxpo/fallback_triggered")
+        items = ((k, dict[k]) for k in keys if k in dict)
+    else:
+        items = dict.items()
+    for k, v in items:
         if isinstance(v, numbers.Number):
             output.append(f'{k}:{v:.3f}')
     output_str = ' - '.join(output)

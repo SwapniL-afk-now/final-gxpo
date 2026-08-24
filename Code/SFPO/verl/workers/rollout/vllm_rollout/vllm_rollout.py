@@ -27,6 +27,7 @@ When working with Megatron:
 from typing import List
 from contextlib import contextmanager
 from omegaconf import DictConfig
+import os
 import torch
 import torch.distributed
 from tensordict import TensorDict
@@ -132,7 +133,7 @@ class vLLMRollout(BaseRollout):
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
 
-        print(f"kwargs: {kwargs}")
+        if os.environ.get('GXPO_CONCISE_LOGS') != '1': print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id

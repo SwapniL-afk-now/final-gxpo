@@ -19,6 +19,7 @@ from concurrent.futures import ProcessPoolExecutor
 from verl import DataProto
 from verl.utils.reward_score import _default_compute_score
 import torch
+import os
 
 
 class NaiveRewardManager:
@@ -121,9 +122,10 @@ class NaiveRewardManager:
 
             if already_print_data_sources[data_source] < self.num_examine:
                 already_print_data_sources[data_source] += 1
-                print("[prompt]", args_list[i]['prompt_str'])
-                print("[response]", response_strs[i])
-                print("[ground_truth]", args_list[i]['ground_truth'])
-                print("[score]", scores[i])
+                if os.environ.get('GXPO_CONCISE_LOGS') != '1':
+                    print("[prompt]", args_list[i]['prompt_str'])
+                    print("[response]", response_strs[i])
+                    print("[ground_truth]", args_list[i]['ground_truth'])
+                    print("[score]", scores[i])
 
         return reward_tensor

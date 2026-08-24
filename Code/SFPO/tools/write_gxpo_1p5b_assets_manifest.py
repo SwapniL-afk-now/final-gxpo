@@ -12,7 +12,7 @@ from verify_gxpo_math_assets import ASSETS, validate_asset
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODEL_ID = "Qwen/Qwen2.5-Math-1.5B-Instruct"
-MODEL_PATH = REPO_ROOT / "models" / "Qwen2.5-Math-1.5B-Instruct"
+MODEL_PATH = REPO_ROOT.parents[1] / "models" / "Qwen2.5-Math-1.5B-Instruct"
 MANIFEST_PATH = REPO_ROOT / "assets" / "gxpo_1p5b_assets.json"
 
 

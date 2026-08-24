@@ -125,8 +125,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.inference_engine.wake_up()
             world_size = torch.distributed.get_world_size()
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+            # FSDP=1 uses a two-dimensional mesh with an FSDP dimension of
+            # size one. In that mode state_dict() can return ordinary tensors
+            # even though the distributed world has more than one rank.
+            # Only DTensor/FSDP sharded tensors provide full_tensor().
             loaded_params = model.load_weights(
-                ((name, param.full_tensor() if world_size != 1 else param) for name, param in params.items()))
+                ((name, param.full_tensor() if hasattr(param, "full_tensor") else param)
+                 for name, param in params.items()))
             logger.info(f"vLLM load wegiths, loaded_params: {len(loaded_params)}")
 
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)

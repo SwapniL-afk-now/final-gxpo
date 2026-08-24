@@ -10,13 +10,12 @@ cd "$REPO_ROOT"
 # Make every launch reproducible from a fresh tmux shell.  The base image's
 # venv is not automatically activated, and FA3/dependency wheels are kept in
 # user-writable workspace paths on this unprivileged instance.
-if [[ -f /venv/main/bin/activate ]]; then
-  source /venv/main/bin/activate
+GXPO_PROJECT_ROOT="$(cd -- "$REPO_ROOT/../.." && pwd)"
+if [[ -x "$GXPO_PROJECT_ROOT/.venv/bin/python" ]]; then
+  export VIRTUAL_ENV="$GXPO_PROJECT_ROOT/.venv"
+  export PATH="$GXPO_PROJECT_ROOT/.venv/bin:$PATH"
 fi
 export PYTHONPATH="$REPO_ROOT/.runtime_deps:${PYTHONPATH:-}"
-if [[ -d /workspace/.gxpo_pydeps ]]; then
-  export PYTHONPATH="/workspace/.gxpo_pydeps:$PYTHONPATH"
-fi
 export HF_HOME="${HF_HOME:-$REPO_ROOT/.hf_home}"
 # A system-provided HF_HOME can exist but still be unwritable by the training
 # user.  Fall back to the repository cache instead of failing inside Ray's
@@ -26,12 +25,21 @@ if [[ ! -w "$HF_HOME/hub" ]]; then
 fi
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 mkdir -p "$HF_HUB_CACHE"
-python - <<'PY'
+ATTN_IMPL="${ATTN_IMPL:-flash_attention_3}"
+export ATTN_IMPL
+python - "$ATTN_IMPL" <<'PY'
 import importlib.util
-required = ('pandas', 'wandb', 'tensordict', 'flash_attn_3', 'flash_attn_interface')
+import sys
+
+attn_impl = sys.argv[1]
+required = ['pandas', 'wandb', 'tensordict']
+if attn_impl == 'flash_attention_2':
+    required.append('flash_attn')
+else:
+    required.extend(['flash_attn_3', 'flash_attn_interface'])
 missing = [name for name in required if importlib.util.find_spec(name) is None]
 if missing:
-    raise SystemExit('Missing runtime dependencies: ' + ', '.join(missing))
+    raise SystemExit(f"Missing runtime dependencies for {attn_impl}: {', '.join(missing)}")
 PY
 
 REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.5}"
@@ -45,6 +53,8 @@ GXPO_WARMUP_STEPS="${GXPO_WARMUP_STEPS:-50}"
 GXPO_TAU="${GXPO_TAU:-3.0}"
 GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
 GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-3}"
+GXPO_FALLBACK_MODE="${GXPO_FALLBACK_MODE:-permanent}"
+GXPO_FALLBACK_WINDOW="${GXPO_FALLBACK_WINDOW:-10}"
 SFPO_ZSCORE_THRESHOLD="${SFPO_ZSCORE_THRESHOLD:-2.5}"
 SFPO_TRIGGER_PATIENCE="${SFPO_TRIGGER_PATIENCE:-3}"
 SFPO_RESET_ENTROPY_AFTER_WARMUP="${SFPO_RESET_ENTROPY_AFTER_WARMUP:-True}"
@@ -62,6 +72,9 @@ USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-True}"
 ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-False}"
 ACTOR_OPTIMIZER_OFFLOAD="${ACTOR_OPTIMIZER_OFFLOAD:-False}"
 ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-}"
+TRAINER_TEST_FREQ="${TRAINER_TEST_FREQ:-5}"
+TRAINER_RESUME_MODE="${TRAINER_RESUME_MODE:-auto}"
+TRAINER_RESUME_FROM_PATH="${TRAINER_RESUME_FROM_PATH:-False}"
 GPU_COUNT="${GPU_COUNT:-${N_GPUS:-1}}"
 PROJECT="${WANDB_PROJECT:-gxpo-efficiency-final}"
 
@@ -145,6 +158,7 @@ VAL_FILES="['$MATH500','$AIME24','$AIME25','$AMC23','$MINERVA','$OLYMPIAD']"
 METHOD_FLAGS=()
 case "$METHOD" in
   grpo)
+    METHOD_FLAGS+=(+actor_rollout_ref.actor.use_gxpo=False)
     ;;
   sfpo)
     METHOD_FLAGS+=(
@@ -168,6 +182,8 @@ case "$METHOD" in
       +actor_rollout_ref.actor.gxpo_zscore_w="$GXPO_ZSCORE_W"
       +actor_rollout_ref.actor.gxpo_trigger_signal=entropy
       +actor_rollout_ref.actor.gxpo_trigger_patience="$GXPO_TRIGGER_PATIENCE"
+      +actor_rollout_ref.actor.gxpo_fallback_mode="$GXPO_FALLBACK_MODE"
+      +actor_rollout_ref.actor.gxpo_fallback_window="$GXPO_FALLBACK_WINDOW"
       +actor_rollout_ref.actor.gxpo_trigger_granularity=outer
       +actor_rollout_ref.actor.gxpo_warmup_steps="$GXPO_WARMUP_STEPS"
       +actor_rollout_ref.actor.gxpo_reset_entropy_after_warmup=True
@@ -201,6 +217,8 @@ gxpo_tau=$GXPO_TAU
 gxpo_zscore_w=$GXPO_ZSCORE_W
 gxpo_trigger_signal=entropy
 gxpo_trigger_patience=$GXPO_TRIGGER_PATIENCE
+gxpo_fallback_mode=$GXPO_FALLBACK_MODE
+gxpo_fallback_window=$GXPO_FALLBACK_WINDOW
 gxpo_trigger_granularity=outer
 validation_interval=5
 validation_decoding=greedy temperature=0 do_sample=false n=1
@@ -228,7 +246,7 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.model.path="$MODEL_ID" \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.model.enable_gradient_checkpointing="$ENABLE_GRADIENT_CHECKPOINTING" \
-  actor_rollout_ref.model.attn_implementation="${ATTN_IMPL:-flash_attention_3}" \
+  actor_rollout_ref.model.attn_implementation="$ATTN_IMPL" \
   +actor_rollout_ref.model.use_liger="$USE_LIGER" \
   actor_rollout_ref.actor.optim.lr="$LR" \
   +actor_rollout_ref.actor.optim.name=adamw \
@@ -243,7 +261,7 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.use_kl_loss=False \
   actor_rollout_ref.actor.kl_loss_coef=0.0 \
   actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-  actor_rollout_ref.actor.fsdp_config.fsdp_size=1 \
+  actor_rollout_ref.actor.fsdp_config.fsdp_size="${FSDP_SIZE:-1}" \
   actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_PARAM_OFFLOAD" \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload="$ACTOR_OPTIMIZER_OFFLOAD" \
   ${ACTOR_MODEL_DTYPE:+\+actor_rollout_ref.actor.fsdp_config.model_dtype="$ACTOR_MODEL_DTYPE"} \
@@ -276,7 +294,9 @@ python -u -m verl.trainer.main_ppo \
   trainer.save_freq="$SAVE_FREQ" \
   +trainer.keep_last_ckpts=1 \
   +trainer.keep_all_ckpts=False \
-  trainer.test_freq=5 \
+  trainer.resume_mode="$TRAINER_RESUME_MODE" \
+  trainer.resume_from_path="$TRAINER_RESUME_FROM_PATH" \
+  trainer.test_freq="$TRAINER_TEST_FREQ" \
   +trainer.validation_seeds='[0]' \
   +trainer.keep_last_validations=1 \
   +trainer.val_before_train="$VAL_BEFORE_TRAIN" \

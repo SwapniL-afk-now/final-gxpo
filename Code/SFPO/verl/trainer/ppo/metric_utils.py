@@ -16,6 +16,7 @@ Metrics related to the PPO trainer.
 """
 
 import torch
+import os
 from typing import Any, Dict, List
 import numpy as np
 from verl import DataProto
@@ -195,17 +196,19 @@ def compute_reward_metrics(batch, config):
 
         prompt_num = reward_tensor.view(-1,8).size(0)
 
-        print('reward:')
-        print(reward_tensor.view(-1,8).shape)
-        print(reward_tensor.view(-1,8))
-        # non_diverse_examples = (reward_tensor.view(-1,8).max(-1)[0] == reward_tensor.view(-1,8).min(-1)[0]).sum()
-        # print(f'Non-diverse examples: {non_diverse_examples}')
-        print('Mean reward:', torch.mean(reward_tensor).detach().item())
+        if os.environ.get('GXPO_CONCISE_LOGS') != '1':
+            print('reward:')
+            print(reward_tensor.view(-1,8).shape)
+            print(reward_tensor.view(-1,8))
+            # non_diverse_examples = (reward_tensor.view(-1,8).max(-1)[0] == reward_tensor.view(-1,8).min(-1)[0]).sum()
+            # print(f'Non-diverse examples: {non_diverse_examples}')
+            print('Mean reward:', torch.mean(reward_tensor).detach().item())
 
         non_diverse_examples = (reward_tensor.view(-1,8).max(-1)[0] == reward_tensor.view(-1,8).min(-1)[0]).sum()
 
         non_diverse_examples_ratio = non_diverse_examples / prompt_num
-        print('non_diverse_examples:', non_diverse_examples)
+        if os.environ.get('GXPO_CONCISE_LOGS') != '1':
+            print('non_diverse_examples:', non_diverse_examples)
         reward_metrics["examples/non_diverse_examples_ratio"] = non_diverse_examples_ratio.detach().item()
 
         format_example = torch.logical_and(reward_tensor.view(-1,8).max(-1)[0] == 0.1, reward_tensor.view(-1,8).min(-1)[0] == 0.1).sum()

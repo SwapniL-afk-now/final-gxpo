@@ -64,6 +64,12 @@ def _actor_memory_snapshot():
 
 
 def create_device_mesh(world_size, fsdp_size):
+    if world_size > 1 and fsdp_size == 1:
+        raise ValueError(
+            "fsdp_size=1 with multiple ranks is unsafe in this FSDP1 worker: "
+            "PyTorch collapses each size-one HYBRID_SHARD group to NO_SHARD, "
+            "leaving replicas without gradient synchronization. Use "
+            "fsdp_size=world_size or implement an explicit DDP path.")
     if fsdp_size < 0 or fsdp_size >= world_size:
         device_mesh = init_device_mesh('cuda', mesh_shape=(world_size,), mesh_dim_names=['fsdp'])
     else:
@@ -219,7 +225,7 @@ class ActorRolloutRefWorker(Worker):
         override_config_kwargs['attn_implementation'] = attn_implementation
         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
         if self.rank == 0:
-            print(f'Model config after override: {actor_model_config}')
+            if os.environ.get('GXPO_CONCISE_LOGS') != '1': print(f'Model config after override: {actor_model_config}')
             print(f'Attention backend: {attn_implementation}')
 
         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
@@ -339,6 +345,12 @@ class ActorRolloutRefWorker(Worker):
                 from verl.workers.muon import build_muon
                 actor_optimizer = build_muon(actor_module_fsdp, optim_config)
             else:
+                optimizer_param_dtype = next(actor_module_fsdp.parameters()).dtype
+                if optimizer_param_dtype != torch.float32:
+                    raise ValueError(
+                        "AdamW requires FP32 actor/master parameters in this worker; "
+                        f"got {optimizer_param_dtype}. Keep model_dtype unset or set "
+                        "it to float32; FSDP mixed precision still uses BF16 compute.")
                 optimizer_kwargs = dict(
                     lr=optim_config.lr,
                     betas=optim_config.get('betas', (0.9, 0.999)),
@@ -790,8 +802,9 @@ class ActorRolloutRefWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1:
-            self.actor.actor_module._handle.reshard(True)
+        actor_handle = self.actor.actor_module._handle
+        if self.world_size > 1 and getattr(actor_handle, "uses_sharded_strategy", False):
+            actor_handle.reshard(True)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -821,8 +834,9 @@ class ActorRolloutRefWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        if self.world_size > 1:
-            self.ref_policy.actor_module._handle.reshard(True)
+        ref_handle = self.ref_policy.actor_module._handle
+        if self.world_size > 1 and getattr(ref_handle, "uses_sharded_strategy", False):
+            ref_handle.reshard(True)
 
         return output
 
@@ -1418,7 +1432,9 @@ class RewardModelWorker(Worker):
 
         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
         # unshard the root FSDP module
-        self.reward_module._handle.reshard(True)
+        reward_handle = self.reward_module._handle
+        if getattr(reward_handle, "uses_sharded_strategy", False):
+            reward_handle.reshard(True)
 
         output = output.to('cpu')
         return output
