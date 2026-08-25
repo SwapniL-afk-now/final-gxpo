@@ -156,6 +156,13 @@ TRAIN_FILES="['$DAPO_TRAIN','$LIGHTEVAL_TRAIN']"
 VAL_FILES="['$MATH500','$AIME24','$AIME25','$AMC23','$MINERVA','$OLYMPIAD']"
 
 METHOD_FLAGS=()
+# Gate v2 (opt-in; see .audit/gxpo_algorithm_findings.md):
+#   GXPO_TRIGGER_ROBUST=1   -> median/MAD z-score (resists early-warmup transient bursts)
+#   GXPO_TRIGGER_MIN_OBS=N  -> gate cannot trip until N scored post-warmup observations
+# Prediction-quality gating instead of the trainer entropy gate requires a custom
+# entrypoint: gxpo_trigger_signal != entropy plus gxpo_shutoff_mode=cosine, which makes
+# the actor gate on disagreement = 1 - |cos(g0, g_slow)|.
+
 case "$METHOD" in
   grpo)
     METHOD_FLAGS+=(+actor_rollout_ref.actor.use_gxpo=False)
@@ -191,6 +198,8 @@ case "$METHOD" in
       +actor_rollout_ref.actor.gxpo_shutoff_mode=trajectory_aware
       +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=False
       +actor_rollout_ref.actor.gxpo_diag_freq=10
+      ${GXPO_TRIGGER_ROBUST:+\+actor_rollout_ref.actor.gxpo_trigger_robust=True}
+      ${GXPO_TRIGGER_MIN_OBS:+\+actor_rollout_ref.actor.gxpo_trigger_min_obs="$GXPO_TRIGGER_MIN_OBS"}
     )
     ;;
 esac

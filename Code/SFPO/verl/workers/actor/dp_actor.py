@@ -120,6 +120,8 @@ class DataParallelPPOActor(BasePPOActor):
                 fallback_mode=self.config.get('gxpo_fallback_mode', 'permanent'),
                 fallback_window=self.config.get('gxpo_fallback_window', 10),
                 trigger_patience=self.config.get('gxpo_trigger_patience', 1),
+                trigger_robust=self.config.get('gxpo_trigger_robust', False),
+                min_post_warmup_obs=int(self.config.get('gxpo_trigger_min_obs', 0)),
             )
             self._gxpo_diag_freq = int(self.config.get('gxpo_diag_freq', 10))
 
@@ -871,6 +873,15 @@ class DataParallelPPOActor(BasePPOActor):
         r_var = max(sum_r_sq / max(n_total, 1.0) - r_mean**2, 0.0)
         disp2_norm, dispK_norm = disp2_sq**0.5, dispK_sq**0.5
 
+        # Cosine gate mode (F1): the observation is |cos(g0, gslow)| computed from the
+        # PRE-clip probe/corrective gradients -- a direct measurement of whether the
+        # extrapolated direction still agrees with real optimization pressure. Healthy
+        # production runs sit at 0.92-0.98; failing ones collapse (see
+        # .audit/gxpo_algorithm_findings.md). Disagreement score = 1 - |cos| so the
+        # existing "z >= tau trips" convention applies unchanged.
+        cos_override = None
+        if state.shutoff_mode == 'cosine':
+            cos_override = 1.0 - abs(dot0slow / (g0_norm * gslow_norm + eps))
         # The gate reads PRE-clip norms (gn0/gn_slow, straight off _clip_grads), not the post-clip
         # g0_norm/gslow_norm logged below. Post-clip norms saturate at grad_clip, so a genuine
         # gradient blow-up pins the trigger stat to a constant and the z-score *shrinks* exactly
@@ -883,7 +894,7 @@ class DataParallelPPOActor(BasePPOActor):
             # this full batch have been reduced to one trigger statistic.
             z_score = 0.0
             trigger_stat = state.resolve_trigger_observation(
-                g0_norm=gn0, g_slow_norm=gate_slow_norm)
+                g0_norm=gn0, g_slow_norm=gate_slow_norm, stat_override=cos_override)
             triggered = False
         else:
             z_score, trigger_stat, triggered = state.update_trigger_state(
@@ -891,7 +902,8 @@ class DataParallelPPOActor(BasePPOActor):
                 g0_norm=gn0,
                 g_slow_norm=gate_slow_norm,
                 allow_trigger=trigger_enabled,
-                defer_trigger=False)
+                defer_trigger=False,
+                stat_override=cos_override)
             state.step_count = step_idx + 1
 
         if triggered and state.fallback_mode == 'permanent':
@@ -1013,7 +1025,8 @@ class DataParallelPPOActor(BasePPOActor):
                     g0_norm=outer_stat,
                     g_slow_norm=outer_stat,
                     allow_trigger=trigger_enabled,
-                    defer_trigger=False)
+                    defer_trigger=False,
+                    stat_override=outer_stat)
                 self.gxpo_state.step_count = outer_step + 1
 
             metrics['actor/gxpo_trigger_z'] = float(outer_z)

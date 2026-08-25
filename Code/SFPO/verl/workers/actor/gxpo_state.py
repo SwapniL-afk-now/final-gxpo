@@ -74,7 +74,7 @@ def compute_gxpo_retention_scale(g0: torch.Tensor, g1: torch.Tensor, K: int,
 class GXPOState:
     """Per-actor GXPO state: hyperparameters + rolling shutoff statistics."""
 
-    VALID_SHUTOFF_MODES = ('trajectory_aware', 'legacy_g0', 'never')
+    VALID_SHUTOFF_MODES = ('trajectory_aware', 'legacy_g0', 'cosine', 'never')
     VALID_FALLBACK_MODES = ('permanent', 'temporary')
 
     def __init__(
@@ -90,6 +90,8 @@ class GXPOState:
         fallback_mode: str = 'permanent',
         fallback_window: int = 10,
         trigger_patience: int = 1,
+        trigger_robust: bool = False,
+        min_post_warmup_obs: int = 0,
     ):
         if shutoff_mode not in self.VALID_SHUTOFF_MODES:
             raise ValueError(f'Invalid GXPO shutoff mode: {shutoff_mode}. '
@@ -117,9 +119,22 @@ class GXPOState:
         # Keep the warmup field for compatibility with existing launchers. The rolling window
         # itself also prevents a cold-start trigger until it contains zscore_w observations.
         self.warmup_steps = int(warmup_steps)
+        # Robust gating (opt-in): score observations against the window median and a
+        # MAD-derived scale instead of mean/std. Production runs showed the classic
+        # z-score trips in early-transient bursts right after warmup and goes quiet
+        # afterwards; the robust statistic resists exactly that contamination.
+        self.trigger_robust = bool(trigger_robust)
+        if int(min_post_warmup_obs) < 0:
+            raise ValueError('GXPO min_post_warmup_obs must be non-negative')
+        # Minimum number of scored post-warmup observations before the gate may trip.
+        # Streaks accumulated before this age are discarded, so the first decision
+        # after the minimum age is not an instant carry-over trip.
+        self.min_post_warmup_obs = int(min_post_warmup_obs)
 
         self.trigger_index = float('inf')  # s*: first step with extrapolation disabled
         self.trigger_streak = 0
+        # Scored observations since the last warmup baseline reset (gate age).
+        self.post_warmup_scored = 0
         self.mu = 1.0  # preceding rolling-window mean of the trigger statistic
         self.sigma = 1.0  # preceding rolling-window population std of the trigger statistic
         self.step_count = 0
@@ -157,9 +172,23 @@ class GXPOState:
             self.trigger_history.append(float(H_s))
             return 0.0
 
-        self.mu = sum(history) / self.zscore_w
-        variance = sum((value - self.mu) ** 2 for value in history) / self.zscore_w
-        self.sigma = variance ** 0.5
+        if self.trigger_robust:
+            # Median/MAD location-scale: a single transient in the window moves the
+            # baseline far less than mean/std, so one spike cannot both contaminate
+            # the reference and hide the next one.
+            ordered = sorted(history)
+            mid = len(ordered) // 2
+            median = (ordered[mid - 1] + ordered[mid]) / 2.0 if len(ordered) % 2 == 0 else ordered[mid]
+            deviations = sorted(abs(value - median) for value in history)
+            mad_mid = len(deviations) // 2
+            mad = ((deviations[mad_mid - 1] + deviations[mad_mid]) / 2.0
+                   if len(deviations) % 2 == 0 else deviations[mid])
+            self.mu = median
+            self.sigma = 1.4826 * mad  # consistent with std under Gaussian windows
+        else:
+            self.mu = sum(history) / self.zscore_w
+            variance = sum((value - self.mu) ** 2 for value in history) / self.zscore_w
+            self.sigma = variance ** 0.5
         z_score = (float(H_s) - self.mu) / (self.sigma + 1e-9)
         self.trigger_history.append(float(H_s))
         if len(self.trigger_history) > self.zscore_w:
@@ -171,16 +200,36 @@ class GXPOState:
         self.trigger_history.clear()
         self.observation_count = 0
         self.trigger_streak = 0
+        self.post_warmup_scored = 0
         self.mu = 1.0
         self.sigma = 1.0
 
-    def resolve_trigger_observation(self, *, g0_norm: float, g_slow_norm: float) -> float:
+    def resolve_trigger_observation(self, *, g0_norm: float, g_slow_norm: float,
+                                    stat_override: Optional[float] = None) -> float:
+        """Resolve this step's raw gate observation.
+
+        ``stat_override`` carries an already-resolved statistic (e.g. the outer-batch
+        mean of per-minibatch observations, or |cos(g0, g_slow)| for the cosine mode,
+        which cannot be recovered from norms alone)."""
+        if stat_override is not None:
+            return float(stat_override)
         if self.shutoff_mode == 'legacy_g0':
             return float(g0_norm)
+        if self.shutoff_mode == 'cosine':
+            raise ValueError(
+                "shutoff_mode='cosine' requires the caller to pass the pre-computed "
+                '|cos(g0, g_slow)| via stat_override; it cannot be derived from norms')
         return float(g_slow_norm)
 
     def check_trigger(self, Z_s: float, step: int) -> bool:
         if step < self.warmup_steps:
+            self.trigger_streak = 0
+            return False
+        # Gate age floor (F3): every observed trip in production fired in the volatile
+        # burst immediately after warmup. Require min_post_warmup_obs scored post-warmup
+        # observations before any trip, and discard streaks accumulated before the age
+        # threshold so reaching it does not instantly convert old streaks into a trip.
+        if self.post_warmup_scored < self.min_post_warmup_obs:
             self.trigger_streak = 0
             return False
         # Algorithm 1 shuts off on an upward instability only.  A low-norm
@@ -198,16 +247,21 @@ class GXPOState:
 
     def update_trigger_state(self, *, step: int, g0_norm: float,
                              g_slow_norm: float, allow_trigger: bool = True,
-                             defer_trigger: bool = False) -> Tuple[float, float, bool]:
-        """Feed this step's norms into the gate.
+                             defer_trigger: bool = False,
+                             stat_override: Optional[float] = None) -> Tuple[float, float, bool]:
+        """Feed this step's gate observation into the rolling shutoff state.
 
         ``allow_trigger=False`` is used for an outer training-step warmup: the rolling baseline and
         observation history continue to update, but this observation cannot trip the
         shutoff gate. This keeps the first post-warmup decision statistically useful
         without allowing a warmup spike to disable GXPO.
 
+        ``stat_override`` supplies a pre-resolved observation (outer-batch mean or the
+        cosine-mode |cos(g0, g_slow)|); see ``resolve_trigger_observation``.
+
         Returns ``(z_score, trigger_stat, triggered)``."""
-        trigger_stat = self.resolve_trigger_observation(g0_norm=g0_norm, g_slow_norm=g_slow_norm)
+        trigger_stat = self.resolve_trigger_observation(g0_norm=g0_norm, g_slow_norm=g_slow_norm,
+                                                        stat_override=stat_override)
         if self.shutoff_mode == 'never':
             return 0.0, float(trigger_stat), False
         if not allow_trigger:
@@ -230,6 +284,7 @@ class GXPOState:
         # SFPO's rolling mean/std gate and avoids a cold-start z-score.
         z_score = self.update_stats(trigger_stat)
         self.observation_count += 1
+        self.post_warmup_scored += 1
         if len(self.trigger_history) < self.zscore_w:
             return float(z_score), float(trigger_stat), False
         triggered = self.check_trigger(z_score, step)
