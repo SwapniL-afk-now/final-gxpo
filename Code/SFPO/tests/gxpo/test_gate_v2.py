@@ -48,7 +48,8 @@ def first_trip_z(robust):
     st_ = GXPOState(tau=2.0, omega=0.1, zscore_w=10, warmup_steps=0, trigger_patience=1,
                     shutoff_mode='trajectory_aware', trigger_robust=robust)
     zs = []
-    for h in [10.0] * 9 + [200.0] + [11.0]:   # one outlier contaminates the window
+    for h in [10.0] * 9 + [200.0] + [60.0]:   # outlier contaminates the window; the
+        # follow-up must still register above the floored robust scale (floor=1.0)
         st_.is_enabled(st_.step_count)
         z, _, _ = st_.update_trigger_state(step=st_.step_count, g0_norm=h, g_slow_norm=h)
         zs.append(z)

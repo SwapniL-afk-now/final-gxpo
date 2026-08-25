@@ -200,9 +200,13 @@ class GXPOState:
             deviations = sorted(abs(value - median) for value in history)
             mad_mid = len(deviations) // 2
             mad = ((deviations[mad_mid - 1] + deviations[mad_mid]) / 2.0
-                   if len(deviations) % 2 == 0 else deviations[mid])
+                   if len(deviations) % 2 == 0 else deviations[mad_mid])
             self.mu = median
-            self.sigma = 1.4826 * mad  # consistent with std under Gaussian windows
+            # Consistent with std under Gaussian windows, floored at 10% of the
+            # location: replay over production runs showed a near-constant window
+            # drives raw MAD to ~0 and manufactures enormous z from tiny wobbles
+            # (false trips). The floor keeps the robust scale physically meaningful.
+            self.sigma = max(1.4826 * mad, 0.10 * abs(median))
         else:
             self.mu = sum(history) / self.zscore_w
             variance = sum((value - self.mu) ** 2 for value in history) / self.zscore_w
