@@ -105,11 +105,33 @@ def main_task(config):
 
     from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
+    # The reference policy worker is only needed when KL is actually consumed.
+    # In this fork `compute_ref_log_prob` is never called by the trainer, so
+    # building Role.RefPolicy costs a full extra HF load + FSDP wrap at startup
+    # for nothing. Skip it when every KL switch is off; an explicit
+    # `trainer.skip_ref_policy` can narrow this further but can never force a
+    # skip when KL is enabled.
+    def _ref_policy_needed(cfg):
+        use_kl_loss = bool(cfg.actor_rollout_ref.actor.get('use_kl_loss', False))
+        kl_coef = float(cfg.algorithm.kl_ctrl.get('kl_coef', 0.0) or 0.0)
+        use_kl_in_reward = bool(cfg.algorithm.get('use_kl_in_reward', False))
+        return use_kl_loss or kl_coef != 0.0 or use_kl_in_reward
+
+    skip_ref_policy_override = config.trainer.get('skip_ref_policy', None)
+    if skip_ref_policy_override is None:
+        skip_ref_policy = not _ref_policy_needed(config)
+    else:
+        skip_ref_policy = bool(skip_ref_policy_override) and not _ref_policy_needed(config)
+    if skip_ref_policy:
+        print('[main_ppo] skipping RefPolicy worker (KL disabled): '
+              'trainer.skip_ref_policy=' + repr(skip_ref_policy_override))
+
     role_worker_mapping = {
         Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
         Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
     }
+    if not skip_ref_policy:
+        role_worker_mapping[Role.RefPolicy] = ray.remote(ActorRolloutRefWorker)
 
     global_pool_id = 'global_pool'
     resource_pool_spec = {
@@ -118,8 +140,9 @@ def main_task(config):
     mapping = {
         Role.ActorRollout: global_pool_id,
         Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
     }
+    if not skip_ref_policy:
+        mapping[Role.RefPolicy] = global_pool_id
 
     # we should adopt a multi-source reward function here
     # - for rule-based rm, we directly call a reward score

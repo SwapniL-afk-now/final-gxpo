@@ -162,6 +162,30 @@ class ActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
         self.training_step = 0
+        # Persistent SFPO weight-snapshot buffers (slow/fast endpoints). Created
+        # lazily on first use and reused across outer steps; refilled each step
+        # via torch._foreach_copy_ (bit-exact replacement for per-param .clone()).
+        self._sfpo_weight_bufs = None
+
+    def _sfpo_param_buffers(self):
+        """Return (params, slow_bufs, fast_bufs) for sfpo_update_actor, reusing
+        preallocated buffers when shape/dtype/device still match."""
+        params = [p for p in self.actor_module_fsdp.parameters() if p.requires_grad]
+        bufs = self._sfpo_weight_bufs
+        reuse = (
+            bufs is not None
+            and len(bufs['slow']) == len(params)
+            and all(b.shape == p.shape and b.dtype == p.dtype and b.device == p.device
+                    for b, p in zip(bufs['slow'], params))
+            and all(b.shape == p.shape and b.dtype == p.dtype and b.device == p.device
+                    for b, p in zip(bufs['fast'], params))
+        )
+        if not reuse:
+            with torch.no_grad():
+                bufs = {'slow': [torch.empty_like(p) for p in params],
+                        'fast': [torch.empty_like(p) for p in params]}
+            self._sfpo_weight_bufs = bufs
+        return params, bufs['slow'], bufs['fast']
 
     def _build_model_optimizer(self,
                                model_path,
@@ -519,7 +543,9 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
-            torch.cuda.empty_cache()
+            # (torch.cuda.empty_cache() removed here: it sat immediately before
+            # the update hot path and forced the loop to re-cudaMalloc cached
+            # blocks; no effect on training math.)
             torch.cuda.reset_peak_memory_stats()
             before_actor_update = _actor_memory_snapshot()
             with Timer(name='update_policy', logger=None) as timer:
@@ -646,8 +672,11 @@ class ActorRolloutRefWorker(Worker):
         bp_start = self.actor.cumulative_bp
         raw_backward_start = self.actor.raw_backward_calls
 
+        # Snapshot the pre-update (slow) weights into persistent buffers.
+        # torch._foreach_copy_ preserves values bit-exactly vs. per-param .clone().
         with torch.no_grad():
-            slow_weights = [p.detach().clone() for p in self.actor_module_fsdp.parameters() if p.requires_grad]
+            sfpo_params, slow_weights, _ = self._sfpo_param_buffers()
+            torch._foreach_copy_(slow_weights, [p.data for p in sfpo_params])
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
@@ -656,13 +685,27 @@ class ActorRolloutRefWorker(Worker):
             for _ in range(num_inner_steps):
                 metrics = self.actor.update_policy(data=data)
 
+            # Snapshot the post-fast-phase (fast) weights into persistent buffers.
             with torch.no_grad():
-                fast_weights = [p.detach().clone() for p in self.actor_module_fsdp.parameters() if p.requires_grad]
+                _, _, fast_weights = self._sfpo_param_buffers()
+                torch._foreach_copy_(fast_weights, [p.data for p in sfpo_params])
                 jump_sq = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
                 param_sq = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
-                for slow, fast in zip(slow_weights, fast_weights):
-                    jump_sq += (fast.float() - slow.float()).square().sum()
-                    param_sq += slow.float().square().sum()
+                if all(w.dtype == torch.float32 for w in fast_weights):
+                    # Fused dispatch; per-element op order (sub, mul/square, sum,
+                    # then sequential accumulation into jump_sq/param_sq) is
+                    # identical to the previous per-param loop => bit-exact.
+                    diffs = torch._foreach_sub(fast_weights, slow_weights)
+                    sq_diffs = torch._foreach_mul(diffs, diffs)
+                    for t in sq_diffs:
+                        jump_sq += t.sum()
+                    sq_slow = torch._foreach_mul(slow_weights, slow_weights)
+                    for t in sq_slow:
+                        param_sq += t.sum()
+                else:
+                    for slow, fast in zip(slow_weights, fast_weights):
+                        jump_sq += (fast.float() - slow.float()).square().sum()
+                        param_sq += slow.float().square().sum()
                 if torch.distributed.is_initialized():
                     torch.distributed.all_reduce(jump_sq, op=torch.distributed.ReduceOp.SUM)
                     torch.distributed.all_reduce(param_sq, op=torch.distributed.ReduceOp.SUM)
@@ -673,14 +716,15 @@ class ActorRolloutRefWorker(Worker):
                 reposition_pairs = list(zip(fast_weights, slow_weights))
 
             # Reposition: the existing optimizer state is deliberately untouched.
+            # Fused dispatch of slow + step_size * (fast - slow): per-element op
+            # order (sub -> scalar mul -> add) matches the previous per-param
+            # chain exactly => bit-exact.
             with torch.no_grad():
-                idx = 0
-                for param in self.actor_module_fsdp.parameters():
-                    if not param.requires_grad:
-                        continue
-                    param_tmp = slow_weights[idx] + step_size * (fast_weights[idx] - slow_weights[idx])
-                    param.data.copy_(param_tmp)
-                    idx += 1
+                param_datas = [p.data for p in sfpo_params]
+                reposition_diffs = torch._foreach_sub(fast_weights, slow_weights)
+                torch._foreach_mul_(reposition_diffs, step_size)
+                torch._foreach_copy_(param_datas, slow_weights)
+                torch._foreach_add_(param_datas, reposition_diffs)
 
             # Slow correction update.
             with Timer(name='update_policy', logger=None) as timer:

@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import threading
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -175,6 +176,96 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     metrics = {'critic/kl': current_kl, 'critic/kl_coeff': beta}
 
     return data, metrics, current_kl
+
+
+def select_batch_slice(batch: DataProto, num_samples: int) -> DataProto:
+    """Keep only the leading ``num_samples`` examples of ``batch``.
+
+    Used by the dynamic-filtering accumulation path in ``fit``: examples are
+    accumulated across dataloader steps until ``len(acc_batch) >= target``, so
+    the buffer can overshoot. Before generation it is trimmed back down to the
+    requested sampling size (or to a multiple of the DP world size). Rows are
+    prompt-level at that point (the n-times repeat happens later), so a leading
+    slice keeps every per-prompt group intact.
+    """
+    if num_samples is None or num_samples >= len(batch):
+        return batch
+    return batch.select_via_index(list(range(int(num_samples))))
+
+
+def _make_inverse_perm(balance_perm):
+    """Inverse of a row permutation produced by ``_balance_batch``."""
+    if balance_perm is None:
+        return None
+    inv = torch.empty_like(balance_perm)
+    inv[balance_perm] = torch.arange(balance_perm.size(0))
+    return inv
+
+
+def _restore_group_order(x, inv_perm):
+    """Restore pre-balance row order so per-prompt group views (view(-1, n))
+    see the same contiguous groups as before balancing."""
+    if inv_perm is None:
+        return x
+    if isinstance(x, np.ndarray):
+        return x[inv_perm.numpy()]
+    return x[inv_perm]
+
+
+def compute_reward_metrics_grouped(reward_tensor: torch.Tensor, config) -> Dict:
+    """Group-aware reward metrics with the group size derived from config.
+
+    ``metric_utils.compute_reward_metrics`` hardcodes ``reward_tensor.view(-1, 8)``,
+    which crashes or silently mis-groups when ``actor_rollout_ref.rollout.n != 8``.
+    This local version derives the group size from ``rollout.n`` (fallback 8).
+    Reimplemented here because this change is restricted to ray_trainer.py /
+    main_ppo.py.
+    """
+    reward_metrics = {}
+
+    group_size = 8
+    try:
+        n_cfg = int(config.actor_rollout_ref.rollout.n)
+        if n_cfg > 0 and reward_tensor.numel() % n_cfg == 0:
+            group_size = n_cfg
+    except (AttributeError, TypeError, ValueError):
+        pass
+
+    reward_metrics["reward/mean"] = torch.mean(reward_tensor).detach().item()
+    all_correct = torch.sum(reward_tensor == 1).float() / reward_tensor.numel()
+    reward_metrics["reward/all_correct_ratio"] = all_correct.detach().item()
+    format_error = torch.sum(reward_tensor == 0).float() / reward_tensor.numel()
+    reward_metrics["reward/format_error_ratio"] = format_error.detach().item()
+    format_error = torch.sum(reward_tensor == 0.1).float() / reward_tensor.numel()
+    reward_metrics["reward/wrong_answer_ratio"] = format_error.detach().item()
+
+    prompt_num = reward_tensor.view(-1, group_size).size(0)
+
+    if os.environ.get('GXPO_CONCISE_LOGS') != '1':
+        print('reward:')
+        print(reward_tensor.view(-1, group_size).shape)
+        print(reward_tensor.view(-1, group_size))
+        print('Mean reward:', torch.mean(reward_tensor).detach().item())
+
+    non_diverse_examples = (reward_tensor.view(-1, group_size).max(-1)[0] == reward_tensor.view(-1, group_size).min(-1)[0]).sum()
+
+    if os.environ.get('GXPO_CONCISE_LOGS') != '1':
+        print('non_diverse_examples:', non_diverse_examples)
+    reward_metrics["examples/non_diverse_examples_ratio"] = (non_diverse_examples / prompt_num).detach().item()
+
+    format_example = torch.logical_and(reward_tensor.view(-1, group_size).max(-1)[0] == 0.1,
+                                       reward_tensor.view(-1, group_size).min(-1)[0] == 0.1).sum() / prompt_num
+
+    all_correct_example = torch.logical_and(reward_tensor.view(-1, group_size).max(-1)[0] == 1,
+                                            reward_tensor.view(-1, group_size).min(-1)[0] == 1).sum() / prompt_num
+
+    reward_metrics["examples/format_example_ratio"] = format_example.detach().item()
+    reward_metrics["examples/all_correct_example_ratio"] = all_correct_example.detach().item()
+
+    easy_examples_ratio = (reward_tensor.view(-1, group_size).mean(-1) > 0.75).sum() / prompt_num
+    reward_metrics["examples/easy_examples_ratio_0.75"] = easy_examples_ratio.detach().item()
+
+    return reward_metrics
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
@@ -633,6 +724,10 @@ class RayPPOTrainer(object):
         reward_tensor_lst = []
         data_source_lst = []
 
+        # Decoding every prompt/output to text is pure I/O overhead unless the
+        # sample table is actually logged; skip it when nothing is logged.
+        log_val_generations = self.config.trainer.val_generations_to_log_to_wandb != 0
+
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
@@ -656,8 +751,9 @@ class RayPPOTrainer(object):
 
             # Store original inputs
             input_ids = test_batch.batch['input_ids']
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
+            if log_val_generations:
+                sample_inputs.extend(
+                    [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids])
 
             if 'multi_modal_inputs' in test_batch.non_tensor_batch.keys():
                 test_gen_batch = test_batch.pop(
@@ -692,8 +788,9 @@ class RayPPOTrainer(object):
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch['responses']
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+            if log_val_generations:
+                sample_outputs.extend(
+                    [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids])
 
             test_batch = test_batch.union(test_output_gen_batch)
 
@@ -1051,6 +1148,9 @@ class RayPPOTrainer(object):
         # reorder based on index. The data will be automatically equally partitioned by dispatch function
         global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
         batch.reorder(global_idx)
+        # Remember the permutation: grouped per-prompt views downstream restore
+        # the pre-balance row order via its inverse (see _restore_group_order).
+        self._last_balance_perm = global_idx
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst,
                                                     partitions=global_partition_lst,
                                                     prefix=logging_prefix)
@@ -1555,18 +1655,64 @@ class RayPPOTrainer(object):
                             batch = DataProto.concat(question_scale_batch_list)
                             question_scale_batch_list = []
 
-                    with _timer('adv', timing_raw):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm:
-                            # we first compute reward model score
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                    # -----------------------------------------------------------------
+                    # Overlap rule-based reward scoring (driver CPU / sandbox pool)
+                    # with the old_log_prob GPU forward. Rewards depend only on
+                    # prompts + responses; the log-prob forward depends only on
+                    # input_ids/attention_mask/responses, so they are independent.
+                    # The reward thread reads a private-shell snapshot of `batch`;
+                    # later driver-side mutations (reorder/union) replace dict
+                    # entries instead of mutating the shared arrays/tensors.
+                    if self.use_rm:
+                        # rm scores feed reward_fn (it short-circuits on
+                        # 'rm_scores'), so this stage stays sequential.
+                        reward_tensor = self.rm_wg.compute_rm_score(batch)
+                        batch = batch.union(reward_tensor)
 
-                        # we combine with rule-based rm
-                        with _timer('reward', timing_raw):
-                            reward_tensor = self.reward_fn(batch)
+                    reward_snapshot = DataProto(batch=batch.batch,
+                                                non_tensor_batch=dict(batch.non_tensor_batch),
+                                                meta_info={})
+                    _reward_result = []
+                    _reward_error = []
+
+                    def _score_rewards():
+                        try:
+                            _reward_result.append(self.reward_fn(reward_snapshot))
+                        except BaseException as e:  # re-raised on the main thread below
+                            _reward_error.append(e)
+
+                    reward_thread = threading.Thread(target=_score_rewards,
+                                                     name='rule-based-reward',
+                                                     daemon=True)
+                    reward_thread.start()
+
+                    with _timer('old_log_prob', timing_raw):
+                        # balance the number of valid tokens on each dp rank.
+                        # Note that this breaks the order of data inside the batch.
+                        # Please take care when you implement group based adv computation such as GRPO and rloo
+                        # (moved ahead of the reward/advantage driver work so the GPU
+                        # forward starts immediately; the permutation depends only on
+                        # attention_mask and is identical to the previous position).
+                        balance_perm = None
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
+                            balance_perm = getattr(self, '_last_balance_perm', None)
+                        inv_balance_perm = _make_inverse_perm(balance_perm)
+
+                        batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                        # recompute old_log_probs while rewards are scored concurrently
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        batch = batch.union(old_log_prob)
+
+                    # collect the concurrent reward result; by now most of its
+                    # wall-clock was absorbed by the GPU forward above.
+                    with _timer('reward', timing_raw):
+                        reward_thread.join()
+                    if _reward_error:
+                        raise _reward_error[0]
+                    reward_tensor = _reward_result[0]
+
+                    with _timer('adv', timing_raw):
                         batch.batch['token_level_scores'] = reward_tensor
 
                         # compute rewards. apply_kl_penalty if available
@@ -1585,7 +1731,9 @@ class RayPPOTrainer(object):
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                    reward_metrics = compute_reward_metrics(batch, self.config)
+                    # per-prompt group views must see pre-balance row order
+                    reward_flat = _restore_group_order(batch.batch['token_level_scores'].sum(-1), inv_balance_perm)
+                    reward_metrics = compute_reward_metrics_grouped(reward_flat, self.config)
                     metrics.update(reward_metrics)
                     batch_num = len(batch)
 
@@ -1596,11 +1744,14 @@ class RayPPOTrainer(object):
                     # collect metrics
                     metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
 
-                    log_index_tensor = torch.tensor(batch.non_tensor_batch['index'].astype(int)).view(-1, self.config.actor_rollout_ref.rollout.n).max(dim=1)[0]
-                    log_data_source = batch.non_tensor_batch['data_source'].tolist()[::self.config.actor_rollout_ref.rollout.n]
-                    log_reward_tensor = batch.batch['reward'].view(-1, self.config.actor_rollout_ref.rollout.n)
+                    # per-prompt group views must see pre-balance row order
+                    _group_index = _restore_group_order(batch.non_tensor_batch['index'], inv_balance_perm)
+                    _group_data_source = _restore_group_order(batch.non_tensor_batch['data_source'], inv_balance_perm)
+                    log_reward_tensor = _restore_group_order(batch.batch['reward'], inv_balance_perm).view(-1, self.config.actor_rollout_ref.rollout.n)
+                    log_index_tensor = torch.tensor(_group_index.astype(int)).view(-1, self.config.actor_rollout_ref.rollout.n).max(dim=1)[0]
+                    log_data_source = _group_data_source.tolist()[::self.config.actor_rollout_ref.rollout.n]
                     log_avg_reward = log_reward_tensor.mean(dim=1).tolist()
-                    correct_num = (batch.batch['reward'].view(-1, self.config.actor_rollout_ref.rollout.n) > 0.95).sum(dim=1)
+                    correct_num = (log_reward_tensor > 0.95).sum(dim=1)
 
                     # training accuracy / pass metrics over the n rollouts per prompt
                     _train_correct = (log_reward_tensor > 0.95).float()  # (num_prompts, n)
@@ -1679,19 +1830,8 @@ class RayPPOTrainer(object):
                     hard_data_num = 0
                     total_num = 0
 
-                    # balance the number of valid tokens on each dp rank.
-                    # Note that this breaks the order of data inside the batch.
-                    # Please take care when you implement group based adv computation such as GRPO and rloo
-                    
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
-
-
-                    batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
-                    # recompute old_log_probs
-                    with _timer('old_log_prob', timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        batch = batch.union(old_log_prob)
+                    # (seqlen balancing + old_log_prob moved above the reward /
+                    # advantage driver work so rewards overlap the GPU forward)
 
                     # compute values
                     if self.use_critic:

@@ -16,6 +16,7 @@ Single Process Actor
 """
 
 import itertools
+import weakref
 from typing import Iterable, Tuple
 
 import torch
@@ -104,6 +105,9 @@ class DataParallelPPOActor(BasePPOActor):
         # GXPO: shutoff-gate state + lazily allocated per-parameter buffers
         self.gxpo_state = None
         self._gxpo_bufs = None
+        # Cache of the constant-per-outer-step reposition direction sum-of-squares
+        # consumed by _optimizer_state_metrics; keyed by a weakref to the pairs list.
+        self._reposition_dir_cache = None
         if self.config.get('use_gxpo', False) and actor_optimizer is not None:
             self.gxpo_state = GXPOState(
                 K=self.config.get('gxpo_k', 5),
@@ -119,10 +123,10 @@ class DataParallelPPOActor(BasePPOActor):
             )
             self._gxpo_diag_freq = int(self.config.get('gxpo_diag_freq', 10))
 
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, need_entropy=True) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
-            entropy: # (bs, response_len)
+            entropy: # (bs, response_len); ``None`` when ``need_entropy=False``
             log_probs: # (bs, response_len)
         """
         response_length = micro_batch['responses'].size(-1)
@@ -177,8 +181,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 logits_rmpad.div_(temperature)
 
-                # compute entropy
-                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
+                # compute entropy (skipped entirely when the caller discards it)
+                entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad) if need_entropy else None  # ((total_nnz / sp) + pad)
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
@@ -187,22 +191,26 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_ulysses_sp:
                     # gather and unpad for the ulysses sp
                     log_probs = gather_outpus_and_unpad(log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-                    entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
-                                                            gather_dim=0,
-                                                            unpad_dim=0,
-                                                            padding_size=pad_size)
+                    if need_entropy:
+                        entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
+                                                                gather_dim=0,
+                                                                unpad_dim=0,
+                                                                padding_size=pad_size)
                 # pad back to (bsz, seqlen)
-                full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
-                                         indices=indices,
-                                         batch=batch_size,
-                                         seqlen=seqlen)
                 full_log_probs = pad_input(hidden_states=log_probs.unsqueeze(-1),
                                            indices=indices,
                                            batch=batch_size,
                                            seqlen=seqlen)
 
                 # only return response part:
-                entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                if need_entropy:
+                    full_entropy = pad_input(hidden_states=entropy_rmpad.unsqueeze(-1),
+                                             indices=indices,
+                                             batch=batch_size,
+                                             seqlen=seqlen)
+                    entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
+                else:
+                    entropy = None
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
             else:  # not using rmpad and no ulysses sp
@@ -215,7 +223,7 @@ class DataParallelPPOActor(BasePPOActor):
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                entropy = verl_F.entropy_from_logits(logits) if need_entropy else None  # (bsz, response_length)
 
             return entropy, log_probs
 
@@ -247,6 +255,19 @@ class DataParallelPPOActor(BasePPOActor):
         if reposition_pairs is not None and len(reposition_pairs) != len(params):
             reposition_pairs = None
 
+        # The (post_reposition - pre_reposition) direction is constant across every
+        # mini-batch of one SFPO slow phase (the caller builds one pairs list per
+        # sfpo_update_actor and reuses it), so its sum-of-squares (stats[4]) is
+        # computed once per pairs list and cached. The cache holds a weakref only,
+        # so the caller's weight lists can still be freed. NOTE: stats[5] multiplies
+        # the direction by the CURRENT exp_avg, which the optimizer updates on every
+        # step, so it must be recomputed per call to stay bit-identical.
+        cached_dir_sq = None
+        if reposition_pairs is not None and self._reposition_dir_cache is not None:
+            pairs_ref, dir_sq = self._reposition_dir_cache
+            if pairs_ref() is reposition_pairs:
+                cached_dir_sq = dir_sq
+
         stats = None
         for index, param in enumerate(params):
             grad = param.grad
@@ -273,11 +294,17 @@ class DataParallelPPOActor(BasePPOActor):
                 if post.device != grad_f.device or pre.device != grad_f.device:
                     continue
                 direction_f = post.detach().float() - pre.detach().float()
-                stats[4] += direction_f.square().sum()
+                if cached_dir_sq is None:
+                    stats[4] += direction_f.square().sum()
                 stats[5] += (direction_f * avg_f).sum()
 
         if stats is None:
             return {}
+        if reposition_pairs is not None:
+            if cached_dir_sq is not None:
+                stats[4] = cached_dir_sq
+            else:
+                self._reposition_dir_cache = (weakref.ref(reposition_pairs), stats[4].clone())
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
         grad_norm = stats[0].sqrt().item()
@@ -461,19 +488,33 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.zero_grad()
         metrics = {}
 
+        current_device = torch.cuda.current_device()
+        target_device = torch.device('cuda', current_device)
         for data in micro_batches:
-            # Support all hardwares
+            # Support all hardwares. Skip the transfer when tensors are already
+            # resident on the current device -- SFPO hoists the H2D copy above its
+            # K+1 update loop, so the per-micro-batch .to() would be a repeated
+            # no-op. Genuinely CPU-resident batches (offload paths) still transfer.
             if isinstance(data, DataProto):
-                data = {**data.batch.to(torch.cuda.current_device()), **data.non_tensor_batch}
+                first_tensor = next((v for v in data.batch.values() if isinstance(v, torch.Tensor)), None)
+                if first_tensor is not None and first_tensor.device == target_device:
+                    data = {**data.batch, **data.non_tensor_batch}
+                else:
+                    data = {**data.batch.to(current_device), **data.non_tensor_batch}
             else:
-                data = data.to(torch.cuda.current_device())  # actor device is cpu when using offload
+                first_tensor = next((v for v in data.values() if isinstance(v, torch.Tensor)), None)
+                if not (first_tensor is not None and first_tensor.device == target_device):
+                    data = data.to(current_device)  # actor device is cpu when using offload
             responses = data['responses']
             response_length = responses.size(1)
             attention_mask = data['attention_mask']
             response_mask = attention_mask[:, -response_length:]
             if recompute_old_log_probs:
                 with torch.no_grad():
-                    _, old_log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                    # Entropy is discarded on this probe pass; skip softmax+logsumexp.
+                    _, old_log_prob = self._forward_micro_batch(micro_batch=data,
+                                                                temperature=temperature,
+                                                                need_entropy=False)
             else:
                 old_log_prob = data['old_log_probs']
             advantages = data['advantages']
@@ -481,16 +522,31 @@ class DataParallelPPOActor(BasePPOActor):
             clip_ratio = self.config.clip_ratio
             entropy_coeff = self.config.entropy_coeff
 
+            # Entropy is consumed only through the logged entropy_loss metric and the
+            # `- entropy_loss * entropy_coeff` term. When metrics are not collected
+            # and the coefficient is zero, skip the softmax+logsumexp entirely.
+            need_entropy = collect_metrics or entropy_coeff != 0
+
             # all return: (bsz, response_length)
-            entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+            if need_entropy:
+                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+            else:
+                _, log_prob = self._forward_micro_batch(micro_batch=data,
+                                                        temperature=temperature,
+                                                        need_entropy=False)
 
             pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
                                                                           log_prob=log_prob,
                                                                           advantages=advantages,
                                                                           eos_mask=response_mask,
                                                                           cliprange=clip_ratio)
-            # compute entropy loss from entropy
-            entropy_loss = verl_F.masked_mean(entropy, response_mask)
+            # compute entropy loss from entropy. A skipped entropy implies
+            # entropy_coeff == 0, so the zero placeholder keeps policy_loss (and its
+            # gradients) bit-identical.
+            if need_entropy:
+                entropy_loss = verl_F.masked_mean(entropy, response_mask)
+            else:
+                entropy_loss = pg_loss.new_zeros(())
 
             # compute policy loss
             policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -505,7 +561,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                 if collect_metrics:
-                    metrics['actor/kl_loss'] = kl_loss.detach().item()
+                    # deferred D2H sync: converted to python floats once per mini-batch below
+                    metrics['actor/kl_loss'] = kl_loss.detach()
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
             if self.config.use_dynamic_bsz:
@@ -519,13 +576,23 @@ class DataParallelPPOActor(BasePPOActor):
             self.raw_backward_calls += 1
 
             if collect_metrics:
+                # GPU-scalar accumulation with a single deferred D2H sync per
+                # mini-batch below, instead of one .item() sync per micro-batch.
                 micro_metrics = {
-                    'actor/entropy_loss': entropy_loss.detach().item(),
-                    'actor/pg_loss': pg_loss.detach().item(),
-                    'actor/pg_clipfrac': pg_clipfrac.detach().item(),
-                    'actor/ppo_kl': ppo_kl.detach().item(),
+                    'actor/entropy_loss': entropy_loss.detach(),
+                    'actor/pg_loss': pg_loss.detach(),
+                    'actor/pg_clipfrac': pg_clipfrac.detach(),
+                    'actor/ppo_kl': ppo_kl.detach(),
                 }
                 append_to_dict(metrics, micro_metrics)
+
+        # Materialize deferred GPU scalars in one sync. Values are bit-identical to
+        # the previous per-micro-batch .item() conversions; list lengths unchanged.
+        for key in ('actor/entropy_loss', 'actor/pg_loss', 'actor/pg_clipfrac', 'actor/ppo_kl',
+                    'actor/kl_loss'):
+            vals = metrics.get(key)
+            if vals and isinstance(vals[0], torch.Tensor):
+                metrics[key] = torch.stack(vals).tolist()
 
         self.cumulative_bp += 1
         return metrics
@@ -548,7 +615,6 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(mb_metrics, self._optimizer_state_metrics(reposition_pairs))
                 _merge_metrics(metrics, mb_metrics)
 
-                print('>>> Weight update!!!')
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
         metrics['actor/cumulative_bp'] = self.cumulative_bp
@@ -556,7 +622,6 @@ class DataParallelPPOActor(BasePPOActor):
         metrics['actor/cumulative_policy_grad_evals'] = self.cumulative_bp
         metrics['actor/raw_backward_calls_step'] = self.raw_backward_calls - raw_backward_start
         metrics['actor/cumulative_raw_backward_calls'] = self.raw_backward_calls
-        self.actor_optimizer.zero_grad()
         return metrics
 
     # ------------------------------------------------------------------
@@ -593,6 +658,16 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_bufs = {
             name: [torch.empty_like(p) for p in self._gxpo_params] for name in ('theta0', 'g0', 'g1')
         }
+
+    def _gxpo_release_buffers(self):
+        """Free the theta0/g0/g1 caches (~3 model-shard fp32 buffers of dead VRAM).
+
+        Only called once the shutoff gate has tripped permanently: `is_enabled`
+        then returns False forever, `_gxpo_init_buffers` is never reached again,
+        and the buffers would otherwise stay resident for the rest of training.
+        """
+        self._gxpo_bufs = None
+        self._gxpo_params = []
 
     def _gxpo_capture_grads(self, bufs):
         grads = [p.grad for p in self._gxpo_params]
@@ -706,26 +781,31 @@ class DataParallelPPOActor(BasePPOActor):
         do_diag = self._gxpo_diag_freq > 0 and (step_idx % self._gxpo_diag_freq == 0)
 
         with torch.no_grad():
+            # Batched diagnostic reductions: one foreach kernel group replaces the old
+            # per-parameter square/cast/sum chains and their full-model temporaries.
+            # Numerically equivalent only (summation order differs), which is fine --
+            # these feed nothing algorithmic (see comment above).
+            if g0_bufs:
+                stats[0] += torch.stack(torch._foreach_norm(g0_bufs)).square().sum()
+                stats[1] += torch.stack(torch._foreach_norm(g1_bufs)).square().sum()
+                param_sq += torch.stack(torch._foreach_norm(theta0)).square().sum()
+
             for p, t0, g0b, g1b in zip(params, theta0, g0_bufs, g1_bufs):
-                param_sq += t0.float().square().sum()
-                g0f = g0b.float()
-                g1f = g1b.float()
-                stats[0] += g0f.square().sum()
-                stats[1] += g1f.square().sum()
-                stats[2] += (g0f * g1f).sum()
+                # ---- ALGORITHMIC PATH: retention scale + reposition write stay
+                # ---- op-for-op identical to the previous per-parameter loop.
                 r, scale, active, ratio_clipped = compute_gxpo_retention_scale(g0b, g1b, K, delta)
+                stats[2] += (g0b * g1b).sum()
                 stats[7] += active.sum()
                 stats[8] += g0b.numel()
                 stats[14] += ratio_clipped.sum()
                 stats[9] += scale.float().sum()
                 scale_max = torch.maximum(scale_max, scale.float().amax().reshape(1))
 
-                rf = r.float()
-                stats[5] += rf.sum()
-                stats[6] += rf.square().sum()
+                stats[5] += r.sum()
+                stats[6] += r.square().sum()
 
                 disp2 = p.data - t0
-                stats[3] += disp2.float().square().sum()
+                stats[3] += disp2.square().sum()
 
                 if do_diag:
                     # Table 6: closed-form S_K/S_2 vs explicit Horner sums
@@ -736,13 +816,13 @@ class DataParallelPPOActor(BasePPOActor):
                     scale_expl = torch.where(s2_expl.abs() > delta, s_expl / s2_expl, scale)
                     d_closed = disp2 * scale
                     d_expl = disp2 * scale_expl
-                    stats[10] += (d_closed - d_expl).float().square().sum()
-                    stats[11] += (d_closed.float() * d_expl.float()).sum()
-                    stats[12] += d_closed.float().square().sum()
-                    stats[13] += d_expl.float().square().sum()
+                    stats[10] += (d_closed - d_expl).square().sum()
+                    stats[11] += (d_closed * d_expl).sum()
+                    stats[12] += d_closed.square().sum()
+                    stats[13] += d_expl.square().sum()
 
                 dispK = disp2.mul_(scale)  # disp2 buffer becomes dispK
-                stats[4] += dispK.float().square().sum()
+                stats[4] += dispK.square().sum()
                 p.data.copy_(dispK.mul_(alpha).add_(t0))
 
         # Pass 3: slow correction at theta_tilde. Skipped for the no-corrective ablation, where the
@@ -813,6 +893,11 @@ class DataParallelPPOActor(BasePPOActor):
                 allow_trigger=trigger_enabled,
                 defer_trigger=False)
             state.step_count = step_idx + 1
+
+        if triggered and state.fallback_mode == 'permanent':
+            # Permanent shutoff: extrapolation is disabled forever, so the cached
+            # theta0/g0/g1 buffers are dead VRAM -- release them.
+            self._gxpo_release_buffers()
 
         metrics = pass3_metrics
         append_to_dict(metrics, {'actor/grad_norm': float(gn_slow)})
@@ -935,6 +1020,9 @@ class DataParallelPPOActor(BasePPOActor):
             metrics['actor/gxpo_trigger_stat'] = float(outer_stat)
             metrics['actor/gxpo_trigger_candidate'] = float(outer_z >= self.gxpo_state.tau)
             metrics['actor/gxpo_trigger_streak'] = float(self.gxpo_state.trigger_streak)
+            if triggered and self.gxpo_state.fallback_mode == 'permanent':
+                # Permanent shutoff: free the now-dead extrapolation buffers.
+                self._gxpo_release_buffers()
             if triggered:
                 print(f'[GXPO] outer-batch shutoff triggered after '
                       f'{self.gxpo_state.trigger_patience} consecutive violating batches: '
@@ -956,5 +1044,4 @@ class DataParallelPPOActor(BasePPOActor):
         )
         if self.gxpo_state.trigger_index != float('inf'):
             metrics['actor/gxpo_shutoff_step'] = float(self.gxpo_state.trigger_index)
-        self.actor_optimizer.zero_grad()
         return metrics
