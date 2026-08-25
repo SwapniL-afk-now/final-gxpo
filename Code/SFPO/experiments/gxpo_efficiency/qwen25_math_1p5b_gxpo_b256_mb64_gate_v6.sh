@@ -6,12 +6,16 @@
 # minibatch 64 | K=5 | alpha=0.5 | 2 GPUs (Blackwell 6000 Pro class)
 # driven by the Gate-v2 prediction-quality trigger.
 #
-# Gate configuration (evidence: Code/SFPO/.audit/gxpo_algorithm_findings.md):
-#   signal   : grad (actor-side; cosine measured from pre-clip g0/g_slow)
-#   mode     : cosine  -> observation = 1 - |cos(g0, g_slow)|, trip on z >= tau
-#   robust   : median/MAD z-score with sigma floored at 10% of the median
-#   age floor: no trip before GXPO_TRIGGER_MIN_OBS scored post-warmup batches
-#   budget   : hard stop after GXPO_MAX_ACTIVE_STEPS enabled steps (runtime cap)
+# Gate configuration - MODERATE PROFILE (evidence: Code/SFPO/.audit/gxpo_algorithm_findings.md):
+#   signal    : grad (actor-side; disagreement = 1 - |cos(g0, g_slow)| from pre-clip grads)
+#   primary   : sustained level - rolling median of last 10 observations >= 0.15,
+#               held for 2 consecutive scored batches (zero false positives across
+#               all 7 production runs in replay; catches failing runs ~5x earlier
+#               than the entropy gate, which missed them entirely)
+#   backup    : robust median/MAD z-score path, used only if ABS_THRESHOLD=0
+#   age floor : no trip before 12 scored post-warmup batches (rides out the
+#               volatile window that caused all observed production trips)
+#   budget    : hard stop after 150 enabled steps regardless of gate (runtime cap)
 #
 # Usage:
 #   bash qwen25_math_1p5b_gxpo_b256_mb64_gate_v6.sh            # launch
@@ -50,7 +54,7 @@ export GXPO_TRIGGER_SUSTAIN_W="${GXPO_TRIGGER_SUSTAIN_W:-10}"
 # SECONDARY z-score path (used only when ABS_THRESHOLD=0): robust median/MAD.
 export GXPO_TRIGGER_ROBUST="${GXPO_TRIGGER_ROBUST:-1}"
 export GXPO_TAU="${GXPO_TAU:-2.0}"
-export GXPO_TRIGGER_MIN_OBS="${GXPO_TRIGGER_MIN_OBS:-10}"
+export GXPO_TRIGGER_MIN_OBS="${GXPO_TRIGGER_MIN_OBS:-12}"
 export GXPO_MAX_ACTIVE_STEPS="${GXPO_MAX_ACTIVE_STEPS:-150}"
 export GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-2}"
 # Window length is inherited from common.sh (GXPO_ZSCORE_W=30).
@@ -105,7 +109,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   abs threshold      : $GXPO_TRIGGER_ABS_THRESHOLD (rolling median of last ${GXPO_TRIGGER_SUSTAIN_W:-10})
   tau / patience     : $GXPO_TAU / $GXPO_TRIGGER_PATIENCE (z-path backup when abs=0)
   robust statistic   : $GXPO_TRIGGER_ROBUST      (median/MAD, sigma floor 10%)
-  min_obs age floor  : $GXPO_TRIGGER_MIN_OBS
+  min_obs age floor  : $GXPO_TRIGGER_MIN_OBS      (moderate profile)
   max_active_steps   : $GXPO_MAX_ACTIVE_STEPS    (hard runtime ceiling)
   zscore window      : ${GXPO_ZSCORE_W:-30}
   wandb project      : ${WANDB_PROJECT:-gxpo-efficiency-final}
