@@ -174,7 +174,9 @@ class GXPOState:
         # and the gate fired on a *deviation*, not a bad baseline; a cold reset would discard
         # useful recent history. During the window the
         # fallback runs standard GRPO steps, which don't touch the rolling baseline, so it stays frozen-valid.
-        if self.fallback_mode == 'temporary' and step >= self.trigger_index + self.fallback_window:
+        # budget_stop=True (max_active_steps) is a HARD cap: temporary mode must never re-arm past it.
+        if (self.fallback_mode == 'temporary' and not self.budget_stop
+                and step >= self.trigger_index + self.fallback_window):
             self.trigger_index = float('inf')
             return True
         return False

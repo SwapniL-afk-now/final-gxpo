@@ -113,7 +113,10 @@ def main_task(config):
     # skip when KL is enabled.
     def _ref_policy_needed(cfg):
         use_kl_loss = bool(cfg.actor_rollout_ref.actor.get('use_kl_loss', False))
-        kl_coef = float(cfg.algorithm.kl_ctrl.get('kl_coef', 0.0) or 0.0)
+        # .get on an absent intermediate node returns None for DictConfig; guard it so
+        # custom configs without algorithm.kl_ctrl do not raise AttributeError.
+        kl_ctrl_cfg = cfg.algorithm.get('kl_ctrl', None)
+        kl_coef = float((kl_ctrl_cfg.get('kl_coef', 0.0) if kl_ctrl_cfg is not None else 0.0) or 0.0)
         use_kl_in_reward = bool(cfg.algorithm.get('use_kl_in_reward', False))
         return use_kl_loss or kl_coef != 0.0 or use_kl_in_reward
 

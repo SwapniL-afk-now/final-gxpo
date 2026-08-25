@@ -163,6 +163,28 @@ METHOD_FLAGS=()
 # entrypoint: gxpo_trigger_signal != entropy plus gxpo_shutoff_mode=cosine, which makes
 # the actor gate on disagreement = 1 - |cos(g0, g_slow)|.
 
+# Gate v2 passthroughs (defaults preserve the historical behavior exactly).
+GXPO_TRIGGER_SIGNAL="${GXPO_TRIGGER_SIGNAL:-entropy}"
+GXPO_SHUTOFF_MODE="${GXPO_SHUTOFF_MODE:-trajectory_aware}"
+export GXPO_TRIGGER_SIGNAL GXPO_SHUTOFF_MODE
+
+if [[ "$GXPO_SHUTOFF_MODE" == "cosine" && "$GXPO_TRIGGER_SIGNAL" == "entropy" ]]; then
+  echo "WARNING: GXPO_SHUTOFF_MODE=cosine is INERT with GXPO_TRIGGER_SIGNAL=entropy:" >&2
+  echo "         the trainer entropy gate makes the trip decision; cosine stats are logged only." >&2
+fi
+# Boolean footgun guard: ${VAR:+..} would fire on '0'/'false'; require an explicit yes.
+case "${GXPO_TRIGGER_ROBUST:-}" in
+  1|true|True|yes) METHOD_FLAGS+=(+actor_rollout_ref.actor.gxpo_trigger_robust=True) ;;
+  ""|0|false|False|no) : ;;
+  *) echo "WARNING: GXPO_TRIGGER_ROBUST='$GXPO_TRIGGER_ROBUST' not recognized; ignoring." >&2 ;;
+esac
+if [[ -n "${GXPO_TRIGGER_MIN_OBS:-}" && "$GXPO_TRIGGER_SIGNAL" == "entropy" ]]; then
+  echo "WARNING: GXPO_TRIGGER_MIN_OBS only affects the actor-side gate; inert with signal=entropy." >&2
+fi
+if [[ -n "${GXPO_TRIGGER_ROBUST:-}" && "$GXPO_TRIGGER_SIGNAL" == "entropy" ]]; then
+  echo "WARNING: GXPO_TRIGGER_ROBUST only affects the actor-side gate; inert with signal=entropy." >&2
+fi
+
 case "$METHOD" in
   grpo)
     METHOD_FLAGS+=(+actor_rollout_ref.actor.use_gxpo=False)
@@ -187,7 +209,7 @@ case "$METHOD" in
       +actor_rollout_ref.actor.gxpo_delta=1e-8
       +actor_rollout_ref.actor.gxpo_tau="$GXPO_TAU"
       +actor_rollout_ref.actor.gxpo_zscore_w="$GXPO_ZSCORE_W"
-      +actor_rollout_ref.actor.gxpo_trigger_signal=entropy
+      +actor_rollout_ref.actor.gxpo_trigger_signal="$GXPO_TRIGGER_SIGNAL"
       +actor_rollout_ref.actor.gxpo_trigger_patience="$GXPO_TRIGGER_PATIENCE"
       +actor_rollout_ref.actor.gxpo_fallback_mode="$GXPO_FALLBACK_MODE"
       +actor_rollout_ref.actor.gxpo_fallback_window="$GXPO_FALLBACK_WINDOW"
@@ -195,10 +217,9 @@ case "$METHOD" in
       +actor_rollout_ref.actor.gxpo_warmup_steps="$GXPO_WARMUP_STEPS"
       +actor_rollout_ref.actor.gxpo_reset_entropy_after_warmup=True
       +actor_rollout_ref.actor.gxpo_omega=0.1
-      +actor_rollout_ref.actor.gxpo_shutoff_mode=trajectory_aware
+      +actor_rollout_ref.actor.gxpo_shutoff_mode="$GXPO_SHUTOFF_MODE"
       +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=False
       +actor_rollout_ref.actor.gxpo_diag_freq=10
-      ${GXPO_TRIGGER_ROBUST:+\+actor_rollout_ref.actor.gxpo_trigger_robust=True}
       ${GXPO_TRIGGER_MIN_OBS:+\+actor_rollout_ref.actor.gxpo_trigger_min_obs="$GXPO_TRIGGER_MIN_OBS"}
       ${GXPO_MAX_ACTIVE_STEPS:+\+actor_rollout_ref.actor.gxpo_max_active_steps="$GXPO_MAX_ACTIVE_STEPS"}
     )
@@ -225,7 +246,11 @@ sfpo_reset_entropy_after_warmup=$SFPO_RESET_ENTROPY_AFTER_WARMUP
 gxpo_warmup_steps=$GXPO_WARMUP_STEPS
 gxpo_tau=$GXPO_TAU
 gxpo_zscore_w=$GXPO_ZSCORE_W
-gxpo_trigger_signal=entropy
+gxpo_trigger_signal=$GXPO_TRIGGER_SIGNAL
+gxpo_shutoff_mode=$GXPO_SHUTOFF_MODE
+gxpo_trigger_robust=${GXPO_TRIGGER_ROBUST:-0}
+gxpo_trigger_min_obs=${GXPO_TRIGGER_MIN_OBS:-0}
+gxpo_max_active_steps=${GXPO_MAX_ACTIVE_STEPS:-0}
 gxpo_trigger_patience=$GXPO_TRIGGER_PATIENCE
 gxpo_fallback_mode=$GXPO_FALLBACK_MODE
 gxpo_fallback_window=$GXPO_FALLBACK_WINDOW

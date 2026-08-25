@@ -1669,6 +1669,11 @@ class RayPPOTrainer(object):
                         reward_tensor = self.rm_wg.compute_rm_score(batch)
                         batch = batch.union(reward_tensor)
 
+                    # The snapshot shares the TensorDict with `batch`. Reorder replaces
+                    # dict entries (safe), but DataProto.union mutates the TensorDict
+                    # IN PLACE - so the old_log_prob union below must stay AFTER the
+                    # reward thread joins, otherwise a concurrent reader can hit
+                    # "dict changed size during iteration" when balance_batch=False.
                     reward_snapshot = DataProto(batch=batch.batch,
                                                 non_tensor_batch=dict(batch.non_tensor_batch),
                                                 meta_info={})
@@ -1700,9 +1705,16 @@ class RayPPOTrainer(object):
                         inv_balance_perm = _make_inverse_perm(balance_perm)
 
                         batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
-                        # recompute old_log_probs while rewards are scored concurrently
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        batch = batch.union(old_log_prob)
+                        # recompute old_log_probs while rewards are scored concurrently.
+                        # NOTE: union of the result into `batch` is deferred until after
+                        # reward_thread.join() - union mutates batch.batch in place.
+                        try:
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        except BaseException:
+                            # never abandon the scoring thread on driver failure: join it
+                            # (bounded) before propagating, then re-raise unchanged.
+                            reward_thread.join(timeout=60)
+                            raise
 
                     # collect the concurrent reward result; by now most of its
                     # wall-clock was absorbed by the GPU forward above.
@@ -1710,6 +1722,7 @@ class RayPPOTrainer(object):
                         reward_thread.join()
                     if _reward_error:
                         raise _reward_error[0]
+                    batch = batch.union(old_log_prob)
                     reward_tensor = _reward_result[0]
 
                     with _timer('adv', timing_raw):

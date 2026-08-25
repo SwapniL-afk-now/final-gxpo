@@ -565,7 +565,7 @@ class DataParallelPPOActor(BasePPOActor):
                 policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                 if collect_metrics:
                     # deferred D2H sync: converted to python floats once per mini-batch below
-                    metrics['actor/kl_loss'] = kl_loss.detach()
+                    append_to_dict(metrics, {'actor/kl_loss': kl_loss.detach()})
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
             if self.config.use_dynamic_bsz:
@@ -1058,4 +1058,11 @@ class DataParallelPPOActor(BasePPOActor):
         )
         if self.gxpo_state.trigger_index != float('inf'):
             metrics['actor/gxpo_shutoff_step'] = float(self.gxpo_state.trigger_index)
+        # WARN-1 fix: a hard-budget stop (max_active_steps) closes the gate without
+        # producing triggered=True anywhere, so the theta0/g0/g1 caches would stay
+        # resident forever. Release them once the stop is terminal.
+        if (self.gxpo_state.budget_stop and self.gxpo_state.fallback_mode != 'temporary'
+                and self._gxpo_bufs is not None):
+            self._gxpo_release_buffers()
+            metrics['actor/gxpo_budget_buffers_released'] = 1.0
         return metrics
