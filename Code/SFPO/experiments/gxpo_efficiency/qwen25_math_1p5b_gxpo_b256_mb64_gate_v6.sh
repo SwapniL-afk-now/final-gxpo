@@ -41,10 +41,17 @@ fi
 # 'entropy' or common.sh warns and the trainer entropy gate keeps control.
 export GXPO_TRIGGER_SIGNAL="${GXPO_TRIGGER_SIGNAL:-grad}"
 export GXPO_SHUTOFF_MODE="${GXPO_SHUTOFF_MODE:-cosine}"
+# PRIMARY criterion (calibrated on 7 production runs, see .audit/gxpo_algorithm_findings.md):
+# trip when the rolling median of the last 10 disagreement observations stays >= 0.15
+# for 2 consecutive batches. Replay: healthy runs never trip; failing k10 trips @55;
+# diverged no-fallback trips @90; zero false positives.
+export GXPO_TRIGGER_ABS_THRESHOLD="${GXPO_TRIGGER_ABS_THRESHOLD:-0.15}"
+export GXPO_TRIGGER_SUSTAIN_W="${GXPO_TRIGGER_SUSTAIN_W:-10}"
+# SECONDARY z-score path (used only when ABS_THRESHOLD=0): robust median/MAD.
 export GXPO_TRIGGER_ROBUST="${GXPO_TRIGGER_ROBUST:-1}"
+export GXPO_TAU="${GXPO_TAU:-2.0}"
 export GXPO_TRIGGER_MIN_OBS="${GXPO_TRIGGER_MIN_OBS:-10}"
 export GXPO_MAX_ACTIVE_STEPS="${GXPO_MAX_ACTIVE_STEPS:-150}"
-export GXPO_TAU="${GXPO_TAU:-2.0}"
 export GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-2}"
 # Window length is inherited from common.sh (GXPO_ZSCORE_W=30).
 
@@ -95,7 +102,8 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   --- gate v2 ---
   trigger_signal     : $GXPO_TRIGGER_SIGNAL      (must not be 'entropy')
   shutoff_mode       : $GXPO_SHUTOFF_MODE        (disagreement = 1 - |cos(g0,g_slow)|)
-  tau / patience     : $GXPO_TAU / $GXPO_TRIGGER_PATIENCE
+  abs threshold      : $GXPO_TRIGGER_ABS_THRESHOLD (rolling median of last ${GXPO_TRIGGER_SUSTAIN_W:-10})
+  tau / patience     : $GXPO_TAU / $GXPO_TRIGGER_PATIENCE (z-path backup when abs=0)
   robust statistic   : $GXPO_TRIGGER_ROBUST      (median/MAD, sigma floor 10%)
   min_obs age floor  : $GXPO_TRIGGER_MIN_OBS
   max_active_steps   : $GXPO_MAX_ACTIVE_STEPS    (hard runtime ceiling)

@@ -184,6 +184,17 @@ fi
 if [[ -n "${GXPO_TRIGGER_ROBUST:-}" && "$GXPO_TRIGGER_SIGNAL" == "entropy" ]]; then
   echo "WARNING: GXPO_TRIGGER_ROBUST only affects the actor-side gate; inert with signal=entropy." >&2
 fi
+case "${GXPO_TRIGGER_ABS_THRESHOLD:-}" in
+  ""|0|0.0) : ;;
+  *) if [[ "$GXPO_TRIGGER_SIGNAL" == "entropy" || "$GXPO_SHUTOFF_MODE" != "cosine" ]]; then
+       echo "WARNING: GXPO_TRIGGER_ABS_THRESHOLD only applies to cosine mode with signal!=entropy; inert here." >&2
+     else
+       METHOD_FLAGS+=(+actor_rollout_ref.actor.gxpo_trigger_abs_threshold="$GXPO_TRIGGER_ABS_THRESHOLD")
+     fi ;;
+esac
+if [[ -n "${GXPO_TRIGGER_SUSTAIN_W:-}" ]]; then
+  METHOD_FLAGS+=(+actor_rollout_ref.actor.gxpo_trigger_sustain_w="$GXPO_TRIGGER_SUSTAIN_W")
+fi
 
 case "$METHOD" in
   grpo)

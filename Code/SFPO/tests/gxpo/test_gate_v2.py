@@ -198,4 +198,33 @@ assert trip is not None and trip - 100 <= 35, f'degraded series tripped too late
 print('PASS cosine replay: 20 seeds quiet when healthy (300 steps); '
       f'degraded trips at step {trip} ({trip - 100} obs after onset)')
 
+# 7. sustained-level criterion (abs_threshold): the empirically calibrated default
+import random
+rng = random.Random(7)
+s = GXPOState(tau=2.0, omega=0.1, zscore_w=30, warmup_steps=0, trigger_patience=2,
+              shutoff_mode='cosine', abs_threshold=0.15, sustain_window=10,
+              min_post_warmup_obs=10)
+# healthy: disagreement ~ N(0.05, 0.02), clipped to [0,1] - must NEVER trip in 300 steps
+trip = None
+for i in range(300):
+    d = min(max(rng.gauss(0.05, 0.02), 0.0), 1.0)
+    s.is_enabled(i)
+    _, _, t = s.update_trigger_state(step=i, g0_norm=d, g_slow_norm=d,
+                                     allow_trigger=True, stat_override=d)
+    if t and trip is None: trip = i
+assert trip is None, f'healthy noise falsely tripped at {trip}'
+# degraded: level shifts to 0.28 at obs 300 -> once >=6 of the last 10 observations
+# are post-onset, the median clears the threshold; allow up to 15 obs + patience.
+for i in range(300, 400):
+    d = min(max(rng.gauss(0.28, 0.03), 0.0), 1.0)
+    s.is_enabled(i)
+    _, _, t = s.update_trigger_state(step=i, g0_norm=d, g_slow_norm=d,
+                                     allow_trigger=True, stat_override=d)
+    if t: break
+else:
+    raise AssertionError('sustained degradation never tripped')
+assert i - 300 <= 15, f'trip too slow after onset: {i-300} obs'
+print(f'PASS sustained-level criterion: healthy 300 steps quiet; degradation trips at obs {i} '
+      f'({i-300} after onset)')
+
 print('ALL GATE V2 CHECKS PASSED')

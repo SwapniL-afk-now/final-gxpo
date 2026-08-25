@@ -19,6 +19,7 @@ baseline, extrapolation is permanently disabled (s* = step + 1) and all
 subsequent updates fall back to single-pass GRPO.
 """
 
+import statistics
 from typing import Optional, Tuple
 
 import torch
@@ -93,6 +94,8 @@ class GXPOState:
         trigger_robust: bool = False,
         min_post_warmup_obs: int = 0,
         max_active_steps: int = 0,
+        abs_threshold: float = 0.0,
+        sustain_window: int = 10,
     ):
         if shutoff_mode not in self.VALID_SHUTOFF_MODES:
             raise ValueError(f'Invalid GXPO shutoff mode: {shutoff_mode}. '
@@ -137,6 +140,20 @@ class GXPOState:
         if int(max_active_steps) < 0:
             raise ValueError('GXPO max_active_steps must be non-negative')
         self.max_active_steps = int(max_active_steps)
+        # Sustained-level criterion (cosine mode): trip when the rolling median of
+        # the last `sustain_window` disagreement observations stays >= abs_threshold
+        # for `trigger_patience` consecutive scored batches. Calibrated on
+        # production curves (.audit/gxpo_algorithm_findings.md): healthy runs sit
+        # at median <= 0.06 (p90 <= 0.12); failing ones >= 0.25. Threshold 0.15
+        # separates them with zero false trips and catches sustained degradation
+        # that windowed z-scores structurally miss (the baseline adapts to the
+        # new level and z falls back down). 0 disables the criterion (z-path).
+        if float(abs_threshold) < 0:
+            raise ValueError('GXPO abs_threshold must be non-negative')
+        self.abs_threshold = float(abs_threshold)
+        if int(sustain_window) < 2:
+            raise ValueError('GXPO sustain_window must be >= 2')
+        self.sustain_window = int(sustain_window)
         # True when shutoff came from the hard budget rather than the gate.
         self.budget_stop = None
 
@@ -310,6 +327,25 @@ class GXPOState:
         self.observation_count += 1
         self.post_warmup_scored += 1
         if len(self.trigger_history) < self.zscore_w:
+            return float(z_score), float(trigger_stat), False
+        if self.shutoff_mode == 'cosine' and self.abs_threshold > 0:
+            # Sustained-level criterion replaces the z-path for cosine mode when
+            # enabled. The rolling median over `sustain_window` scored batches is
+            # compared against abs_threshold; streak/patience/warmup/age-floor
+            # semantics match check_trigger exactly.
+            window = [float(v) for v in self.trigger_history[-self.sustain_window:]]
+            med = statistics.median(window)
+            eligible = (med >= self.abs_threshold
+                        and step >= self.warmup_steps
+                        and self.post_warmup_scored >= self.min_post_warmup_obs
+                        and self.trigger_index == float('inf'))
+            if eligible:
+                self.trigger_streak += 1
+                if self.trigger_streak >= self.trigger_patience:
+                    self.trigger_index = step + 1
+                    return float(z_score), float(trigger_stat), True
+                return float(z_score), float(trigger_stat), False
+            self.trigger_streak = 0
             return float(z_score), float(trigger_stat), False
         triggered = self.check_trigger(z_score, step)
         return float(z_score), float(trigger_stat), bool(triggered)
