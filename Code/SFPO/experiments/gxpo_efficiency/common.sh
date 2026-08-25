@@ -200,6 +200,7 @@ case "$METHOD" in
       +actor_rollout_ref.actor.gxpo_diag_freq=10
       ${GXPO_TRIGGER_ROBUST:+\+actor_rollout_ref.actor.gxpo_trigger_robust=True}
       ${GXPO_TRIGGER_MIN_OBS:+\+actor_rollout_ref.actor.gxpo_trigger_min_obs="$GXPO_TRIGGER_MIN_OBS"}
+      ${GXPO_MAX_ACTIVE_STEPS:+\+actor_rollout_ref.actor.gxpo_max_active_steps="$GXPO_MAX_ACTIVE_STEPS"}
     )
     ;;
 esac

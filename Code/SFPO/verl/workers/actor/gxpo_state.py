@@ -92,6 +92,7 @@ class GXPOState:
         trigger_patience: int = 1,
         trigger_robust: bool = False,
         min_post_warmup_obs: int = 0,
+        max_active_steps: int = 0,
     ):
         if shutoff_mode not in self.VALID_SHUTOFF_MODES:
             raise ValueError(f'Invalid GXPO shutoff mode: {shutoff_mode}. '
@@ -130,6 +131,14 @@ class GXPOState:
         # Streaks accumulated before this age are discarded, so the first decision
         # after the minimum age is not an instant carry-over trip.
         self.min_post_warmup_obs = int(min_post_warmup_obs)
+        # Hard cap on enabled (extrapolating) outer steps. 0 disables the cap.
+        # This is a worst-case runtime guard, NOT a stability mechanism: the
+        # statistical gate remains responsible for quality-based shutoff.
+        if int(max_active_steps) < 0:
+            raise ValueError('GXPO max_active_steps must be non-negative')
+        self.max_active_steps = int(max_active_steps)
+        # True when shutoff came from the hard budget rather than the gate.
+        self.budget_stop = None
 
         self.trigger_index = float('inf')  # s*: first step with extrapolation disabled
         self.trigger_streak = 0
@@ -149,6 +158,15 @@ class GXPOState:
     def is_enabled(self, step: Optional[int] = None) -> bool:
         if step is None:
             step = self.step_count
+        # Hard compute budget (F5/F8 worst-case guard): never spend more than
+        # max_active_steps outer steps in 3-pass mode, regardless of what the
+        # statistical gate does. Bounds the runtime penalty of a mis-tuned gate;
+        # recorded via trigger_index so existing shutoff metrics/reporting apply.
+        if (self.max_active_steps > 0 and step >= self.max_active_steps
+                and self.trigger_index == float('inf') and self.budget_stop is None):
+            self.trigger_index = step
+            self.budget_stop = True
+            return False
         if step < self.trigger_index:
             return True
         # Tripped. Permanent stays off forever; temporary re-arms after the window by clearing the

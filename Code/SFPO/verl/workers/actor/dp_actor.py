@@ -122,6 +122,7 @@ class DataParallelPPOActor(BasePPOActor):
                 trigger_patience=self.config.get('gxpo_trigger_patience', 1),
                 trigger_robust=self.config.get('gxpo_trigger_robust', False),
                 min_post_warmup_obs=int(self.config.get('gxpo_trigger_min_obs', 0)),
+                max_active_steps=int(self.config.get('gxpo_max_active_steps', 0)),
             )
             self._gxpo_diag_freq = int(self.config.get('gxpo_diag_freq', 10))
 

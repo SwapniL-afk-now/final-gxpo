@@ -83,4 +83,24 @@ for step, h in enumerate(norms):
 assert trip == 10, f'default behavior changed! trip at {trip}, expected 10'
 print('PASS backward compatibility: default gate trips at step 10 as before')
 
+# 6. hard active-step budget: force-shutoff even when the statistical gate never trips
+s = GXPOState(tau=1.0, omega=0.1, zscore_w=5, warmup_steps=0, trigger_patience=2,
+              shutoff_mode='trajectory_aware', max_active_steps=5)
+flat = [10.0] * 20                    # perfectly stable -> classic gate never fires
+trig_budget = []
+for i, h in enumerate(flat):
+    on = s.is_enabled(i)
+    if on:
+        s.update_trigger_state(step=i, g0_norm=h, g_slow_norm=h)
+    trig_budget.append(on)
+assert all(trig_budget[:5]), 'budget must allow the first 5 steps'
+assert not any(trig_budget[5:]), 'budget must disable extrapolation at step 5 and stay off'
+assert s.budget_stop is True and s.trigger_index == 5
+# default (no budget) keeps old behavior: gate alone decides
+s2 = GXPOState(tau=1.0, omega=0.1, zscore_w=5, warmup_steps=0, trigger_patience=99,
+               shutoff_mode='trajectory_aware')
+on_all = [s2.is_enabled(i) for i in range(20)]
+assert all(on_all), 'without a budget, stable runs must stay enabled'
+print('PASS max_active_steps hard budget bounds 3-pass runtime; default unchanged')
+
 print('ALL GATE V2 CHECKS PASSED')
