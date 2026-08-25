@@ -55,7 +55,15 @@ export WANDB_CACHE_DIR="$GXPO_LOCAL_ROOT/.wandb/cache"
 export WANDB_CONFIG_DIR="$GXPO_LOCAL_ROOT/.wandb/config"
 export WANDB_DATA_DIR="$GXPO_LOCAL_ROOT/.wandb/data"
 export WANDB_ARTIFACT_DIR="$GXPO_LOCAL_ROOT/.wandb/artifacts"
-export TMPDIR="/office/dev_workspace/swapnil/.gxpo-tmp"
+# Portable scratch dir: prefer GXPO_TMPDIR, then an existing inherited TMPDIR,
+# then the original H200 mount, then a fresh mktemp dir. The old unconditional
+# export + mkdir under set -euo pipefail killed startup on machines without
+# /office/dev_workspace mounted (audit: revision_config_audit.md finding 5).
+if [[ -n "${GXPO_TMPDIR:-}" ]]; then
+  export TMPDIR="$GXPO_TMPDIR"
+elif [[ -z "${TMPDIR:-}" || ! -w "$(dirname "${TMPDIR:-/nonexistent}")" ]]; then
+  TMPDIR="/office/dev_workspace/swapnil/.gxpo-tmp"
+fi
 export TMP="$TMPDIR"
 export TEMP="$TMPDIR"
 SWAPNIL_ROOT="$(cd -- "$GXPO_LOCAL_ROOT/.." && pwd)"
@@ -65,8 +73,13 @@ export RAY_AIR_LOCAL_CACHE_DIR="${RAY_AIR_LOCAL_CACHE_DIR:-$SWAPNIL_ROOT/.gxpo-r
 mkdir -p "$GXPO_DATA_ROOT" "$GXPO_RESULTS_ROOT" "$GXPO_LOCAL_ROOT/models" \
   "$HF_HUB_CACHE" "$HF_DATASETS_CACHE" \
   "$XDG_CACHE_HOME" "$WANDB_CACHE_DIR" "$WANDB_CONFIG_DIR" \
-  "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR" "$TMPDIR" "$RAY_TMPDIR" \
-  "$RAY_AIR_LOCAL_CACHE_DIR"
+  "$WANDB_DATA_DIR" "$WANDB_ARTIFACT_DIR" "$RAY_TMPDIR" \
+  "$RAY_AIR_LOCAL_CACHE_DIR" || true   # individual failures surface at use time
+if ! mkdir -p "$TMPDIR" 2>/dev/null; then
+  # last-resort fallback: never let scratch-dir creation abort the launch
+  TMPDIR="$(mktemp -d)"
+  export TMPDIR TMP="$TMPDIR" TEMP="$TMPDIR"
+fi
 
 # Dedicated 1.5B GXPO run: global train batch 256, k=5, reposition alpha 0.5.
 # Keep the original qwen25_math_1p5b_gxpo_k10.sh unchanged for reproducibility.
