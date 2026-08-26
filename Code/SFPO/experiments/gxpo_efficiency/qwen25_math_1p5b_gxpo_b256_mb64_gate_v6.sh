@@ -3,7 +3,7 @@
 # qwen25_math_1p5b_gxpo_b256_mb64_gate_v6.sh
 #
 # Complete entrypoint: Qwen2.5-Math-1.5B-Instruct | GXPO | batch 256 |
-# minibatch 64 | K=5 | alpha=0.5 | 2 GPUs (Blackwell 6000 Pro class)
+# minibatch 64 | K=10 | alpha=0.3 | 2 GPUs (Blackwell 6000 Pro class)
 # driven by the Gate-v2 prediction-quality trigger.
 #
 # Gate configuration - MODERATE PROFILE (evidence: Code/SFPO/.audit/gxpo_algorithm_findings.md):
@@ -41,6 +41,11 @@ if [[ -f "$REPO_ROOT/.env" ]]; then
 fi
 
 # ------------------------------------------------------------ gate config ----
+# Experiment settings owned by this entrypoint.  The downstream environment
+# wrapper must preserve these inherited values instead of overriding them.
+export K=10
+export REPOSITION_ALPHA=0.3
+
 # Actor-side prediction-quality gate. GXPO_TRIGGER_SIGNAL must differ from
 # 'entropy' or common.sh warns and the trainer entropy gate keeps control.
 export GXPO_TRIGGER_SIGNAL="${GXPO_TRIGGER_SIGNAL:-grad}"
@@ -97,7 +102,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   repo_root          : $REPO_ROOT
   model              : $MODEL_DIR
   data_root          : $DATA_ROOT
-  method             : gxpo (K=${K:-5}, alpha=${REPOSITION_ALPHA:-0.5})
+  method             : gxpo (K=${K:-10}, alpha=${REPOSITION_ALPHA:-0.3})
   batch / minibatch  : ${TRAIN_BATCH_SIZE:-256} / ${PPO_MINI_BATCH_SIZE:-64}
   gpus               : ${GPU_COUNT:-2}  (ids ${GPU_IDS:-0,1}, FSDP_SIZE=${FSDP_SIZE:-2})
   max_steps          : ${MAX_STEPS:-400}   save_freq ${SAVE_FREQ:-20}

@@ -15,6 +15,25 @@ fi
 export GXPO_DATA_ROOT="$GXPO_LOCAL_ROOT/Code/SFPO/data"
 export GXPO_RESULTS_ROOT="$GXPO_LOCAL_ROOT/results/gxpo_efficiency"
 export MODEL_QWEN25_MATH_1P5B="$GXPO_LOCAL_ROOT/models/Qwen2.5-Math-1.5B-Instruct"
+
+# This entrypoint is a fixed two-GPU experiment.  Keep the physical device
+# mapping stable even when the parent shell was previously using another pair.
+export GPU_IDS=0,1
+export CUDA_VISIBLE_DEVICES=0,1
+export GPU_COUNT=2
+export FSDP_SIZE=2
+
+# Use the repository's verified, preprocessed assets.  The shared launcher
+# combines both training files and all six validation benchmarks below.
+export DAPO_TRAIN="${DAPO_TRAIN:-$GXPO_DATA_ROOT/dapo_math/train.parquet}"
+export LIGHTEVAL_TRAIN="${LIGHTEVAL_TRAIN:-$GXPO_DATA_ROOT/lighteval-math/train.parquet}"
+export MATH500="${MATH500:-$GXPO_DATA_ROOT/math500/test.parquet}"
+export AIME24="${AIME24:-$GXPO_DATA_ROOT/aime2024/test.parquet}"
+export AIME25="${AIME25:-$GXPO_DATA_ROOT/aime2025/test.parquet}"
+export AMC23="${AMC23:-$GXPO_DATA_ROOT/amc/test.parquet}"
+export MINERVA="${MINERVA:-$GXPO_DATA_ROOT/minervamath/test.parquet}"
+export OLYMPIAD="${OLYMPIAD:-$GXPO_DATA_ROOT/olympiadbench/test.parquet}"
+
 export HF_HOME="$GXPO_LOCAL_ROOT/.hf_home"
 export HF_HUB_CACHE="$HF_HOME/hub"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"
@@ -81,33 +100,38 @@ if ! mkdir -p "$TMPDIR" 2>/dev/null; then
   export TMPDIR TMP="$TMPDIR" TEMP="$TMPDIR"
 fi
 
-# Dedicated 1.5B GXPO run: global train batch 256, k=5, reposition alpha 0.5.
-# Keep the original qwen25_math_1p5b_gxpo_k10.sh unchanged for reproducibility.
+# Shared 1.5B GXPO environment wrapper.  Experiment entrypoints may provide
+# K and REPOSITION_ALPHA; preserve those values instead of silently replacing
+# them.  These defaults only apply when this wrapper is launched directly.
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
-export REPOSITION_ALPHA=0.5
-export K=5
-export GXPO_TAU=1.0
-export GXPO_TRIGGER_PATIENCE=1
-export GXPO_FALLBACK_MODE=permanent
-export GXPO_WARMUP_STEPS=0
-export GXPO_ZSCORE_W=30
+export REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.3}"
+export K="${K:-10}"
+export ROLLOUT_N="${ROLLOUT_N:-8}"
+export GXPO_TAU="${GXPO_TAU:-2.0}"
+export GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-1}"
+export GXPO_FALLBACK_MODE="${GXPO_FALLBACK_MODE:-permanent}"
+export GXPO_WARMUP_STEPS="${GXPO_WARMUP_STEPS:-0}"
+export GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
 export LOG_PROB_MICRO_BATCH_SIZE="${LOG_PROB_MICRO_BATCH_SIZE:-8}"
-export FSDP_SIZE=2
-export USE_LIGER=True
+export USE_LIGER="${USE_LIGER:-True}"
 export ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
-export GPU_IDS="${GPU_IDS:-0,1}"
-export GPU_COUNT="${GPU_COUNT:-2}"
+# 32768 diverged on 2026-08-25 (entropy blowup); 24576 matches the healthy
+# v5/v6 runs -- do not raise again without an A/B check.
+export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}"
+# verl sends validation to vLLM as one logical dataset batch; numeric
+# data.val_batch_size is deprecated and only produces a misleading warning.
+export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-null}"
 export SAVE_FREQ="${SAVE_FREQ:-20}"
 export MAX_STEPS="${MAX_STEPS:-400}"
 export WANDB_PROJECT="${WANDB_PROJECT:-gxpo-efficiency-final}"
 export WANDB_GROUP="${WANDB_GROUP:-qwen25-math-1p5b-b256}"
-export WANDB_TAGS="${WANDB_TAGS:-model:qwen25-math-1p5b,method:gxpo,k:5,alpha:0.5,batch:256,minibatch:64,experiment:custom}"
+export WANDB_TAGS="${WANDB_TAGS:-model:qwen25-math-1p5b,method:gxpo,k:${K},alpha:${REPOSITION_ALPHA},batch:256,minibatch:64,experiment:custom}"
 export WANDB_MODE="${WANDB_MODE:-online}"
-export GXPO_RUN_NAME="${GXPO_RUN_NAME:-qwen25_math_1p5b_gxpo_k5_a05_perm_b256_mb64_fsdp2_fp32_liger_v5_20260824}"
+export GXPO_RUN_NAME="${GXPO_RUN_NAME:-qwen25_math_1p5b_gxpo_k${K}_a${REPOSITION_ALPHA}_perm_b256_mb64_fsdp2_fp32_liger_v6_20260826}"
 export GXPO_CONCISE_LOGS=1
 export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
-export ACTOR_MODEL_DTYPE=float32
+export ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-float32}"
 
 # A 256-prompt batch with rollout.n=8 creates 2048 responses, split evenly
 # across the two rollout ranks. Match the per-rank sequence cap to that share

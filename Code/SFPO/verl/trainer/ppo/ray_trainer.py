@@ -1724,6 +1724,15 @@ class RayPPOTrainer(object):
                         raise _reward_error[0]
                     batch = batch.union(old_log_prob)
                     reward_tensor = _reward_result[0]
+                    # The reward thread scored the PRE-balance snapshot: reorder()
+                    # rebinds batch.batch instead of mutating tensors, so the
+                    # snapshot kept the original row order while `batch` is now
+                    # post-balance. Realign the scores to the live row order before
+                    # attaching them - without this, GRPO group normalization mixes
+                    # rewards across prompts and corrupts every advantage.
+                    if balance_perm is not None:
+                        reward_tensor = reward_tensor.index_select(
+                            0, balance_perm.to(device=reward_tensor.device))
 
                     with _timer('adv', timing_raw):
                         batch.batch['token_level_scores'] = reward_tensor
