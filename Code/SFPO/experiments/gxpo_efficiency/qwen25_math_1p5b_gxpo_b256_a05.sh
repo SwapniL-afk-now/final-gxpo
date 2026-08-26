@@ -137,8 +137,15 @@ export ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-float32}"
 # across the two rollout ranks. Match the per-rank sequence cap to that share
 # so vLLM keeps enough KV-cache blocks for active generations without admitting
 # an unnecessarily large concurrent queue.
-export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-1024}"
-export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-98304}"
+# Flattened-load mitigation for the GPU-3 power/bus-drop issue: smaller vLLM
+# batching peaks reduce transient board draw during rollout bursts.
+# Flattened-load mitigation for the GPU-3 power/bus-drop issue: smaller vLLM
+# batching peaks reduce transient board draw during rollout bursts.
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-512}"
+export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-65536}"
+# Host-RAM ceiling (~80GB target): cap the Ray shared-memory object store
+# instead of Ray's default reservation (~30% of physical RAM).
+export RAY_OBJECT_STORE_MEMORY_GB="${RAY_OBJECT_STORE_MEMORY_GB:-16}"
 export VLLM_ENABLE_CHUNKED_PREFILL="${VLLM_ENABLE_CHUNKED_PREFILL:-True}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
 export VLLM_SLEEP_LEVEL="${VLLM_SLEEP_LEVEL:-2}"

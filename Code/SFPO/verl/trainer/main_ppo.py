@@ -58,13 +58,20 @@ def run_ppo(config) -> None:
 
     if not ray.is_initialized():
         # this is for local ray cluster
+        import os
+        init_kwargs = {}
+        # Optional host-RAM ceiling: cap the shared-memory object store instead of
+        # letting Ray reserve its default (~30% of physical RAM).
+        ostore_gb = float(os.environ.get('RAY_OBJECT_STORE_MEMORY_GB', '0') or 0)
+        if ostore_gb > 0:
+            init_kwargs['object_store_memory'] = int(ostore_gb * 1024 ** 3)
         ray.init(include_dashboard=False, runtime_env={
             'env_vars': {
                 'TOKENIZERS_PARALLELISM': 'true',
                 'NCCL_DEBUG': 'WARN',
                 'VLLM_LOGGING_LEVEL': 'WARN'
             }
-        })
+        }, **init_kwargs)
 
     ray.get(main_task.remote(config))
 
