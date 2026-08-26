@@ -16,8 +16,13 @@ Single Process Actor
 """
 
 import itertools
+import os
 import weakref
 from typing import Iterable, Tuple
+
+# Power-throttle chunk size for full-model diagnostic norm waves (see
+# fsdp_workers._SFPO_FOREACH_CHUNK); values unchanged, scheduling only.
+_GXPO_NORM_CHUNK = max(1, int(os.environ.get('GXPO_NORM_CHUNK', '32')))
 
 import torch
 from torch import nn
@@ -791,11 +796,17 @@ class DataParallelPPOActor(BasePPOActor):
             # Numerically equivalent only (summation order differs), which is fine --
             # these feed nothing algorithmic (see comment above).
             if g0_bufs:
-                stats[0] += torch.stack(torch._foreach_norm(g0_bufs)).square().sum()
-                stats[1] += torch.stack(torch._foreach_norm(g1_bufs)).square().sum()
-                param_sq += torch.stack(torch._foreach_norm(theta0)).square().sum()
+                for i in range(0, len(g0_bufs), _GXPO_NORM_CHUNK):
+                    j = i + _GXPO_NORM_CHUNK
+                    stats[0] += torch.stack(torch._foreach_norm(g0_bufs[i:j])).square().sum()
+                    stats[1] += torch.stack(torch._foreach_norm(g1_bufs[i:j])).square().sum()
+                    param_sq += torch.stack(torch._foreach_norm(theta0[i:j])).square().sum()
+                    torch.cuda.synchronize()
 
-            for p, t0, g0b, g1b in zip(params, theta0, g0_bufs, g1_bufs):
+            _p2_sync_every = max(1, _GXPO_NORM_CHUNK)
+            for _p2_i, (p, t0, g0b, g1b) in enumerate(zip(params, theta0, g0_bufs, g1_bufs)):
+                if _p2_i and _p2_i % _p2_sync_every == 0:
+                    torch.cuda.synchronize()
                 # ---- ALGORITHMIC PATH: retention scale + reposition write stay
                 # ---- op-for-op identical to the previous per-parameter loop.
                 r, scale, active, ratio_clipped = compute_gxpo_retention_scale(g0b, g1b, K, delta)

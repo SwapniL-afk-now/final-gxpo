@@ -18,6 +18,20 @@ The main entry point to run the PPO algorithm
 import logging
 import os
 import copy
+
+# Power-throttle: full-model foreach waves launch every kernel back-to-back,
+# spiking instantaneous board draw past the 500W target during SFPO
+# snapshot/jump/reposition phases. Chunking each wave + a device sync between
+# chunks caps concurrent kernel count. Values are identical; only scheduling
+# changes. Tune with SFPO_FOREACH_CHUNK (tensors per wave).
+_SFPO_FOREACH_CHUNK = max(1, int(os.environ.get('SFPO_FOREACH_CHUNK', '32')))
+
+
+def _chunked_foreach_copy_(dst, src):
+    for i in range(0, len(dst), _SFPO_FOREACH_CHUNK):
+        j = i + _SFPO_FOREACH_CHUNK
+        torch._foreach_copy_(dst[i:j], src[i:j])
+        torch.cuda.synchronize()
 import warnings
 import psutil
 
@@ -676,7 +690,7 @@ class ActorRolloutRefWorker(Worker):
         # torch._foreach_copy_ preserves values bit-exactly vs. per-param .clone().
         with torch.no_grad():
             sfpo_params, slow_weights, _ = self._sfpo_param_buffers()
-            torch._foreach_copy_(slow_weights, [p.data for p in sfpo_params])
+            _chunked_foreach_copy_(slow_weights, [p.data for p in sfpo_params])
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
@@ -688,20 +702,24 @@ class ActorRolloutRefWorker(Worker):
             # Snapshot the post-fast-phase (fast) weights into persistent buffers.
             with torch.no_grad():
                 _, _, fast_weights = self._sfpo_param_buffers()
-                torch._foreach_copy_(fast_weights, [p.data for p in sfpo_params])
+                _chunked_foreach_copy_(fast_weights, [p.data for p in sfpo_params])
                 jump_sq = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
                 param_sq = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
                 if all(w.dtype == torch.float32 for w in fast_weights):
-                    # Fused dispatch; per-element op order (sub, mul/square, sum,
-                    # then sequential accumulation into jump_sq/param_sq) is
+                    # Fused dispatch, chunked + synced for power throttling;
+                    # per-element op order (sub, mul/square, sum, then
+                    # sequential accumulation into jump_sq/param_sq) is
                     # identical to the previous per-param loop => bit-exact.
-                    diffs = torch._foreach_sub(fast_weights, slow_weights)
-                    sq_diffs = torch._foreach_mul(diffs, diffs)
-                    for t in sq_diffs:
-                        jump_sq += t.sum()
-                    sq_slow = torch._foreach_mul(slow_weights, slow_weights)
-                    for t in sq_slow:
-                        param_sq += t.sum()
+                    for i in range(0, len(fast_weights), _SFPO_FOREACH_CHUNK):
+                        j = i + _SFPO_FOREACH_CHUNK
+                        diffs = torch._foreach_sub(fast_weights[i:j], slow_weights[i:j])
+                        sq_diffs = torch._foreach_mul(diffs, diffs)
+                        for t in sq_diffs:
+                            jump_sq += t.sum()
+                        sq_slow = torch._foreach_mul(slow_weights[i:j], slow_weights[i:j])
+                        for t in sq_slow:
+                            param_sq += t.sum()
+                        torch.cuda.synchronize()
                 else:
                     for slow, fast in zip(slow_weights, fast_weights):
                         jump_sq += (fast.float() - slow.float()).square().sum()
@@ -721,10 +739,15 @@ class ActorRolloutRefWorker(Worker):
             # chain exactly => bit-exact.
             with torch.no_grad():
                 param_datas = [p.data for p in sfpo_params]
-                reposition_diffs = torch._foreach_sub(fast_weights, slow_weights)
-                torch._foreach_mul_(reposition_diffs, step_size)
-                torch._foreach_copy_(param_datas, slow_weights)
-                torch._foreach_add_(param_datas, reposition_diffs)
+                reposition_diffs = [None] * len(param_datas)
+                for i in range(0, len(param_datas), _SFPO_FOREACH_CHUNK):
+                    j = i + _SFPO_FOREACH_CHUNK
+                    chunk = torch._foreach_sub(fast_weights[i:j], slow_weights[i:j])
+                    torch._foreach_mul_(chunk, step_size)
+                    torch._foreach_copy_(param_datas[i:j], slow_weights[i:j])
+                    torch._foreach_add_(param_datas[i:j], chunk)
+                    reposition_diffs[i:j] = chunk
+                    torch.cuda.synchronize()
 
             # Slow correction update.
             with Timer(name='update_policy', logger=None) as timer:
