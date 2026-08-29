@@ -2,8 +2,8 @@
 #
 # qwen25_math_1p5b_gxpo_b256_mb64_gate_v6.sh
 #
-# Complete entrypoint: Qwen2.5-Math-1.5B-Instruct | GXPO | batch 256 |
-# minibatch 64 | K=10 | alpha=0.3 | 2 GPUs (Blackwell 6000 Pro class)
+# Complete entrypoint: Llama-3.2-3B-Instruct | GXPO | batch 256 |
+# minibatch 64 | K=10 | alpha=0.3 | 4 GPUs (FSDP size 4)
 # driven by the Gate-v2 prediction-quality trigger.
 #
 # Gate configuration - MODERATE PROFILE (evidence: Code/SFPO/.audit/gxpo_algorithm_findings.md):
@@ -32,11 +32,16 @@ DRY_RUN=0
 [[ "${1:-}" == "--dry-run" ]] && DRY_RUN=1
 
 # ---------------------------------------------------------------- secrets ----
-# Checkout-local secrets (WANDB_API_KEY); never printed.
-if [[ -f "$REPO_ROOT/.env" ]]; then
+# Checkout-local secrets (WANDB_API_KEY); never printed. When this is a
+# separate clone without its own .env, use the workspace-level .env.
+ENV_FILE="${GXPO_ENV_FILE:-$REPO_ROOT/.env}"
+if [[ ! -f "$ENV_FILE" && -f "/workspace/.env" ]]; then
+  ENV_FILE="/workspace/.env"
+fi
+if [[ -f "$ENV_FILE" ]]; then
   set -a
   # shellcheck disable=SC1091
-  source "$REPO_ROOT/.env"
+  source "$ENV_FILE"
   set +a
 fi
 
@@ -66,13 +71,13 @@ export GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-2}"
 
 # ------------------------------------------------------------- preflight -----
 MISSING=0
-MODEL_DIR="${MODEL_QWEN25_MATH_1P5B:-$REPO_ROOT/models/Qwen2.5-Math-1.5B-Instruct}"
-DATA_ROOT="${GXPO_DATA_ROOT:-$REPO_ROOT/Code/SFPO/data}"
+MODEL_DIR="${MODEL_LLAMA32_3B:-/workspace/models/Llama-3.2-3B-Instruct}"
+DATA_ROOT="${GXPO_DATA_ROOT:-/workspace/data}"
 
 if [[ ! -f "$MODEL_DIR/config.json" ]]; then
   echo "PREFLIGHT FAIL: model weights not found at $MODEL_DIR" >&2
-  echo "  (download Qwen/Qwen2.5-Math-1.5B-Instruct there, or point" >&2
-  echo "   MODEL_QWEN25_MATH_1P5B at an existing local copy)" >&2
+  echo "  (download meta-llama/Llama-3.2-3B-Instruct there, or point" >&2
+  echo "   MODEL_LLAMA32_3B at an existing local copy)" >&2
   MISSING=1
 fi
 
@@ -104,7 +109,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   data_root          : $DATA_ROOT
   method             : gxpo (K=${K:-10}, alpha=${REPOSITION_ALPHA:-0.3})
   batch / minibatch  : ${TRAIN_BATCH_SIZE:-256} / ${PPO_MINI_BATCH_SIZE:-64}
-  gpus               : ${GPU_COUNT:-2}  (ids ${GPU_IDS:-0,1}, FSDP_SIZE=${FSDP_SIZE:-2})
+  gpus               : ${GPU_COUNT:-4}  (ids ${GPU_IDS:-0,1,2,3}, FSDP_SIZE=${FSDP_SIZE:-4})
   max_steps          : ${MAX_STEPS:-400}   save_freq ${SAVE_FREQ:-20}
   dtype / liger      : ${ACTOR_MODEL_DTYPE:-float32} / ${USE_LIGER:-True}
   attention          : train ${ATTN_IMPL:-flash_attention_2} | vllm ${VLLM_ATTENTION_BACKEND:-FLASHINFER}

@@ -1905,6 +1905,10 @@ class RayPPOTrainer(object):
                     gxpo_baseline_ready = False
                     gxpo_trigger_z = 0.0
                     gxpo_trigger_candidate = False
+                    # GXPO gate variables are also referenced by shared bookkeeping.
+                    # Initialize them for SFPO so the GXPO path remains disabled.
+                    gxpo_zscore_w = 0
+                    gxpo_fallback_mode = 'permanent'
                     gxpo_trigger_stat = (
                         float(self.gxpo_entropy_container[-1])
                         if self.gxpo_entropy_container else 0.0

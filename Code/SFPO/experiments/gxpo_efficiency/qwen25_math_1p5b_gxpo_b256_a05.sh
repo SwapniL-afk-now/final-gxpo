@@ -5,23 +5,28 @@ GXPO_LOCAL_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)
 export GXPO_LOCAL_ROOT
 
 # Load checkout-local secrets (for example WANDB_API_KEY) without printing them.
-if [[ -f "$GXPO_LOCAL_ROOT/.env" ]]; then
+# The cloned checkout may not have a .env, so fall back to the workspace .env.
+GXPO_ENV_FILE="${GXPO_ENV_FILE:-$GXPO_LOCAL_ROOT/.env}"
+if [[ ! -f "$GXPO_ENV_FILE" && -f "/workspace/.env" ]]; then
+  GXPO_ENV_FILE="/workspace/.env"
+fi
+if [[ -f "$GXPO_ENV_FILE" ]]; then
   set -a
-  source "$GXPO_LOCAL_ROOT/.env"
+  source "$GXPO_ENV_FILE"
   set +a
 fi
 
-# Keep every artifact, cache, checkpoint, model, dataset, and temporary file under this checkout.
-export GXPO_DATA_ROOT="$GXPO_LOCAL_ROOT/Code/SFPO/data"
+# Use verified workspace assets when this clone does not contain generated data or model weights; keep outputs and caches isolated to this checkout.
+export GXPO_DATA_ROOT="${GXPO_DATA_ROOT:-/workspace/data}"
 export GXPO_RESULTS_ROOT="$GXPO_LOCAL_ROOT/results/gxpo_efficiency"
-export MODEL_QWEN25_MATH_1P5B="$GXPO_LOCAL_ROOT/models/Qwen2.5-Math-1.5B-Instruct"
+export MODEL_LLAMA32_3B="${MODEL_LLAMA32_3B:-/workspace/models/Llama-3.2-3B-Instruct}"
 
-# This entrypoint is a fixed two-GPU experiment.  Keep the physical device
+# This entrypoint is a fixed four-GPU experiment. Keep the physical device
 # mapping stable even when the parent shell was previously using another pair.
-export GPU_IDS=0,1
-export CUDA_VISIBLE_DEVICES=0,1
-export GPU_COUNT=2
-export FSDP_SIZE=2
+export GPU_IDS=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export GPU_COUNT=4
+export FSDP_SIZE=4
 
 # Use the repository's verified, preprocessed assets.  The shared launcher
 # combines both training files and all six validation benchmarks below.
@@ -128,10 +133,10 @@ export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-null}"
 export SAVE_FREQ="${SAVE_FREQ:-20}"
 export MAX_STEPS="${MAX_STEPS:-400}"
 export WANDB_PROJECT="${WANDB_PROJECT:-gxpo-efficiency-final}"
-export WANDB_GROUP="${WANDB_GROUP:-qwen25-math-1p5b-b256}"
-export WANDB_TAGS="${WANDB_TAGS:-model:qwen25-math-1p5b,method:gxpo,k:${K},alpha:${REPOSITION_ALPHA},batch:256,minibatch:64,experiment:custom}"
+export WANDB_GROUP="${WANDB_GROUP:-llama32-3b-instruct-gxpo-b256-fsdp4}"
+export WANDB_TAGS="${WANDB_TAGS:-model:llama32-3b-instruct,method:gxpo,k:${K},alpha:${REPOSITION_ALPHA},batch:256,minibatch:64,gpus:4,fsdp:4,experiment:gate-v6}"
 export WANDB_MODE="${WANDB_MODE:-online}"
-export GXPO_RUN_NAME="${GXPO_RUN_NAME:-qwen25_math_1p5b_gxpo_k${K}_a${REPOSITION_ALPHA}_perm_b256_mb64_fsdp2_fp32_liger_v6_20260826}"
+export GXPO_RUN_NAME="${GXPO_RUN_NAME:-llama32_3b_instruct_gxpo_gate_v6_k${K}_a${REPOSITION_ALPHA}_b256_mb64_g4_fsdp4_fp32_liger}"
 export GXPO_CONCISE_LOGS=1
 export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
 export ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-float32}"

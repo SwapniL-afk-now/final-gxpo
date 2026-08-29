@@ -18,7 +18,6 @@ Single Process Actor
 import itertools
 import os
 import time
-import weakref
 from typing import Iterable, Tuple
 
 # Power-throttle chunk size for full-model diagnostic norm waves (see
@@ -122,7 +121,7 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_power_guard_active_s = 0.0
         self._gxpo_power_guard_sleep_s = 0.0
         # Cache of the constant-per-outer-step reposition direction sum-of-squares
-        # consumed by _optimizer_state_metrics; keyed by a weakref to the pairs list.
+        # consumed by _optimizer_state_metrics; keyed by the identity of the current pairs list.
         self._reposition_dir_cache = None
         if self.config.get('use_gxpo', False) and actor_optimizer is not None:
             self.gxpo_state = GXPOState(
@@ -304,14 +303,14 @@ class DataParallelPPOActor(BasePPOActor):
         # The (post_reposition - pre_reposition) direction is constant across every
         # mini-batch of one SFPO slow phase (the caller builds one pairs list per
         # sfpo_update_actor and reuses it), so its sum-of-squares (stats[4]) is
-        # computed once per pairs list and cached. The cache holds a weakref only,
+        # computed once per pairs list and cached. The cache holds the list identity and references existing buffers; it is replaced each outer step,
         # so the caller's weight lists can still be freed. NOTE: stats[5] multiplies
         # the direction by the CURRENT exp_avg, which the optimizer updates on every
         # step, so it must be recomputed per call to stay bit-identical.
         cached_dir_sq = None
         if reposition_pairs is not None and self._reposition_dir_cache is not None:
-            pairs_ref, dir_sq = self._reposition_dir_cache
-            if pairs_ref() is reposition_pairs:
+            pairs_obj, dir_sq = self._reposition_dir_cache
+            if pairs_obj is reposition_pairs:
                 cached_dir_sq = dir_sq
 
         stats = None
@@ -350,7 +349,7 @@ class DataParallelPPOActor(BasePPOActor):
             if cached_dir_sq is not None:
                 stats[4] = cached_dir_sq
             else:
-                self._reposition_dir_cache = (weakref.ref(reposition_pairs), stats[4].clone())
+                self._reposition_dir_cache = (reposition_pairs, stats[4].clone())
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
         grad_norm = stats[0].sqrt().item()
