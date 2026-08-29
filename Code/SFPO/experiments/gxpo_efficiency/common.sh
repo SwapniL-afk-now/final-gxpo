@@ -55,6 +55,9 @@ GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
 GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-3}"
 GXPO_FALLBACK_MODE="${GXPO_FALLBACK_MODE:-permanent}"
 GXPO_FALLBACK_WINDOW="${GXPO_FALLBACK_WINDOW:-10}"
+GXPO_ACTOR_DUTY_CYCLE="${GXPO_ACTOR_DUTY_CYCLE:-0}"
+GXPO_DIAG_FREQ="${GXPO_DIAG_FREQ:-10}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 SFPO_ZSCORE_THRESHOLD="${SFPO_ZSCORE_THRESHOLD:-2.5}"
 SFPO_TRIGGER_PATIENCE="${SFPO_TRIGGER_PATIENCE:-3}"
 SFPO_RESET_ENTROPY_AFTER_WARMUP="${SFPO_RESET_ENTROPY_AFTER_WARMUP:-True}"
@@ -152,6 +155,33 @@ if [[ -n "${GPU_IDS:-}" ]]; then
   export CUDA_VISIBLE_DEVICES="$GPU_IDS"
 fi
 
+# A duty-cycle sleep reduces sustained load but cannot guarantee an
+# instantaneous board-power ceiling. For power-sensitive GXPO launches, fail
+# closed unless the physical NVIDIA power limit is already at or below the
+# configured maximum. Applying the limit requires an administrator.
+if [[ "${GXPO_ENFORCE_POWER_LIMIT:-False}" == "True" || "${GXPO_ENFORCE_POWER_LIMIT:-0}" == "1" ]]; then
+  GXPO_MAX_POWER_W="${GXPO_MAX_POWER_W:-500}"
+  if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "GXPO power safety: nvidia-smi is unavailable; refusing to launch." >&2
+    exit 2
+  fi
+  gxpo_power_limits="$(nvidia-smi --id="$GPU_IDS" \
+    --query-gpu=index,power.limit --format=csv,noheader,nounits 2>/dev/null)" || {
+    echo "GXPO power safety: unable to read power limits for GPUs $GPU_IDS; refusing to launch." >&2
+    exit 2
+  }
+  while IFS=',' read -r gxpo_gpu_id gxpo_power_limit; do
+    [[ -z "$gxpo_gpu_id" ]] && continue
+    if awk -v limit="$gxpo_power_limit" -v maximum="$GXPO_MAX_POWER_W" \
+      'BEGIN { exit !(limit+0 > maximum+0) }'; then
+      echo "GXPO power safety: GPU ${gxpo_gpu_id//[[:space:]]/} limit=${gxpo_power_limit}W exceeds ${GXPO_MAX_POWER_W}W; refusing to launch." >&2
+      echo "Ask an administrator to run: sudo nvidia-smi -i $GPU_IDS -pl $GXPO_MAX_POWER_W" >&2
+      exit 2
+    fi
+  done <<< "$gxpo_power_limits"
+  echo "GXPO power safety: physical GPU limits verified <= ${GXPO_MAX_POWER_W}W"
+fi
+
 TRAIN_FILES="['$DAPO_TRAIN','$LIGHTEVAL_TRAIN']"
 VAL_FILES="['$MATH500','$AIME24','$AIME25','$AMC23','$MINERVA','$OLYMPIAD']"
 
@@ -226,11 +256,12 @@ case "$METHOD" in
       +actor_rollout_ref.actor.gxpo_fallback_window="$GXPO_FALLBACK_WINDOW"
       +actor_rollout_ref.actor.gxpo_trigger_granularity=outer
       +actor_rollout_ref.actor.gxpo_warmup_steps="$GXPO_WARMUP_STEPS"
-      +actor_rollout_ref.actor.gxpo_reset_entropy_after_warmup=True
+      +actor_rollout_ref.actor.gxpo_reset_entropy_after_warmup="$GXPO_RESET_ENTROPY_AFTER_WARMUP"
       +actor_rollout_ref.actor.gxpo_omega=0.1
       +actor_rollout_ref.actor.gxpo_shutoff_mode="$GXPO_SHUTOFF_MODE"
       +actor_rollout_ref.actor.gxpo_recompute_old_log_probs=False
-      +actor_rollout_ref.actor.gxpo_diag_freq=10
+      +actor_rollout_ref.actor.gxpo_diag_freq="$GXPO_DIAG_FREQ"
+      +actor_rollout_ref.actor.gxpo_actor_duty_cycle="$GXPO_ACTOR_DUTY_CYCLE"
       ${GXPO_TRIGGER_MIN_OBS:+\+actor_rollout_ref.actor.gxpo_trigger_min_obs="$GXPO_TRIGGER_MIN_OBS"}
       ${GXPO_MAX_ACTIVE_STEPS:+\+actor_rollout_ref.actor.gxpo_max_active_steps="$GXPO_MAX_ACTIVE_STEPS"}
     )
@@ -265,6 +296,8 @@ gxpo_max_active_steps=${GXPO_MAX_ACTIVE_STEPS:-0}
 gxpo_trigger_patience=$GXPO_TRIGGER_PATIENCE
 gxpo_fallback_mode=$GXPO_FALLBACK_MODE
 gxpo_fallback_window=$GXPO_FALLBACK_WINDOW
+gxpo_actor_duty_cycle=$GXPO_ACTOR_DUTY_CYCLE
+gxpo_diag_freq=$GXPO_DIAG_FREQ
 gxpo_trigger_granularity=outer
 validation_interval=5
 validation_decoding=greedy temperature=0 do_sample=false n=1

@@ -54,3 +54,12 @@ Code/SFPO/models/
 Code/SFPO/results/
 Code/SFPO/.gxpo_pydeps/
 !Code/SFPO/experiments/gxpo_efficiency/qwen1p5b_perf.env
+
+# Project-local runtime assets (keep outside version control).
+/.cache/
+/.cuda-toolkit/
+/.hf_home/
+/.python-dev/
+/.ray-*/
+/models/
+/results/

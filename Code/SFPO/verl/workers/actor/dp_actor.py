@@ -17,6 +17,7 @@ Single Process Actor
 
 import itertools
 import os
+import time
 import weakref
 from typing import Iterable, Tuple
 
@@ -110,6 +111,16 @@ class DataParallelPPOActor(BasePPOActor):
         # GXPO: shutoff-gate state + lazily allocated per-parameter buffers
         self.gxpo_state = None
         self._gxpo_bufs = None
+        # Optional duty-cycle guard for the high-power GXPO actor path. This
+        # is scheduling only: it never changes the loss, gradients, clipping,
+        # optimizer, or GXPO reposition math.
+        raw_duty_cycle = self.config.get(
+            'gxpo_actor_duty_cycle', os.environ.get('GXPO_ACTOR_DUTY_CYCLE', '0'))
+        self._gxpo_actor_duty_cycle = float(raw_duty_cycle or 0.0)
+        if not 0.0 <= self._gxpo_actor_duty_cycle <= 1.0:
+            raise ValueError('gxpo_actor_duty_cycle must be in [0, 1]')
+        self._gxpo_power_guard_active_s = 0.0
+        self._gxpo_power_guard_sleep_s = 0.0
         # Cache of the constant-per-outer-step reposition direction sum-of-squares
         # consumed by _optimizer_state_metrics; keyed by a weakref to the pairs list.
         self._reposition_dir_cache = None
@@ -250,6 +261,31 @@ class DataParallelPPOActor(BasePPOActor):
         grad_norm = self._clip_grads()
         self.actor_optimizer.step()
         return grad_norm
+
+    def _gxpo_power_guard(self, phase_start: float):
+        """Wait between high-power CUDA phases to enforce a duty cycle.
+
+        ``loss.backward`` and optimizer kernels are asynchronous from Python's
+        point of view. Synchronizing before measuring is intentional: without
+        it, the guard would sleep while CUDA was still executing and would not
+        flatten the board-power transient. A value of 0 disables the guard;
+        1.0 keeps the same synchronization/measurement path but inserts no
+        sleep. The guard is enabled only for an actor constructed with GXPO.
+        """
+        duty = self._gxpo_actor_duty_cycle
+        if self.gxpo_state is None or duty <= 0.0 or not torch.cuda.is_available():
+            return
+
+        torch.cuda.synchronize()
+        active_s = max(time.perf_counter() - phase_start, 0.0)
+        self._gxpo_power_guard_active_s += active_s
+        if duty >= 1.0:
+            return
+
+        sleep_s = active_s * (1.0 / duty - 1.0)
+        if sleep_s > 0.0:
+            time.sleep(sleep_s)
+            self._gxpo_power_guard_sleep_s += sleep_s
 
     def _optimizer_state_metrics(self, reposition_pairs=None):
         """Return scalar AdamW-state diagnostics without changing optimizer state.
@@ -582,8 +618,10 @@ class DataParallelPPOActor(BasePPOActor):
                 loss = policy_loss / self.gradient_accumulation
             # Authoritative raw backward call site; one policy gradient can
             # contain many calls when gradients are accumulated.
+            backward_start = time.perf_counter()
             loss.backward()
             self.raw_backward_calls += 1
+            self._gxpo_power_guard(backward_start)
 
             if collect_metrics:
                 # GPU-scalar accumulation with a single deferred D2H sync per
@@ -727,7 +765,9 @@ class DataParallelPPOActor(BasePPOActor):
         def standard_step(fallback_triggered=False):
             metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
                                                non_tensor_select_keys)
+            step_start = time.perf_counter()
             grad_norm = self._optimizer_step()
+            self._gxpo_power_guard(step_start)
             append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
             append_to_dict(metrics, self._gxpo_default_metrics(enabled=0.0))
             append_to_dict(metrics, {'actor/gxpo_fallback_triggered': float(fallback_triggered)})
@@ -761,10 +801,14 @@ class DataParallelPPOActor(BasePPOActor):
                                  non_tensor_select_keys, collect_metrics=skip_corrective)
         # Capture raw gradients for the retention ratio; clip only the optimizer step.
         self._gxpo_capture_grads(g0_bufs)
+        step_start = time.perf_counter()
         gn0 = self._clip_grads().detach().item()
-        if not (gn0 == gn0 and abs(gn0) != float('inf')) or gn0 <= 1e-8:
+        valid_gn0 = (gn0 == gn0 and abs(gn0) != float('inf') and gn0 > 1e-8)
+        if valid_gn0:
+            self.actor_optimizer.step()
+        self._gxpo_power_guard(step_start)
+        if not valid_gn0:
             return fallback()
-        self.actor_optimizer.step()
 
         # Pass 2: g1 at theta_{t,1}
         self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
@@ -772,10 +816,14 @@ class DataParallelPPOActor(BasePPOActor):
                                  collect_metrics=False)
         # Capture raw gradients before clipping, matching g0.
         self._gxpo_capture_grads(g1_bufs)
+        step_start = time.perf_counter()
         gn1 = self._clip_grads().detach().item()
-        if not (gn1 == gn1 and abs(gn1) != float('inf')):
+        valid_gn1 = (gn1 == gn1 and abs(gn1) != float('inf'))
+        if valid_gn1:
+            self.actor_optimizer.step()
+        self._gxpo_power_guard(step_start)
+        if not valid_gn1:
             return fallback()
-        self.actor_optimizer.step()
 
         # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
         device = theta0[0].device
@@ -790,6 +838,7 @@ class DataParallelPPOActor(BasePPOActor):
         param_sq = torch.zeros(1, dtype=torch.float32, device=device)
         do_diag = self._gxpo_diag_freq > 0 and (step_idx % self._gxpo_diag_freq == 0)
 
+        diagnostic_start = time.perf_counter()
         with torch.no_grad():
             # Batched diagnostic reductions: one foreach kernel group replaces the old
             # per-parameter square/cast/sum chains and their full-model temporaries.
@@ -840,6 +889,7 @@ class DataParallelPPOActor(BasePPOActor):
                 dispK = disp2.mul_(scale)  # disp2 buffer becomes dispK
                 stats[4] += dispK.square().sum()
                 p.data.copy_(dispK.mul_(alpha).add_(t0))
+        self._gxpo_power_guard(diagnostic_start)
 
         # Pass 3: slow correction at theta_tilde. Skipped for the no-corrective ablation, where the
         # reposition above IS the update (params already sit at theta_tilde, nothing more to do).
@@ -863,10 +913,14 @@ class DataParallelPPOActor(BasePPOActor):
                     g0f = g0b.float()
                     gslow_stats[0] += gradf.square().sum()
                     gslow_stats[1] += (gradf * g0f).sum()
+            step_start = time.perf_counter()
             gn_slow = self._clip_grads().detach().item()
-            if not (gn_slow == gn_slow and abs(gn_slow) != float('inf')):
+            valid_gn_slow = (gn_slow == gn_slow and abs(gn_slow) != float('inf'))
+            if valid_gn_slow:
+                self.actor_optimizer.step()
+            self._gxpo_power_guard(step_start)
+            if not valid_gn_slow:
                 return fallback()
-            self.actor_optimizer.step()
 
         # single global reduction so every rank takes the identical gate decision
         if torch.distributed.is_initialized():
@@ -972,6 +1026,8 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
         bp_start = self.cumulative_bp
         raw_backward_start = self.raw_backward_calls
+        self._gxpo_power_guard_active_s = 0.0
+        self._gxpo_power_guard_sleep_s = 0.0
 
         # Guard against degenerate batches (e.g. a format-parse collapse: most rollouts get
         # reward 0 because they failed to parse, not because the problem was hard). Such a batch
@@ -1059,6 +1115,9 @@ class DataParallelPPOActor(BasePPOActor):
         metrics['actor/cumulative_policy_grad_evals'] = self.cumulative_bp
         metrics['actor/raw_backward_calls_step'] = self.raw_backward_calls - raw_backward_start
         metrics['actor/cumulative_raw_backward_calls'] = self.raw_backward_calls
+        metrics['actor/gxpo_power_guard_duty_cycle'] = self._gxpo_actor_duty_cycle
+        metrics['actor/gxpo_power_guard_active_s'] = self._gxpo_power_guard_active_s
+        metrics['actor/gxpo_power_guard_sleep_s'] = self._gxpo_power_guard_sleep_s
         enabled_values = metrics.get('actor/gxpo_enabled', 0.0)
         if isinstance(enabled_values, list):
             enabled_values = sum(enabled_values) / len(enabled_values) if enabled_values else 0.0

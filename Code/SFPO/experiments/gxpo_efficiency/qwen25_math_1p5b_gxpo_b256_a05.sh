@@ -111,13 +111,16 @@ export GXPO_TAU="${GXPO_TAU:-2.0}"
 export GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-1}"
 export GXPO_FALLBACK_MODE="${GXPO_FALLBACK_MODE:-permanent}"
 export GXPO_WARMUP_STEPS="${GXPO_WARMUP_STEPS:-0}"
+export GXPO_RESET_ENTROPY_AFTER_WARMUP="${GXPO_RESET_ENTROPY_AFTER_WARMUP:-False}"
 export GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
 export LOG_PROB_MICRO_BATCH_SIZE="${LOG_PROB_MICRO_BATCH_SIZE:-8}"
 export USE_LIGER="${USE_LIGER:-True}"
 export ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
-# 32768 diverged on 2026-08-25 (entropy blowup); 24576 matches the healthy
-# v5/v6 runs -- do not raise again without an A/B check.
+# Use a larger actor-update token window so FSDP workers can keep more of the
+# available GPU memory occupied and process each PPO minibatch in fewer chunks.
+# This is a workload cap, not a fixed allocation: actual usage still depends
+# on sequence lengths and gradient-checkpointing.
 export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}"
 # verl sends validation to vLLM as one logical dataset batch; numeric
 # data.val_batch_size is deprecated and only produces a misleading warning.
@@ -133,6 +136,17 @@ export GXPO_CONCISE_LOGS=1
 export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
 export ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-float32}"
 
+# Power-safe GXPO actor profile. The duty cycle is scheduling only; it keeps
+# the high-power backward/optimizer phases from running continuously. Set
+# GXPO_ACTOR_DUTY_CYCLE=0 to disable for an explicit unthrottled comparison.
+export GXPO_ACTOR_DUTY_CYCLE="${GXPO_ACTOR_DUTY_CYCLE:-0.70}"
+export GXPO_DIAG_FREQ="${GXPO_DIAG_FREQ:-0}"
+export GXPO_NORM_CHUNK="${GXPO_NORM_CHUNK:-8}"
+export SFPO_FOREACH_CHUNK="${SFPO_FOREACH_CHUNK:-8}"
+export GXPO_GPU_TELEMETRY_INTERVAL="${GXPO_GPU_TELEMETRY_INTERVAL:-1}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export GXPO_ENFORCE_POWER_LIMIT="${GXPO_ENFORCE_POWER_LIMIT:-True}"
+
 # A 256-prompt batch with rollout.n=8 creates 2048 responses, split evenly
 # across the two rollout ranks. Match the per-rank sequence cap to that share
 # so vLLM keeps enough KV-cache blocks for active generations without admitting
@@ -141,8 +155,8 @@ export ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-float32}"
 # batching peaks reduce transient board draw during rollout bursts.
 # Flattened-load mitigation for the GPU-3 power/bus-drop issue: smaller vLLM
 # batching peaks reduce transient board draw during rollout bursts.
-export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-512}"
-export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-65536}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-1024}"
+export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-98304}"
 # Host-RAM ceiling (~80GB target): cap the Ray shared-memory object store
 # instead of Ray's default reservation (~30% of physical RAM).
 export RAY_OBJECT_STORE_MEMORY_GB="${RAY_OBJECT_STORE_MEMORY_GB:-16}"
