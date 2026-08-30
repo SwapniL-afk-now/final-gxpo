@@ -1909,6 +1909,7 @@ class RayPPOTrainer(object):
                         float(self.gxpo_entropy_container[-1])
                         if self.gxpo_entropy_container else 0.0
                     )
+                    gxpo_entropy_gate_enabled = False
                     if actor_cfg.get('use_gxpo', False):
                         gxpo_warmup_steps = int(actor_cfg.get('gxpo_warmup_steps', 0))
                         gxpo_trigger_enabled = self.global_steps > gxpo_warmup_steps
@@ -1928,6 +1929,11 @@ class RayPPOTrainer(object):
                         actor_cfg.get('gxpo_fallback_mode', 'permanent')).lower()
                     gxpo_fallback_window = max(
                         1, int(actor_cfg.get('gxpo_fallback_window', 10)))
+                    # A gradient/cosine configuration owns its trigger decision in
+                    # GXPOState. Do not also run the legacy trainer entropy gate,
+                    # otherwise two unrelated signals can shut off the same run.
+                    gxpo_entropy_gate_enabled = (
+                        actor_cfg.get('gxpo_trigger_signal', 'entropy') == 'entropy')
                     # The previous trainer path permanently set stop_GXPO after
                     # one trigger, bypassing GXPOState's temporary fallback mode.
                     # Re-arm only after the configured GRPO fallback window; keep
@@ -1945,7 +1951,7 @@ class RayPPOTrainer(object):
                     gxpo_baseline_ready = (
                         gxpo_zscore_w > 0 and
                         len(self.gxpo_entropy_container) >= gxpo_zscore_w)
-                    if (gxpo_trigger_enabled and gxpo_baseline_ready and
+                    if (gxpo_entropy_gate_enabled and gxpo_trigger_enabled and gxpo_baseline_ready and
                             not self.stop_GXPO):
                         # SFPO ordering: score the latest completed outer
                         # batch against the preceding rolling window.
@@ -2017,19 +2023,24 @@ class RayPPOTrainer(object):
                         actor_output_metrics = reduce_metrics(actor_scalar_metrics)
                         actor_output_metrics.update(actor_nested_metrics)
                         if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
-                            actor_output_metrics.update({
-                                'actor/gxpo_trigger_z': gxpo_trigger_z,
-                                'actor/gxpo_trigger_stat': gxpo_trigger_stat,
-                                'actor/gxpo_trigger_streak': float(self.gxpo_trigger_streak),
-                                'actor/gxpo_trigger_candidate': float(gxpo_trigger_candidate),
-                                'actor/gxpo_trigger_warmup_active': float(
-                                    not (gxpo_trigger_enabled and gxpo_baseline_ready)),
-                                'actor/gxpo_entropy_window_ready': float(gxpo_baseline_ready),
-                                'actor/gxpo_trigger_patience': float(
-                                    max(1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
-                                ),
-                            })
-                            if self.stop_GXPO:
+                            # Preserve actor-side cosine-gate metrics for
+                            # signal=grad. The trainer-side values below are
+                            # entropy-gate diagnostics and must not overwrite
+                            # the actor's actual disagreement z-score/statistic.
+                            if gxpo_entropy_gate_enabled:
+                                actor_output_metrics.update({
+                                    'actor/gxpo_trigger_z': gxpo_trigger_z,
+                                    'actor/gxpo_trigger_stat': gxpo_trigger_stat,
+                                    'actor/gxpo_trigger_streak': float(self.gxpo_trigger_streak),
+                                    'actor/gxpo_trigger_candidate': float(gxpo_trigger_candidate),
+                                    'actor/gxpo_trigger_warmup_active': float(
+                                        not (gxpo_trigger_enabled and gxpo_baseline_ready)),
+                                    'actor/gxpo_entropy_window_ready': float(gxpo_baseline_ready),
+                                    'actor/gxpo_trigger_patience': float(
+                                        max(1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
+                                    ),
+                                })
+                            if self.stop_GXPO and gxpo_entropy_gate_enabled:
                                 actor_output_metrics.update({
                                     'actor/gxpo_fallback_triggered': 1.0,
                                     'actor/gxpo_fallback_step': float(

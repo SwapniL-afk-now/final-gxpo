@@ -68,6 +68,12 @@ VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 LR="${LR:-1e-6}"
+OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
+MUON_MOMENTUM="${MUON_MOMENTUM:-0.95}"
+MUON_NS_STEPS="${MUON_NS_STEPS:-5}"
+MUON_NESTEROV="${MUON_NESTEROV:-True}"
+MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-1e-2}"
+MUON_DISTRIBUTED_BACKEND="${MUON_DISTRIBUTED_BACKEND:-gather_scatter}"
 USE_LIGER="${USE_LIGER:-True}"
 OPTIM_FUSED="${OPTIM_FUSED:-False}"
 ENABLE_GRADIENT_CHECKPOINTING="${ENABLE_GRADIENT_CHECKPOINTING:-True}"
@@ -131,6 +137,58 @@ export VLLM_SLEEP_LEVEL="${VLLM_SLEEP_LEVEL:-2}"
 mkdir -p "$VLLM_CACHE_ROOT" "$VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"
 
 export GXPO_EFFICIENCY_RUN=1
+python - "$RUN_DIR/run_manifest.json" "$MODEL_ID" "$MODEL_ALIAS" "$METHOD" \
+  "$OPTIMIZER_NAME" "$TRAIN_SEED" "$TRAIN_BATCH_SIZE" "$PPO_MINI_BATCH_SIZE" \
+  "$K" "$REPOSITION_ALPHA" "$MAX_STEPS" "$LR" "$GPU_IDS" "$FSDP_SIZE" \
+  "$DAPO_TRAIN" "$LIGHTEVAL_TRAIN" "$MATH500" "$AIME24" "$AIME25" "$AMC23" \
+  "$MINERVA" "$OLYMPIAD" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+(
+    manifest_path, model_id, model_alias, method, optimizer, seed, batch_size,
+    minibatch_size, k, alpha, max_steps, learning_rate, gpu_ids, fsdp_size,
+    dapo_train, lighteval_train, math500, aime24, aime25, amc23, minerva,
+    olympiad,
+) = sys.argv[1:]
+
+try:
+    git_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=Path.cwd()
+    ).decode().strip()
+except Exception:
+    git_commit = None
+
+manifest = {
+    "schema_version": 1,
+    "kind": "rl_training",
+    "model_alias": model_alias,
+    "model": model_id,
+    "method": method,
+    "optimizer": optimizer,
+    "seed": int(seed),
+    "train_batch_size": int(batch_size),
+    "ppo_minibatch_size": int(minibatch_size),
+    "gxpo": {"k": int(k), "alpha": float(alpha)},
+    "max_steps": int(max_steps),
+    "learning_rate": float(learning_rate),
+    "gpu_ids": gpu_ids,
+    "fsdp_size": int(fsdp_size),
+    "train_files": [dapo_train, lighteval_train],
+    "benchmark_files": {
+        "math500": math500,
+        "aime24": aime24,
+        "aime25": aime25,
+        "amc23": amc23,
+        "minerva": minerva,
+        "olympiadbench": olympiad,
+    },
+    "git_commit": git_commit,
+}
+Path(manifest_path).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+PY
 export GXPO_RUN_NAME="$RUN_NAME"
 export GXPO_MODEL_ALIAS="$MODEL_ALIAS"
 export TRAIN_SEED
@@ -186,6 +244,24 @@ TRAIN_FILES="['$DAPO_TRAIN','$LIGHTEVAL_TRAIN']"
 VAL_FILES="['$MATH500','$AIME24','$AIME25','$AMC23','$MINERVA','$OLYMPIAD']"
 
 METHOD_FLAGS=()
+OPTIMIZER_FLAGS=()
+case "${OPTIMIZER_NAME,,}" in
+  adamw)
+    ;;
+  muon)
+    OPTIMIZER_FLAGS+=(
+      +actor_rollout_ref.actor.optim.muon_momentum="$MUON_MOMENTUM"
+      +actor_rollout_ref.actor.optim.muon_ns_steps="$MUON_NS_STEPS"
+      +actor_rollout_ref.actor.optim.muon_nesterov="$MUON_NESTEROV"
+      +actor_rollout_ref.actor.optim.weight_decay="$MUON_WEIGHT_DECAY"
+      +actor_rollout_ref.actor.optim.muon_distributed_backend="$MUON_DISTRIBUTED_BACKEND"
+    )
+    ;;
+  *)
+    echo "Unsupported OPTIMIZER_NAME=$OPTIMIZER_NAME (expected adamw or muon)" >&2
+    exit 2
+    ;;
+esac
 # Gate v2 (opt-in; see .audit/gxpo_algorithm_findings.md):
 #   GXPO_TRIGGER_ROBUST=1   -> median/MAD z-score (resists early-warmup transient bursts)
 #   GXPO_TRIGGER_MIN_OBS=N  -> gate cannot trip until N scored post-warmup observations
@@ -279,6 +355,12 @@ train_seed=$TRAIN_SEED
 train_batch_size=$TRAIN_BATCH_SIZE
 rollout_n=$ROLLOUT_N
 learning_rate=$LR
+optimizer=$OPTIMIZER_NAME
+muon_momentum=$MUON_MOMENTUM
+muon_ns_steps=$MUON_NS_STEPS
+muon_nesterov=$MUON_NESTEROV
+muon_weight_decay=$MUON_WEIGHT_DECAY
+muon_distributed_backend=$MUON_DISTRIBUTED_BACKEND
 max_steps=$MAX_STEPS
 save_freq=$SAVE_FREQ
 sfpo_warmup_steps=$SFPO_WARMUP_STEPS
@@ -328,7 +410,8 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.model.attn_implementation="$ATTN_IMPL" \
   +actor_rollout_ref.model.use_liger="$USE_LIGER" \
   actor_rollout_ref.actor.optim.lr="$LR" \
-  +actor_rollout_ref.actor.optim.name=adamw \
+  +actor_rollout_ref.actor.optim.name="$OPTIMIZER_NAME" \
+  "${OPTIMIZER_FLAGS[@]}" \
   +actor_rollout_ref.actor.optim.fused="$OPTIM_FUSED" \
   actor_rollout_ref.actor.use_torch_compile="$USE_TORCH_COMPILE" \
   +actor_rollout_ref.actor.data_loader_seed="$TRAIN_SEED" \

@@ -92,6 +92,7 @@ class DataParallelPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self._last_optimizer_metrics = {}
         self.use_remove_padding = self.config.get('use_remove_padding', False)
         print(f'Actor use_remove_padding={self.use_remove_padding}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
@@ -257,9 +258,16 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         return grad_norm
 
-    def _optimizer_step(self):
-        grad_norm = self._clip_grads()
+    def _optimizer_step(self, already_clipped=False):
+        """Run one actor optimizer update and capture backend diagnostics.
+
+        GXPO/SFPO may clip a probe/correction gradient themselves; those paths
+        pass ``already_clipped=True`` so FSDP clipping is never applied twice.
+        """
+        grad_norm = None if already_clipped else self._clip_grads()
         self.actor_optimizer.step()
+        diagnostics = getattr(self.actor_optimizer, 'diagnostics', None)
+        self._last_optimizer_metrics = diagnostics() if diagnostics is not None else {}
         return grad_norm
 
     def _gxpo_power_guard(self, phase_start: float):
@@ -665,11 +673,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
+                metrics.update(self._last_optimizer_metrics)
         metrics['actor/cumulative_bp'] = self.cumulative_bp
         metrics['actor/policy_grad_evals_step'] = self.cumulative_bp - bp_start
         metrics['actor/cumulative_policy_grad_evals'] = self.cumulative_bp
         metrics['actor/raw_backward_calls_step'] = self.raw_backward_calls - raw_backward_start
         metrics['actor/cumulative_raw_backward_calls'] = self.raw_backward_calls
+        metrics.update(self._last_optimizer_metrics)
         return metrics
 
     # ------------------------------------------------------------------
@@ -805,7 +815,7 @@ class DataParallelPPOActor(BasePPOActor):
         gn0 = self._clip_grads().detach().item()
         valid_gn0 = (gn0 == gn0 and abs(gn0) != float('inf') and gn0 > 1e-8)
         if valid_gn0:
-            self.actor_optimizer.step()
+            self._optimizer_step(already_clipped=True)
         self._gxpo_power_guard(step_start)
         if not valid_gn0:
             return fallback()
@@ -820,7 +830,7 @@ class DataParallelPPOActor(BasePPOActor):
         gn1 = self._clip_grads().detach().item()
         valid_gn1 = (gn1 == gn1 and abs(gn1) != float('inf'))
         if valid_gn1:
-            self.actor_optimizer.step()
+            self._optimizer_step(already_clipped=True)
         self._gxpo_power_guard(step_start)
         if not valid_gn1:
             return fallback()
@@ -917,7 +927,7 @@ class DataParallelPPOActor(BasePPOActor):
             gn_slow = self._clip_grads().detach().item()
             valid_gn_slow = (gn_slow == gn_slow and abs(gn_slow) != float('inf'))
             if valid_gn_slow:
-                self.actor_optimizer.step()
+                self._optimizer_step(already_clipped=True)
             self._gxpo_power_guard(step_start)
             if not valid_gn_slow:
                 return fallback()
@@ -1137,4 +1147,5 @@ class DataParallelPPOActor(BasePPOActor):
                 and self._gxpo_bufs is not None):
             self._gxpo_release_buffers()
             metrics['actor/gxpo_budget_buffers_released'] = 1.0
+        metrics.update(self._last_optimizer_metrics)
         return metrics

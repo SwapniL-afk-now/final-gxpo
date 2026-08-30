@@ -25,6 +25,7 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
 import logging
 import re
+import time
 from contextlib import nullcontext
 import torch
 import torch.distributed
@@ -47,6 +48,7 @@ from torch.distributed.device_mesh import DeviceMesh
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.debug import log_gpu_memory_usage
+from verl.trainer.sft_utils import resolve_total_training_steps
 from verl.utils.attention import resolve_attention_implementation
 from peft import LoraConfig, TaskType, get_peft_model
 
@@ -107,6 +109,9 @@ class FSDPSFTTrainer(object):
 
         # GXPO-style update on the supervised objective: shutoff gate + lazily allocated
         # per-parameter buffers. Absent `optim.use_gxpo` keeps the plain 1-pass SFT path.
+        self._backward_calls = 0
+        self._cumulative_train_time = 0.0
+        self._cumulative_tokens = 0
         self.gxpo_state = None
         self._gxpo_bufs = None
         if self.config.optim.get('use_gxpo', False):
@@ -296,7 +301,11 @@ class FSDPSFTTrainer(object):
         log_gpu_memory_usage('After initialize optimizer', logger=logger)
 
         self.steps_per_epoch = len(self.train_dataloader)
-        self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
+        self.total_steps = resolve_total_training_steps(
+            self.steps_per_epoch,
+            self.config.trainer.total_epochs,
+            self.config.trainer.get('total_training_steps', None),
+        )
 
         if self.device_mesh.get_rank() == 0:
             print(
@@ -404,6 +413,7 @@ class FSDPSFTTrainer(object):
 
                 if do_backward:
                     loss.backward()
+                    self._backward_calls += 1
                 return loss
 
     def _accumulate_and_clip(self, batch: TensorDict, capture_bufs=None):
@@ -436,6 +446,9 @@ class FSDPSFTTrainer(object):
 
     def training_step(self, batch: TensorDict):
         self.fsdp_model.train()
+        step_start = time.perf_counter()
+        backward_start = self._backward_calls
+        token_count = int(batch['loss_mask'].sum().item())
 
         log_gpu_memory_usage('Before optimizer zero_grad', logger=logger)
 
@@ -457,6 +470,22 @@ class FSDPSFTTrainer(object):
 
         step_loss = torch.tensor(step_loss).cuda()
         torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+        token_count_tensor = torch.tensor(float(token_count), device=step_loss.device)
+        torch.distributed.all_reduce(token_count_tensor, op=torch.distributed.ReduceOp.SUM)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - step_start
+        self._cumulative_train_time += elapsed
+        self._cumulative_tokens += int(token_count_tensor.item())
+        backward_calls = self._backward_calls - backward_start
+        metrics.update({
+            'eff/step_time_s': elapsed,
+            'eff/cumulative_train_time_s': self._cumulative_train_time,
+            'eff/tokens_step': int(token_count_tensor.item()),
+            'eff/cumulative_tokens': self._cumulative_tokens,
+            'eff/backward_calls_step': backward_calls,
+            'eff/cumulative_backward_calls': self._backward_calls,
+        })
         return {'train/loss': step_loss.detach().item(), 'train/lr(1e-3)': lr * 1e3, **metrics}
 
     def _gxpo_capture_grads(self, bufs):
@@ -651,14 +680,9 @@ class FSDPSFTTrainer(object):
                                 config=OmegaConf.to_container(self.config, resolve=True))
 
         global_step = 0
-        # compute the total training steps.
-        # the total training steps in SFT is mainly for early exit
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
-        self.total_training_steps = total_training_steps
+        # The scheduler was built with this exact horizon. Do not recompute it
+        # from the uncapped epoch budget here.
+        self.total_training_steps = self.total_steps
         print(f'Total training steps: {self.total_training_steps}')
 
         # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.

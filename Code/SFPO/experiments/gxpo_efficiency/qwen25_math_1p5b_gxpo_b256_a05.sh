@@ -12,16 +12,16 @@ if [[ -f "$GXPO_LOCAL_ROOT/.env" ]]; then
 fi
 
 # Keep every artifact, cache, checkpoint, model, dataset, and temporary file under this checkout.
-export GXPO_DATA_ROOT="$GXPO_LOCAL_ROOT/Code/SFPO/data"
-export GXPO_RESULTS_ROOT="$GXPO_LOCAL_ROOT/results/gxpo_efficiency"
-export MODEL_QWEN25_MATH_1P5B="$GXPO_LOCAL_ROOT/models/Qwen2.5-Math-1.5B-Instruct"
+export GXPO_DATA_ROOT="${GXPO_DATA_ROOT:-$GXPO_LOCAL_ROOT/Code/SFPO/data}"
+export GXPO_RESULTS_ROOT="${GXPO_RESULTS_ROOT:-$GXPO_LOCAL_ROOT/results/gxpo_efficiency}"
+export MODEL_QWEN25_MATH_1P5B="${MODEL_QWEN25_MATH_1P5B:-$GXPO_LOCAL_ROOT/models/Qwen2.5-Math-1.5B-Instruct}"
 
-# This entrypoint is a fixed two-GPU experiment.  Keep the physical device
-# mapping stable even when the parent shell was previously using another pair.
-export GPU_IDS=0,1
-export CUDA_VISIBLE_DEVICES=0,1
-export GPU_COUNT=2
-export FSDP_SIZE=2
+# Default to the historical two-GPU experiment, while preserving explicit
+# device/FSDP values supplied by a parent experiment entrypoint.
+export GPU_IDS="${GPU_IDS:-0,1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$GPU_IDS}"
+export GPU_COUNT="${GPU_COUNT:-2}"
+export FSDP_SIZE="${FSDP_SIZE:-2}"
 
 # Use the repository's verified, preprocessed assets.  The shared launcher
 # combines both training files and all six validation benchmarks below.
@@ -129,9 +129,9 @@ export SAVE_FREQ="${SAVE_FREQ:-20}"
 export MAX_STEPS="${MAX_STEPS:-400}"
 export WANDB_PROJECT="${WANDB_PROJECT:-gxpo-efficiency-final}"
 export WANDB_GROUP="${WANDB_GROUP:-qwen25-math-1p5b-b256}"
-export WANDB_TAGS="${WANDB_TAGS:-model:qwen25-math-1p5b,method:gxpo,k:${K},alpha:${REPOSITION_ALPHA},batch:256,minibatch:64,experiment:custom}"
+export WANDB_TAGS="${WANDB_TAGS:-model:qwen25-math-1p5b,method:gxpo,k:${K},alpha:${REPOSITION_ALPHA},batch:${TRAIN_BATCH_SIZE},minibatch:${PPO_MINI_BATCH_SIZE},optimizer:${OPTIMIZER_NAME:-adamw},experiment:custom}"
 export WANDB_MODE="${WANDB_MODE:-online}"
-export GXPO_RUN_NAME="${GXPO_RUN_NAME:-qwen25_math_1p5b_gxpo_k${K}_a${REPOSITION_ALPHA}_perm_b256_mb64_fsdp2_fp32_liger_v6_20260826}"
+export GXPO_RUN_NAME="${GXPO_RUN_NAME:-qwen25_math_1p5b_gxpo_k${K}_a${REPOSITION_ALPHA}_perm_b${TRAIN_BATCH_SIZE}_mb${PPO_MINI_BATCH_SIZE}_${OPTIMIZER_NAME:-adamw}_fsdp${FSDP_SIZE}_fp32_liger_v6_20260826}"
 export GXPO_CONCISE_LOGS=1
 export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
 export ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-float32}"

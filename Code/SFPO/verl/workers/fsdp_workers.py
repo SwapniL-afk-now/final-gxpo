@@ -346,16 +346,15 @@ class ActorRolloutRefWorker(Worker):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
-        # Muon orthogonalizes 2-D weights, but FSDP's sharded parameter views are flattened
-        # to 1-D (torch _flat_param.py:_use_sharded_views) -- which would put the entire
-        # model in Muon's AdamW fallback branch and silently turn a "muon" run into AdamW.
-        # NO_SHARD + use_orig_params is the only combination that hands back original shapes.
+        # Muon uses the original FSDP parameter views to construct a validated
+        # shard registry. Distributed steps gather complete matrices inside the
+        # optimizer, so normal FULL_SHARD/HYBRID_SHARD remains enabled.
         use_muon = (role == 'actor' and optim_config is not None and
                     str(optim_config.get('name', 'adamw')).lower() == 'muon')
-        if use_muon:
-            assert self.world_size == 1, 'muon path requires single-GPU (NO_SHARD + use_orig_params)'
-            from torch.distributed.fsdp import ShardingStrategy
-            sharding_strategy = ShardingStrategy.NO_SHARD
+        if use_muon and (self._is_offload_param or self._is_offload_optimizer):
+            raise ValueError(
+                'distributed Muon requires actor param_offload=False and '
+                'optimizer_offload=False; reference-policy offload is still supported')
 
         # TODO: add transformer policy
         # We force reference policy to use CPUOffload to save memory.
@@ -381,7 +380,7 @@ class ActorRolloutRefWorker(Worker):
             from verl.utils.torch_functional import get_constant_schedule_with_warmup
             if use_muon:
                 from verl.workers.muon import build_muon
-                actor_optimizer = build_muon(actor_module_fsdp, optim_config)
+                actor_optimizer = build_muon(actor_module_fsdp, optim_config, fsdp_model=actor_module_fsdp)
             else:
                 optimizer_param_dtype = next(actor_module_fsdp.parameters()).dtype
                 if optimizer_param_dtype != torch.float32:

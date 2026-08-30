@@ -1,11 +1,14 @@
-data
 docker
 docs
+env
 examples
+experiments
 patches
 raw-data
 recipe
 scripts
+synthetic
 tests
+tools
 train-scripts
 verl
