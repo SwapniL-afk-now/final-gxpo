@@ -286,6 +286,34 @@ class DataParallelPPOActor(BasePPOActor):
             time.sleep(sleep_s)
             self._gxpo_power_guard_sleep_s += sleep_s
 
+    @staticmethod
+    def _all_ranks_flag(value: bool, device, reduce_op=None) -> bool:
+        """Return a rank-consistent boolean without changing the caller's branch order."""
+        flag = torch.tensor(1 if value else 0, dtype=torch.int32, device=device)
+        if torch.distributed.is_initialized():
+            if reduce_op is None:
+                reduce_op = torch.distributed.ReduceOp.MIN
+            torch.distributed.all_reduce(flag, op=reduce_op)
+        return bool(flag.item())
+
+    def _global_format_error_ratio(self, data: DataProto):
+        """Compute the format-error ratio over the full distributed batch.
+
+        Actor data is sharded before this method runs, so a local ratio can differ
+        across FSDP ranks. The fallback decision must use global counts and then
+        be consumed identically by every rank.
+        """
+        scores = data.batch['token_level_scores']
+        local_zero_count = (scores.sum(dim=-1) == 0).sum().to(dtype=torch.float32)
+        local_sample_count = torch.tensor(float(scores.shape[0]),
+                                           dtype=torch.float32,
+                                           device=scores.device)
+        counts = torch.stack((local_zero_count, local_sample_count))
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        ratio = counts[0] / counts[1].clamp_min(1.0)
+        return float(ratio.item()), int(counts[0].item()), int(counts[1].item())
+
     def _optimizer_state_metrics(self, reposition_pairs=None):
         """Return scalar AdamW-state diagnostics without changing optimizer state.
 
@@ -758,6 +786,7 @@ class DataParallelPPOActor(BasePPOActor):
         state = self.gxpo_state
         step_idx = state.step_count
         K, alpha, delta = state.K, state.alpha, state.delta
+        device = torch.device('cuda', torch.cuda.current_device())
         recompute_old = self.config.get('gxpo_recompute_old_log_probs', False)
         skip_corrective = self.config.get('gxpo_skip_corrective', False)
 
@@ -803,10 +832,11 @@ class DataParallelPPOActor(BasePPOActor):
         step_start = time.perf_counter()
         gn0 = self._clip_grads().detach().item()
         valid_gn0 = (gn0 == gn0 and abs(gn0) != float('inf') and gn0 > 1e-8)
-        if valid_gn0:
+        valid_gn0_global = self._all_ranks_flag(valid_gn0, device)
+        if valid_gn0_global:
             self.actor_optimizer.step()
         self._gxpo_power_guard(step_start)
-        if not valid_gn0:
+        if not valid_gn0_global:
             return fallback()
 
         # Pass 2: g1 at theta_{t,1}
@@ -818,10 +848,11 @@ class DataParallelPPOActor(BasePPOActor):
         step_start = time.perf_counter()
         gn1 = self._clip_grads().detach().item()
         valid_gn1 = (gn1 == gn1 and abs(gn1) != float('inf'))
-        if valid_gn1:
+        valid_gn1_global = self._all_ranks_flag(valid_gn1, device)
+        if valid_gn1_global:
             self.actor_optimizer.step()
         self._gxpo_power_guard(step_start)
-        if not valid_gn1:
+        if not valid_gn1_global:
             return fallback()
 
         # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
@@ -915,10 +946,11 @@ class DataParallelPPOActor(BasePPOActor):
             step_start = time.perf_counter()
             gn_slow = self._clip_grads().detach().item()
             valid_gn_slow = (gn_slow == gn_slow and abs(gn_slow) != float('inf'))
-            if valid_gn_slow:
+            valid_gn_slow_global = self._all_ranks_flag(valid_gn_slow, device)
+            if valid_gn_slow_global:
                 self.actor_optimizer.step()
             self._gxpo_power_guard(step_start)
-            if not valid_gn_slow:
+            if not valid_gn_slow_global:
                 return fallback()
 
         # single global reduction so every rank takes the identical gate decision
@@ -1028,17 +1060,30 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_power_guard_active_s = 0.0
         self._gxpo_power_guard_sleep_s = 0.0
 
-        # Guard against degenerate batches (e.g. a format-parse collapse: most rollouts get
-        # reward 0 because they failed to parse, not because the problem was hard). Such a batch
-        # has near-uniform reward -> near-zero-magnitude probe gradients g0/g1 -> a spurious,
-        # huge z-score that permanently trips the shutoff gate on a fluke rather than a real
-        # divergence. Skip extrapolation for this step only; the gate's rolling baseline is left untouched
-        # since a degenerate batch was never a valid observation of the gate's trigger statistic.
-        format_error_ratio = (data.batch['token_level_scores'].sum(-1) == 0).float().mean().item()
-        force_standard = (
-            format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5)
-            or trigger_stop
-        )
+        # The format-error guard is only an auxiliary safety check. It must not
+        # bypass GXPO's requested cold-start history: the first zscore_w outer
+        # batches are always GXPO observations. Actor data is sharded, so compute
+        # the ratio from global counts before making the branch decision.
+        format_error_ratio, format_error_count, format_sample_count = (
+            self._global_format_error_ratio(data))
+        history_ready = len(self.gxpo_state.trigger_history) >= self.gxpo_state.zscore_w
+        history_ready = self._all_ranks_flag(
+            history_ready, data.batch['token_level_scores'].device,
+            reduce_op=torch.distributed.ReduceOp.MIN)
+        trigger_stop = self._all_ranks_flag(
+            bool(trigger_stop), data.batch['token_level_scores'].device,
+            reduce_op=torch.distributed.ReduceOp.MAX)
+        format_guard_violation = (
+            history_ready and
+            format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5))
+        force_standard = bool(trigger_stop or format_guard_violation)
+        # Keep the enabled-state branch rank-consistent even if a prior numerical
+        # event or hard active-step budget changed one rank's local state first.
+        state_enabled = self.gxpo_state.is_enabled(self.gxpo_state.step_count)
+        state_enabled = self._all_ranks_flag(
+            state_enabled, data.batch['token_level_scores'].device,
+            reduce_op=torch.distributed.ReduceOp.MIN)
+        force_standard = bool(force_standard or not state_enabled)
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
         dataloader, has_multi_modal_inputs, select_keys, non_tensor_select_keys = self._make_minibatch_iterator(data)
@@ -1058,6 +1103,10 @@ class DataParallelPPOActor(BasePPOActor):
                 _merge_metrics(metrics, mb_metrics)
         if force_standard:
             metrics['actor/gxpo_format_skip'] = 1.0
+        metrics['actor/gxpo_format_error_ratio'] = format_error_ratio
+        metrics['actor/gxpo_format_error_count'] = float(format_error_count)
+        metrics['actor/gxpo_format_sample_count'] = float(format_sample_count)
+        metrics['actor/gxpo_history_ready'] = float(history_ready)
         if defer_trigger:
             # Match SFPO: reduce minibatch trigger statistics to exactly one
             # scalar for this outer batch, score it against the preceding

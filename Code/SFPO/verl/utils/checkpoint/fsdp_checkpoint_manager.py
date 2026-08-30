@@ -70,40 +70,42 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             f'[rank-{self.rank}]: Loading from {remote_model_path} and {remote_optim_path} and {remote_extra_state_path}'
         )
         local_model_path = copy_to_local(remote_model_path)
-        local_optim_path = copy_to_local(remote_optim_path)
-        local_extra_state_path = copy_to_local(remote_extra_state_path)
+        local_optim_path = copy_to_local(remote_optim_path) if os.path.exists(remote_optim_path) else None
+        local_extra_state_path = copy_to_local(remote_extra_state_path) if os.path.exists(remote_extra_state_path) else None
 
         model_state_dict = torch.load(local_model_path)
-        optimizer_state_dict = torch.load(local_optim_path)
-        extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
+        optimizer_state_dict = torch.load(local_optim_path) if local_optim_path is not None else None
+        extra_state_dict = (torch.load(local_extra_state_path, weights_only=False)
+                            if local_extra_state_path is not None else {})
 
         if del_local_after_load:
             try:
                 os.remove(local_model_path) if is_non_local(local_model_path) else None
-                os.remove(local_optim_path) if is_non_local(local_optim_path) else None
-                os.remove(local_extra_state_path) if is_non_local(local_extra_state_path) else None
+                os.remove(local_optim_path) if local_optim_path and is_non_local(local_optim_path) else None
+                os.remove(local_extra_state_path) if local_extra_state_path and is_non_local(local_extra_state_path) else None
             except Exception as e:
                 print(
                     f'[rank-{self.rank}]: remove local resume ckpt file after loading failed, exception {e} will be ignored'
                 )
 
-        lr_scheduler_state_dict = extra_state_dict['lr_scheduler']
+        lr_scheduler_state_dict = extra_state_dict.get('lr_scheduler')
 
         state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
         with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
             self.model.load_state_dict(model_state_dict)
-            if self.optimizer is not None:
+            if self.optimizer is not None and optimizer_state_dict is not None:
                 self.optimizer.load_state_dict(optimizer_state_dict)
         # recover random state
         if 'rng' in extra_state_dict:
             # 'rng' may not exist for backward compatibility
             self.load_rng_state(extra_state_dict['rng'])
 
-        if self.lr_scheduler is not None:
+        if self.lr_scheduler is not None and lr_scheduler_state_dict is not None:
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
 
-    def save_checkpoint(self, local_path: str, global_step: int, remove_previous_ckpt=False, *args, **kwargs):
+    def save_checkpoint(self, local_path: str, global_step: int, remove_previous_ckpt=False,
+                       save_optimizer=True, *args, **kwargs):
         # record the previous global step
         self.previous_global_step = global_step
 
@@ -121,11 +123,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             warnings.simplefilter("ignore")
             with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
                 model_state_dict = self.model.state_dict()
-                if self.optimizer is not None:
+                if save_optimizer and self.optimizer is not None:
                     optimizer_state_dict = self.optimizer.state_dict()
                 else:
                     optimizer_state_dict = None
-                if self.lr_scheduler is not None:
+                if save_optimizer and self.lr_scheduler is not None:
                     lr_scheduler_state_dict = self.lr_scheduler.state_dict()
                 else:
                     lr_scheduler_state_dict = None
@@ -133,17 +135,19 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 extra_state_dict = {
                     'lr_scheduler': lr_scheduler_state_dict,
                     'rng': self.get_rng_state(),
-                }
+                } if save_optimizer else None
                 model_path = os.path.join(local_path, f'model_world_size_{self.world_size}_rank_{self.rank}.pt')
                 optim_path = os.path.join(local_path, f'optim_world_size_{self.world_size}_rank_{self.rank}.pt')
                 extra_path = os.path.join(local_path, f'extra_state_world_size_{self.world_size}_rank_{self.rank}.pt')
 
                 print(f'[rank-{self.rank}]: Saving model to {os.path.abspath(model_path)}')
                 print(f'[rank-{self.rank}]: Saving checkpoint to {os.path.abspath(model_path)}')
-                print(f'[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}')
+                if save_optimizer:
+                    print(f'[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}')
                 torch.save(model_state_dict, model_path)
-                torch.save(optimizer_state_dict, optim_path)  # TODO: address optimizer is None
-                torch.save(extra_state_dict, extra_path)
+                if save_optimizer:
+                    torch.save(optimizer_state_dict, optim_path)  # TODO: address optimizer is None
+                    torch.save(extra_state_dict, extra_path)
 
         # wait for everyone to dump to local
         torch.distributed.barrier()

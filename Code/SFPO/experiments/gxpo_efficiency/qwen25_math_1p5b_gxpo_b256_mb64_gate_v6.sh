@@ -6,16 +6,12 @@
 # minibatch 64 | K=10 | alpha=0.3 | 4 GPUs (FSDP size 4)
 # driven by the Gate-v2 prediction-quality trigger.
 #
-# Gate configuration - MODERATE PROFILE (evidence: Code/SFPO/.audit/gxpo_algorithm_findings.md):
-#   signal    : grad (actor-side; disagreement = 1 - |cos(g0, g_slow)| from pre-clip grads)
-#   primary   : sustained level - rolling median of last 10 observations >= 0.15,
-#               held for 2 consecutive scored batches (zero false positives across
-#               all 7 production runs in replay; catches failing runs ~5x earlier
-#               than the entropy gate, which missed them entirely)
-#   backup    : robust median/MAD z-score path, used only if ABS_THRESHOLD=0
-#   age floor : no trip before 12 scored post-warmup batches (rides out the
-#               volatile window that caused all observed production trips)
-#   budget    : hard stop after 150 enabled steps regardless of gate (runtime cap)
+# Gate configuration: ordinary mean/std z-score of cosine disagreement.
+#   signal      : grad (actor-side; disagreement = 1 - |cos(g0, g_slow)|)
+#   shutoff     : cosine disagreement
+#   trigger     : z-score >= 2.0 for 2 consecutive outer batches
+#   window      : 30 observations
+#   hard budget : stop extrapolation after 150 enabled steps
 #
 # Usage:
 #   bash qwen25_math_1p5b_gxpo_b256_mb64_gate_v6.sh            # launch
@@ -51,24 +47,20 @@ fi
 export K=10
 export REPOSITION_ALPHA=0.3
 
-# Actor-side prediction-quality gate. GXPO_TRIGGER_SIGNAL must differ from
-# 'entropy' or common.sh warns and the trainer entropy gate keeps control.
+# Actor-side prediction-quality gate. The shared trainer-side entropy gate is
+# explicitly disabled for this grad-trigger run; cosine disagreement is the
+# only statistical fallback trigger.
 export GXPO_TRIGGER_SIGNAL="${GXPO_TRIGGER_SIGNAL:-grad}"
 export GXPO_SHUTOFF_MODE="${GXPO_SHUTOFF_MODE:-cosine}"
-# PRIMARY criterion (calibrated on 7 production runs, see .audit/gxpo_algorithm_findings.md):
-# trip when the rolling median of the last 10 disagreement observations stays >= 0.15
-# for 2 consecutive batches. Replay: healthy runs never trip; failing k10 trips @55;
-# diverged no-fallback trips @90; zero false positives.
-export GXPO_TRIGGER_ABS_THRESHOLD="${GXPO_TRIGGER_ABS_THRESHOLD:-0.15}"
-export GXPO_TRIGGER_SUSTAIN_W="${GXPO_TRIGGER_SUSTAIN_W:-10}"
-# SECONDARY z-score path (used only when ABS_THRESHOLD=0): robust median/MAD.
-export GXPO_TRIGGER_ROBUST="${GXPO_TRIGGER_ROBUST:-1}"
+export GXPO_TRIGGER_ABS_THRESHOLD="${GXPO_TRIGGER_ABS_THRESHOLD:-0}"
+export GXPO_TRIGGER_ROBUST="${GXPO_TRIGGER_ROBUST:-0}"
 export GXPO_TAU="${GXPO_TAU:-2.0}"
+export GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
+export GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-2}"
 export GXPO_TRIGGER_MIN_OBS="${GXPO_TRIGGER_MIN_OBS:-0}"
 export GXPO_MAX_ACTIVE_STEPS="${GXPO_MAX_ACTIVE_STEPS:-150}"
-export GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-2}"
-# Window length is inherited from common.sh (GXPO_ZSCORE_W=30).
-
+unset GXPO_TRIGGER_SUSTAIN_W
+# Ordinary mean/std z-score over the 30-observation window.
 # ------------------------------------------------------------- preflight -----
 MISSING=0
 MODEL_DIR="${MODEL_LLAMA32_3B:-/workspace/models/Llama-3.2-3B-Instruct}"
@@ -114,14 +106,14 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   dtype / liger      : ${ACTOR_MODEL_DTYPE:-float32} / ${USE_LIGER:-True}
   attention          : train ${ATTN_IMPL:-flash_attention_2} | vllm ${VLLM_ATTENTION_BACKEND:-FLASHINFER}
   --- gate v2 ---
-  trigger_signal     : $GXPO_TRIGGER_SIGNAL      (must not be 'entropy')
+  trigger_signal     : $GXPO_TRIGGER_SIGNAL
   shutoff_mode       : $GXPO_SHUTOFF_MODE        (disagreement = 1 - |cos(g0,g_slow)|)
-  abs threshold      : $GXPO_TRIGGER_ABS_THRESHOLD (rolling median of last ${GXPO_TRIGGER_SUSTAIN_W:-10})
-  tau / patience     : $GXPO_TAU / $GXPO_TRIGGER_PATIENCE (z-path backup when abs=0)
-  robust statistic   : $GXPO_TRIGGER_ROBUST      (median/MAD, sigma floor 10%)
-  min_obs age floor  : $GXPO_TRIGGER_MIN_OBS      (moderate profile)
+  abs threshold      : $GXPO_TRIGGER_ABS_THRESHOLD (disabled; z-score path)
+  tau / patience     : $GXPO_TAU / $GXPO_TRIGGER_PATIENCE
+  robust statistic   : $GXPO_TRIGGER_ROBUST (ordinary mean/std)
+  min_obs            : $GXPO_TRIGGER_MIN_OBS
   max_active_steps   : $GXPO_MAX_ACTIVE_STEPS    (hard runtime ceiling)
-  zscore window      : ${GXPO_ZSCORE_W:-30}
+  zscore window      : $GXPO_ZSCORE_W
   wandb project      : ${WANDB_PROJECT:-gxpo-efficiency-final}
 [dry-run] preflight OK - would launch now.
 EOT

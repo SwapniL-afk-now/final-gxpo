@@ -245,6 +245,8 @@ case "$METHOD" in
   gxpo)
     METHOD_FLAGS+=(
       +actor_rollout_ref.actor.use_gxpo=True
+      # GXPO owns its trigger; disable the legacy trainer-side SFPO entropy gate.
+      +actor_rollout_ref.actor.zscore_w=0
       +actor_rollout_ref.actor.gxpo_k="$K"
       +actor_rollout_ref.actor.gxpo_alpha="$REPOSITION_ALPHA"
       +actor_rollout_ref.actor.gxpo_delta=1e-8

@@ -925,13 +925,47 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg.init_model()
 
     def _best_ckpt_score(self, val_metrics):
-        """Checkpoint-selection score: macro-mean val pass@1 across val sources (seed-mean).
+        """Return the exact W&B metric used to select the best checkpoint."""
+        score = val_metrics.get("eval_greedy/avg_pass1")
+        if score is None:
+            return float("-inf")
+        try:
+            score = float(score)
+        except (TypeError, ValueError):
+            return float("-inf")
+        return score if np.isfinite(score) else float("-inf")
 
-        Unweighted across sources, so a 30-problem AIME set counts the same as 40-problem AMC23.
+    def _save_best_model_checkpoint(self):
+        """Save only actor weights for the best pass@1 checkpoint.
+
+        Resume checkpoints remain under ``global_step_N`` and contain optimizer,
+        scheduler, dataloader, and RNG state. The best checkpoint is an
+        inference/export artifact and deliberately omits all of that state.
         """
-        vals = [v for k, v in val_metrics.items()
-                if k.startswith('val/pass_at_1/') and '/seed' not in k and not k.endswith('/std')]
-        return float(np.mean(vals)) if vals else float('-inf')
+        best_root = os.path.join(self.config.trainer.default_local_dir, 'best_checkpoint')
+        best_local_folder = os.path.join(best_root, f'global_step_{self.global_steps}')
+        actor_local_path = os.path.join(best_local_folder, 'actor')
+        actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
+            self.config.trainer.default_hdfs_dir, 'best_checkpoint', f'global_step_{self.global_steps}', 'actor')
+
+        self.actor_rollout_wg.save_checkpoint(actor_local_path,
+                                              actor_remote_path,
+                                              self.global_steps,
+                                              remove_previous_ckpt=False,
+                                              save_optimizer=False)
+
+        previous_best_path = getattr(self, '_best_model_checkpoint_path', None)
+        if previous_best_path and os.path.abspath(previous_best_path) != os.path.abspath(best_local_folder):
+            print(f'Removing previous best model-only checkpoint directory: {previous_best_path}')
+            shutil.rmtree(previous_best_path, ignore_errors=True)
+        self._best_model_checkpoint_path = best_local_folder
+
+        with open(os.path.join(self.config.trainer.default_local_dir, 'best_ckpt.json'), 'w') as f:
+            json.dump({'best_step': self._best_val_step,
+                       'best_score': self._best_val_score,
+                       'metric': 'eval_greedy/avg_pass1',
+                       'type': 'model_only',
+                       'path': os.path.relpath(best_local_folder, self.config.trainer.default_local_dir)}, f)
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -1003,17 +1037,8 @@ class RayPPOTrainer(object):
         with open(local_sampling_num, 'w') as f:
             f.write(str(self.sampling_num))
 
-        # Record which step is the best-pass@1 one so it can be found (and pinned) after the run.
-        best_step = getattr(self, '_best_val_step', None)
-        if best_step is not None:
-            with open(os.path.join(self.config.trainer.default_local_dir, 'best_ckpt.json'), 'w') as f:
-                json.dump({'best_step': best_step,
-                           'best_score': getattr(self, '_best_val_score', None),
-                           'metric': 'macro-mean val/pass_at_1',
-                           'path': f'global_step_{best_step}'}, f)
-
-        # Keep only the latest n checkpoints (for resume), plus the pinned best-pass@1 one.
-        # GXPO sets n=1, so this is at most one resumable checkpoint plus one best checkpoint.
+        # Keep only the latest n full checkpoints. The separate best model-only
+        # checkpoint is retained independently by _save_best_model_checkpoint.
         n = max(int(self.config.trainer.get('keep_last_ckpts', 1)), 1)
         if self.config.trainer.get('keep_all_ckpts', False):
             return
@@ -1028,7 +1053,7 @@ class RayPPOTrainer(object):
             except ValueError:
                 continue  # Ignore malformed directories
 
-        for step in ckpt_steps_to_remove(steps, n, best_step):
+        for step in ckpt_steps_to_remove(steps, n):
             dir_to_remove = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
             print(f"Removing old checkpoint directory: {dir_to_remove}")
             shutil.rmtree(dir_to_remove, ignore_errors=True)
@@ -1071,6 +1096,10 @@ class RayPPOTrainer(object):
                     best_meta = json.load(f)
                 self._best_val_step = int(best_meta['best_step'])
                 self._best_val_score = float(best_meta['best_score'])
+                best_path = best_meta.get('path')
+                if best_path:
+                    self._best_model_checkpoint_path = os.path.join(
+                        self.config.trainer.default_local_dir, best_path)
                 print(f"Restored best validation checkpoint: step={self._best_val_step}, "
                       f"score={self._best_val_score:.6f}")
             except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
@@ -1905,6 +1934,8 @@ class RayPPOTrainer(object):
                     gxpo_baseline_ready = False
                     gxpo_trigger_z = 0.0
                     gxpo_trigger_candidate = False
+                    gxpo_trigger_signal = str(
+                        actor_cfg.get('gxpo_trigger_signal', 'entropy')).lower()
                     # GXPO gate variables are also referenced by shared bookkeeping.
                     # Initialize them for SFPO so the GXPO path remains disabled.
                     gxpo_zscore_w = 0
@@ -1950,7 +1981,7 @@ class RayPPOTrainer(object):
                         gxpo_zscore_w > 0 and
                         len(self.gxpo_entropy_container) >= gxpo_zscore_w)
                     if (gxpo_trigger_enabled and gxpo_baseline_ready and
-                            not self.stop_GXPO):
+                            not self.stop_GXPO and gxpo_trigger_signal == 'entropy'):
                         # SFPO ordering: score the latest completed outer
                         # batch against the preceding rolling window.
                         u = float(np.mean(self.gxpo_entropy_container[-gxpo_zscore_w:]))
@@ -2084,11 +2115,11 @@ class RayPPOTrainer(object):
                         metrics.update(val_metrics)
                         did_validate = True
 
-                    # Two independent reasons to write a checkpoint: the periodic one that makes the
-                    # run resumable, and a new best-pass@1 one that the paper reports. Both write a
-                    # normal global_step_N dir; retention keeps the last few and pins the best.
+                    # Periodic saves are full resumable checkpoints. A new best
+                    # pass@1 is saved separately as model-only below.
                     need_save = (self.config.trainer.save_freq > 0 and
                                  (is_last_step or self.global_steps % self.config.trainer.save_freq == 0))
+                    new_best = False
 
                     if did_validate:
                         score = self._best_ckpt_score(val_metrics)
@@ -2098,7 +2129,7 @@ class RayPPOTrainer(object):
                                   f'(prev {getattr(self, "_best_val_score", float("-inf")):.4f}); saving')
                             self._best_val_score = score
                             self._best_val_step = self.global_steps
-                            need_save = True
+                            new_best = True
                         else:
                             print(f'[best-ckpt] step {self.global_steps}: pass@1 {score:.4f} <= '
                                   f'best {self._best_val_score:.4f} (from step {self._best_val_step})')
@@ -2108,6 +2139,9 @@ class RayPPOTrainer(object):
                     if need_save:
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
+                    if new_best:
+                        with _timer('save_best_checkpoint', timing_raw):
+                            self._save_best_model_checkpoint()
 
                     # reward_metrics = compute_reward_metrics(batch, self.config)
 
