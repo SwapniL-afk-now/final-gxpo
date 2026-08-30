@@ -32,6 +32,7 @@ from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.actor import BasePPOActor
 from verl.workers.actor.gxpo_state import GXPOState, compute_gxpo_retention_scale
+from verl.workers.actor.optimizer_transaction import snapshot_optimizer_state
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
@@ -124,6 +125,14 @@ class DataParallelPPOActor(BasePPOActor):
         # consumed by _optimizer_state_metrics; keyed by the identity of the current pairs list.
         self._reposition_dir_cache = None
         if self.config.get('use_gxpo', False) and actor_optimizer is not None:
+            self.gxpo_optimizer_state_mode = str(
+                self.config.get('gxpo_optimizer_state_mode', 'transactional')).lower()
+            if self.gxpo_optimizer_state_mode not in (
+                    'transactional', 'transactional_fast_state', 'legacy'):
+                raise ValueError(
+                    'gxpo_optimizer_state_mode must be transactional, '
+                    'transactional_fast_state, or legacy, '
+                    f'got {self.gxpo_optimizer_state_mode!r}')
             self.gxpo_state = GXPOState(
                 K=self.config.get('gxpo_k', 5),
                 alpha=self.config.get('gxpo_alpha', 0.5),
@@ -816,41 +825,72 @@ class DataParallelPPOActor(BasePPOActor):
         with torch.no_grad():
             self._gxpo_copy_parameters(theta0, [p.data for p in params])
 
-        def fallback():
-            # ponytail: light fallback — restore theta0 only; probe-step optimizer-moment
-            # pollution is accepted (rare non-finite event), no optimizer-state deepcopy
+        optimizer_transaction = None
+        fast_optimizer_transaction = None
+        if self.gxpo_optimizer_state_mode in ('transactional', 'transactional_fast_state'):
+            optimizer_transaction = snapshot_optimizer_state(self.actor_optimizer)
+
+        def restore_probe_state():
             self._gxpo_restore_theta0()
+            if optimizer_transaction is not None:
+                optimizer_transaction.restore()
+
+        def probe_optimizer_step():
+            try:
+                self.actor_optimizer.step()
+            except BaseException:
+                restore_probe_state()
+                raise
+
+        def probe_clip_grads():
+            try:
+                return self._clip_grads()
+            except BaseException:
+                restore_probe_state()
+                raise
+
+        def fallback():
+            # A failed probe must not leak either its parameters or optimizer state.
+            restore_probe_state()
             self.actor_optimizer.zero_grad(set_to_none=True)
             return standard_step(fallback_triggered=True)
 
         # Pass 1: g0 at theta0. Keep its loss metrics (actor/entropy_loss etc.) — the skip-corrective
         # ablation has no Pass 3 to source them from, and ray_trainer reads actor/entropy_loss every step.
-        probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                 non_tensor_select_keys, collect_metrics=skip_corrective)
+        try:
+            probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                     non_tensor_select_keys, collect_metrics=skip_corrective)
+        except BaseException:
+            restore_probe_state()
+            raise
         # Capture raw gradients for the retention ratio; clip only the optimizer step.
         self._gxpo_capture_grads(g0_bufs)
         step_start = time.perf_counter()
-        gn0 = self._clip_grads().detach().item()
+        gn0 = probe_clip_grads().detach().item()
         valid_gn0 = (gn0 == gn0 and abs(gn0) != float('inf') and gn0 > 1e-8)
         valid_gn0_global = self._all_ranks_flag(valid_gn0, device)
         if valid_gn0_global:
-            self.actor_optimizer.step()
+            probe_optimizer_step()
         self._gxpo_power_guard(step_start)
         if not valid_gn0_global:
             return fallback()
 
         # Pass 2: g1 at theta_{t,1}
-        self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                 non_tensor_select_keys, recompute_old_log_probs=recompute_old,
-                                 collect_metrics=False)
+        try:
+            self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                     non_tensor_select_keys, recompute_old_log_probs=recompute_old,
+                                     collect_metrics=False)
+        except BaseException:
+            restore_probe_state()
+            raise
         # Capture raw gradients before clipping, matching g0.
         self._gxpo_capture_grads(g1_bufs)
         step_start = time.perf_counter()
-        gn1 = self._clip_grads().detach().item()
+        gn1 = probe_clip_grads().detach().item()
         valid_gn1 = (gn1 == gn1 and abs(gn1) != float('inf'))
         valid_gn1_global = self._all_ranks_flag(valid_gn1, device)
         if valid_gn1_global:
-            self.actor_optimizer.step()
+            probe_optimizer_step()
         self._gxpo_power_guard(step_start)
         if not valid_gn1_global:
             return fallback()
@@ -921,6 +961,20 @@ class DataParallelPPOActor(BasePPOActor):
                 p.data.copy_(dispK.mul_(alpha).add_(t0))
         self._gxpo_power_guard(diagnostic_start)
 
+        # The fast trajectory was only a probe. Keep theta_tilde, but isolate
+        # every optimizer-state mutation caused by the probe steps. In the
+        # fast-state comparison mode, retain the native fast branch separately
+        # and select it explicitly for the final committed update.
+        if optimizer_transaction is not None:
+            if self.gxpo_optimizer_state_mode == 'transactional_fast_state':
+                fast_optimizer_transaction = snapshot_optimizer_state(self.actor_optimizer)
+            optimizer_transaction.restore()
+            if self.gxpo_optimizer_state_mode == 'transactional_fast_state':
+                # Match the useful legacy state trajectory without allowing
+                # probe mutations to leak into the main optimizer implicitly.
+                assert fast_optimizer_transaction is not None
+                fast_optimizer_transaction.restore()
+
         # Pass 3: slow correction at theta_tilde. Skipped for the no-corrective ablation, where the
         # reposition above IS the update (params already sit at theta_tilde, nothing more to do).
         if skip_corrective:
@@ -928,9 +982,13 @@ class DataParallelPPOActor(BasePPOActor):
             gn_slow = gn1  # report the last real probe norm; no corrective grad exists
             gslow_stats = torch.zeros(2, dtype=torch.float32, device=device)
         else:
-            pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                                     non_tensor_select_keys, recompute_old_log_probs=recompute_old,
-                                                     collect_metrics=True)
+            try:
+                pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                                         non_tensor_select_keys, recompute_old_log_probs=recompute_old,
+                                                         collect_metrics=True)
+            except BaseException:
+                restore_probe_state()
+                raise
             append_to_dict(pass3_metrics, self._optimizer_state_metrics())
             # Capture corrective-gradient diagnostics before clipping, matching g0/g1.
             # _clip_grads() returns the pre-clip norm but mutates p.grad in place.
@@ -944,11 +1002,11 @@ class DataParallelPPOActor(BasePPOActor):
                     gslow_stats[0] += gradf.square().sum()
                     gslow_stats[1] += (gradf * g0f).sum()
             step_start = time.perf_counter()
-            gn_slow = self._clip_grads().detach().item()
+            gn_slow = probe_clip_grads().detach().item()
             valid_gn_slow = (gn_slow == gn_slow and abs(gn_slow) != float('inf'))
             valid_gn_slow_global = self._all_ranks_flag(valid_gn_slow, device)
             if valid_gn_slow_global:
-                self.actor_optimizer.step()
+                probe_optimizer_step()
             self._gxpo_power_guard(step_start)
             if not valid_gn_slow_global:
                 return fallback()

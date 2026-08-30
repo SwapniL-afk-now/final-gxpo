@@ -275,12 +275,16 @@ def test_gate_and_gradient_capture_order():
     step = next(node for node in ast.walk(tree)
                 if isinstance(node, ast.FunctionDef) and node.name == '_gxpo_minibatch_step')
     step_source = ast.get_source_segment(source, step)
-    assert step_source.index('self._gxpo_capture_grads(g0_bufs)') < step_source.index('self._clip_grads()')
-    assert step_source.index('self._gxpo_capture_grads(g1_bufs)') < step_source.index('self._clip_grads()', step_source.index('self._gxpo_capture_grads(g1_bufs)'))
+    assert step_source.index('self._gxpo_capture_grads(g0_bufs)') < step_source.index(
+        'gn0 = probe_clip_grads()')
+    assert step_source.index('self._gxpo_capture_grads(g1_bufs)') < step_source.index(
+        'gn1 = probe_clip_grads()')
     # Current semantics intentionally gate after the corrective optimizer step:
     # the trigger disables subsequent GXPO steps, not the update just computed.
     assert step_source.rfind('self.actor_optimizer.step()') < step_source.index('state.update_trigger_state')
-    assert 'probe-step optimizer-moment' in source and 'pollution is accepted' in source
+    assert 'snapshot_optimizer_state(self.actor_optimizer)' in step_source
+    assert 'gxpo_optimizer_state_mode' in source
+    assert 'optimizer_transaction.restore()' in step_source
 
 
 if __name__ == '__main__':

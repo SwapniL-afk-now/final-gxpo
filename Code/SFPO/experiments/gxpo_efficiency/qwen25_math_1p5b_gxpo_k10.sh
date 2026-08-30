@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
-MODEL_ALIAS="llama32-3b-instruct"
-MODEL_ID="${MODEL_LLAMA32_3B:-/workspace/models/Llama-3.2-3B-Instruct}"
+MODEL_ALIAS="qwen25-math-1p5b"
+MODEL_ID="${MODEL_QWEN25_MATH_1P5B:-/workspace/models/Qwen2.5-Math-1.5B-Instruct}"
 METHOD="${METHOD:-gxpo}"
 SAVE_FREQ="${SAVE_FREQ:-20}"
 K="${K:-10}"
