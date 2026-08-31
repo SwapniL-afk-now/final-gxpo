@@ -40,15 +40,15 @@ fi
 # ------------------------------------------------------------ gate config ----
 # Experiment settings owned by this entrypoint.  The downstream environment
 # wrapper must preserve these inherited values instead of overriding them.
-export K=10
-export REPOSITION_ALPHA=1.0
+export K="${K:-10}"
+export REPOSITION_ALPHA="${REPOSITION_ALPHA:-1.0}"
 
 # This entrypoint owns the single-GPU launch. The downstream wrapper preserves
 # these inherited values instead of reverting to its historical 0,1/FSDP=2 setup.
-export GPU_IDS=2
-export CUDA_VISIBLE_DEVICES=2
-export GPU_COUNT=1
-export FSDP_SIZE=1
+export GPU_IDS="${GPU_IDS:-2}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$GPU_IDS}"
+export GPU_COUNT="${GPU_COUNT:-1}"
+export FSDP_SIZE="${FSDP_SIZE:-1}"
 export TRAINER_RESUME_MODE=disable
 export TRAINER_RESUME_FROM_PATH=False
 export GXPO_RUN_NAME="${GXPO_RUN_NAME:-qwen25_math_1p5b_gxpo_k10_a1_b256_mb64_gpu2_fsdp1_fp32_liger_zscore_v6_memsafe}"
@@ -73,10 +73,10 @@ export GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
 # 98k-token/1024-sequence vLLM profile exhausted the card during step 1.
 # Keep the requested global batch/minibatch unchanged while bounding peak
 # rollout and actor-update allocations.
-export PPO_MAX_TOKEN_LEN_PER_GPU=16384
-export VLLM_MAX_NUM_SEQS=512
-export VLLM_MAX_NUM_BATCHED_TOKENS=32768
-export VLLM_GPU_MEMORY_UTILIZATION=0.5
+export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-512}"
+export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-32768}"
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.5}"
 
 # ------------------------------------------------------------- preflight -----
 MISSING=0

@@ -117,11 +117,18 @@ class SFTDataset(Dataset):
         prompt = self.prompts[item]
         response = self.responses[item]
 
-        # apply chat template
+        # Apply a chat template when the checkpoint provides one. Base models
+        # such as meta-llama/Llama-3.2-3B intentionally do not define a chat
+        # template, so use plain causal-LM SFT formatting for those checkpoints.
         prompt_chat = [{'role': 'user', 'content': prompt}]
-
-        # string
-        prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
+        if getattr(tokenizer, 'chat_template', None):
+            prompt_chat_str = tokenizer.apply_chat_template(
+                prompt_chat, add_generation_prompt=True, tokenize=False
+            )
+        else:
+            prompt_chat_str = str(prompt)
+            if not prompt_chat_str.endswith(('\n', ' ')):
+                prompt_chat_str += '\n'
         response_chat_str = response + tokenizer.eos_token
 
         # tokenize

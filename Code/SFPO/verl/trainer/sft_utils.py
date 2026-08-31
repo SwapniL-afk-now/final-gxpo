@@ -19,8 +19,10 @@ def resolve_total_training_steps(steps_per_epoch, total_epochs, configured_total
         return natural_steps
 
     configured_total_steps = int(configured_total_steps)
-    if configured_total_steps <= 0:
+    if configured_total_steps < 0:
         raise ValueError(
-            f"trainer.total_training_steps must be positive when set, got {configured_total_steps}"
+            f"trainer.total_training_steps must be zero (derive from epochs) or positive, got {configured_total_steps}"
         )
+    if configured_total_steps == 0:
+        return natural_steps
     return min(natural_steps, configured_total_steps)

@@ -8,11 +8,11 @@ from pathlib import Path
 
 import pandas as pd
 
-SOURCE = "DigitalLearningGmbH/MATH-lighteval"
+DEFAULT_SOURCE = "DigitalLearningGmbH/MATH-lighteval"
 REQUIRED_COLUMNS = {"prompt", "response", "data_source", "extra_info"}
 
 
-def validate_file(path: Path, expected_split: str) -> int:
+def validate_file(path: Path, expected_split: str, source_dataset: str) -> int:
     if not path.is_file():
         raise ValueError(f"missing SFT parquet: {path}")
     frame = pd.read_parquet(path)
@@ -29,9 +29,10 @@ def validate_file(path: Path, expected_split: str) -> int:
             raise ValueError(f"{path}: row {index} has an empty/non-string prompt")
         if not isinstance(response, str) or not response.strip():
             raise ValueError(f"{path}: row {index} has an empty/non-string worked response")
-        if row["data_source"] != SOURCE:
+        if row["data_source"] != source_dataset:
             raise ValueError(
-                f"{path}: row {index} data_source={row['data_source']!r}; expected {SOURCE!r}"
+                f"{path}: row {index} data_source={row['data_source']!r}; "
+                f"expected {source_dataset!r}"
             )
         extra = row["extra_info"]
         if not isinstance(extra, dict) or extra.get("split") != expected_split:
@@ -46,14 +47,15 @@ def main() -> int:
     parser.add_argument("--data-root", required=True, type=Path)
     parser.add_argument("--train-file", type=Path)
     parser.add_argument("--test-file", type=Path)
+    parser.add_argument("--source-dataset", default=DEFAULT_SOURCE)
     args = parser.parse_args()
 
     train_file = args.train_file or args.data_root / "train.parquet"
     test_file = args.test_file or args.data_root / "test.parquet"
 
     counts = {
-        "train": validate_file(train_file, "train"),
-        "test": validate_file(test_file, "test"),
+        "train": validate_file(train_file, "train", args.source_dataset),
+        "test": validate_file(test_file, "test", args.source_dataset),
     }
     print(json.dumps({"data_root": str(args.data_root.resolve()), "rows": counts}, indent=2))
     return 0

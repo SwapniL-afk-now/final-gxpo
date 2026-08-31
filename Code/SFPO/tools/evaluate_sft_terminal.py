@@ -6,6 +6,7 @@ import argparse
 import gc
 import json
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,38 @@ BENCHMARKS = {
     "olympiadbench": "olympiadbench/test.parquet",
 }
 
+
+def add_workspace_cuda_libs():
+    os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
+    os.environ["PATH"] = str(ROOT.parents[1] / ".venv" / "bin") + os.pathsep + os.environ.get("PATH", "")
+    cuda_root = ROOT.parents[1] / ".venv" / "lib" / "python3.12" / "site-packages" / "nvidia"
+    if not cuda_root.is_dir():
+        return
+    library_dirs = []
+    for package_dir in sorted(cuda_root.iterdir()):
+        candidate = package_dir / "lib"
+        if candidate.is_dir():
+            library_dirs.append(str(candidate))
+    python_include = ROOT.parents[1] / ".python-dev" / "usr" / "include" / "python3.12"
+    if (python_include / "Python.h").is_file():
+        include_root = str(python_include.parent)
+        existing_c = [path for path in os.environ.get("C_INCLUDE_PATH", "").split(":") if path]
+        os.environ["C_INCLUDE_PATH"] = ":".join([include_root, str(python_include), *[path for path in existing_c if path not in {include_root, str(python_include)}]])
+        existing_cpp = [path for path in os.environ.get("CPLUS_INCLUDE_PATH", "").split(":") if path]
+        os.environ["CPLUS_INCLUDE_PATH"] = ":".join([include_root, str(python_include), *[path for path in existing_cpp if path not in {include_root, str(python_include)}]])
+    cuda_home = ROOT.parents[1] / ".cuda-toolkit"
+    if (cuda_home / "bin" / "nvcc").is_file():
+        os.environ.setdefault("CUDA_HOME", str(cuda_home))
+        os.environ.setdefault("CUDA_PATH", str(cuda_home))
+        os.environ.setdefault("CUDACXX", str(cuda_home / "bin" / "nvcc"))
+    existing = [path for path in os.environ.get("LD_LIBRARY_PATH", "").split(":") if path]
+    merged = [path for path in library_dirs if path not in existing]
+    merged.extend(path for path in existing if path)
+    if merged:
+        os.environ["LD_LIBRARY_PATH"] = ":".join(merged)
+        if os.environ.get("SFT_EVAL_CUDA_REEXEC") != "1":
+            os.environ["SFT_EVAL_CUDA_REEXEC"] = "1"
+            os.execvpe(sys.executable, [sys.executable, *sys.argv], os.environ)
 
 def find_step(run_dir: Path, requested: int | None) -> int:
     if requested is not None:
@@ -36,7 +69,9 @@ def find_step(run_dir: Path, requested: int | None) -> int:
     return max(steps)
 
 
-def evaluate_seed(llm, tokenizer, data_files, seed, n, temperature, top_p, max_tokens):
+def evaluate_seed(
+    llm, tokenizer, data_files, seed, n, temperature, top_p, max_tokens, max_examples, prompt_length
+):
     import pandas as pd
     from verl.utils.reward_score import _default_compute_score
     from vllm import SamplingParams
@@ -44,20 +79,33 @@ def evaluate_seed(llm, tokenizer, data_files, seed, n, temperature, top_p, max_t
     results = {}
     for benchmark, data_file in data_files.items():
         frame = pd.read_parquet(data_file)
-        prompts = [
+        if max_examples > 0:
+            frame = frame.head(max_examples)
+        prompt_texts = [
             tokenizer.apply_chat_template(
                 list(prompt), tokenize=False, add_generation_prompt=True
             )
             for prompt in frame["prompt"]
+        ]
+        # Keep the prompt within the requested context budget after adding
+        # the chat template; this also makes tiny smoke contexts deterministic.
+        prompt_token_ids = [
+            tokenizer(
+                prompt_text,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=prompt_length,
+            )["input_ids"]
+            for prompt_text in prompt_texts
         ]
         ground_truths = [row["ground_truth"] for row in frame["reward_model"]]
         data_sources = frame["data_source"].tolist()
 
         flat_prompts = []
         sampling_params = []
-        for prompt_index, prompt in enumerate(prompts):
+        for prompt_index, prompt in enumerate(prompt_token_ids):
             for sample_index in range(n):
-                flat_prompts.append(prompt)
+                flat_prompts.append({"prompt_token_ids": prompt})
                 sampling_params.append(
                     SamplingParams(
                         n=1,
@@ -69,14 +117,14 @@ def evaluate_seed(llm, tokenizer, data_files, seed, n, temperature, top_p, max_t
                 )
 
         outputs = llm.generate(flat_prompts, sampling_params, use_tqdm=True)
-        correct = np.zeros((len(prompts), n), dtype=np.float32)
+        correct = np.zeros((len(prompt_token_ids), n), dtype=np.float32)
         truncated = 0
-        for prompt_index in range(len(prompts)):
+        for prompt_index in range(len(prompt_token_ids)):
             for sample_index in range(n):
                 output = outputs[prompt_index * n + sample_index].outputs[0]
                 truncated += int(output.finish_reason == "length")
                 score = _default_compute_score(
-                    prompts[prompt_index],
+                    prompt_texts[prompt_index],
                     data_sources[prompt_index],
                     output.text,
                     ground_truths[prompt_index],
@@ -139,6 +187,12 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.7)
     parser.add_argument("--max-tokens", type=int, default=3072)
+    parser.add_argument(
+        "--max-examples",
+        type=int,
+        default=0,
+        help="Evaluate only the first N examples per benchmark (0 means all).",
+    )
     parser.add_argument("--prompt-length", type=int, default=1024)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
@@ -146,6 +200,8 @@ def main() -> int:
 
     if args.n <= 0:
         raise SystemExit("--n must be positive")
+    if args.max_examples < 0:
+        raise SystemExit("--max-examples must be zero or positive")
     run_dir = args.run_dir.expanduser().resolve()
     step = find_step(run_dir, args.step)
     checkpoint = run_dir / f"global_step_{step}"
@@ -160,33 +216,78 @@ def main() -> int:
     if missing:
         raise SystemExit("Missing benchmark parquet files:\n" + "\n".join(missing))
 
-    from transformers import AutoTokenizer
+    add_workspace_cuda_libs()
+    from transformers import AutoConfig, AutoTokenizer
     from vllm import LLM
 
     tokenizer = AutoTokenizer.from_pretrained(str(checkpoint))
+    model_config = AutoConfig.from_pretrained(str(checkpoint))
+    model_context = getattr(model_config, "max_position_embeddings", None)
+    requested_max_model_len = args.prompt_length + args.max_tokens
+    effective_max_tokens = args.max_tokens
+    if model_context is not None:
+        model_context = int(model_context)
+        if args.prompt_length >= model_context:
+            raise SystemExit(
+                f"--prompt-length {args.prompt_length} must be smaller than "
+                f"model context {model_context}"
+            )
+        effective_max_tokens = min(
+            effective_max_tokens, model_context - args.prompt_length
+        )
+    max_model_len = (
+        min(requested_max_model_len, model_context)
+        if model_context is not None
+        else requested_max_model_len
+    )
+    if effective_max_tokens != args.max_tokens:
+        print(
+            f"Clamping --max-tokens from {args.max_tokens} to "
+            f"{effective_max_tokens} for model context {model_context}"
+        )
+    # CUDA graphs improve steady-state vLLM throughput. Keep an escape hatch
+    # for environments that reproduce the earlier CUDA-graph startup hang.
+    enforce_eager = os.environ.get("VLLM_ENFORCE_EAGER", "0").lower() in {
+        "1", "true", "yes", "on"
+    }
+    print(f"vLLM enforce_eager={enforce_eager}", flush=True)
     llm = LLM(
         model=str(checkpoint),
         tokenizer=str(checkpoint),
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.prompt_length + args.max_tokens,
+        max_model_len=max_model_len,
         dtype="bfloat16",
+        enforce_eager=enforce_eager,
+        # Make FlashInfer authoritative for vLLM V1; the environment alone
+        # can otherwise be overridden by automatic backend selection.
+        attention_config={"backend": "FLASHINFER"},
     )
-    per_seed = {
-        str(seed): evaluate_seed(
-            llm,
-            tokenizer,
-            data_files,
-            seed,
-            args.n,
-            args.temperature,
-            args.top_p,
-            args.max_tokens,
-        )
-        for seed in args.seeds
-    }
-    del llm
-    gc.collect()
+    try:
+        per_seed = {
+            str(seed): evaluate_seed(
+                llm,
+                tokenizer,
+                data_files,
+                seed,
+                args.n,
+                args.temperature,
+                args.top_p,
+                effective_max_tokens,
+                args.max_examples,
+                args.prompt_length,
+            )
+            for seed in args.seeds
+        }
+    finally:
+        # vLLM V1 owns a separate EngineCore process.  Explicitly shut it
+        # down before returning so the trainer can reclaim the GPU and resume.
+        engine = getattr(getattr(llm, "llm_engine", None), "engine_core", None)
+        shutdown = getattr(engine, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
+        del llm
+        gc.collect()
     try:
         import torch
         torch.cuda.empty_cache()
@@ -198,12 +299,14 @@ def main() -> int:
         "kind": "sft_terminal_eval",
         "checkpoint_step": step,
         "checkpoint": str(checkpoint),
+        "max_examples": args.max_examples,
         "seeds": args.seeds,
         "data_root": str(data_root),
         "decoding": {
             "temperature": args.temperature,
             "top_p": args.top_p,
-            "max_tokens": args.max_tokens,
+            "max_tokens": effective_max_tokens,
+            "requested_max_tokens": args.max_tokens,
             "n": args.n,
             "do_sample": True,
         },
