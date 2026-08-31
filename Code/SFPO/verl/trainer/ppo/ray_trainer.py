@@ -17,6 +17,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import threading
 import uuid
@@ -234,10 +235,14 @@ def compute_reward_metrics_grouped(reward_tensor: torch.Tensor, config) -> Dict:
     reward_metrics["reward/mean"] = torch.mean(reward_tensor).detach().item()
     all_correct = torch.sum(reward_tensor == 1).float() / reward_tensor.numel()
     reward_metrics["reward/all_correct_ratio"] = all_correct.detach().item()
-    format_error = torch.sum(reward_tensor == 0).float() / reward_tensor.numel()
-    reward_metrics["reward/format_error_ratio"] = format_error.detach().item()
-    format_error = torch.sum(reward_tensor == 0.1).float() / reward_tensor.numel()
-    reward_metrics["reward/wrong_answer_ratio"] = format_error.detach().item()
+    # Math rewards are binary: only an exactly verified answer receives 1.0.
+    # A parseable but wrong answer is therefore also incorrect for training.
+    incorrect = torch.sum(reward_tensor != 1).float() / reward_tensor.numel()
+    reward_metrics["reward/incorrect_ratio"] = incorrect.detach().item()
+    # Preserve the historical dashboard keys while making their binary
+    # semantics explicit; no partial format reward reaches the actor.
+    reward_metrics["reward/format_error_ratio"] = incorrect.detach().item()
+    reward_metrics["reward/wrong_answer_ratio"] = incorrect.detach().item()
 
     prompt_num = reward_tensor.view(-1, group_size).size(0)
 
@@ -253,19 +258,52 @@ def compute_reward_metrics_grouped(reward_tensor: torch.Tensor, config) -> Dict:
         print('non_diverse_examples:', non_diverse_examples)
     reward_metrics["examples/non_diverse_examples_ratio"] = (non_diverse_examples / prompt_num).detach().item()
 
-    format_example = torch.logical_and(reward_tensor.view(-1, group_size).max(-1)[0] == 0.1,
-                                       reward_tensor.view(-1, group_size).min(-1)[0] == 0.1).sum() / prompt_num
+    group_rewards = reward_tensor.view(-1, group_size)
+    correct_in_group = group_rewards == 1
+    mixed_example = correct_in_group.any(dim=-1) & (~correct_in_group).any(dim=-1)
+    format_example = (~correct_in_group).all(dim=-1).sum() / prompt_num
 
     all_correct_example = torch.logical_and(reward_tensor.view(-1, group_size).max(-1)[0] == 1,
                                             reward_tensor.view(-1, group_size).min(-1)[0] == 1).sum() / prompt_num
 
     reward_metrics["examples/format_example_ratio"] = format_example.detach().item()
     reward_metrics["examples/all_correct_example_ratio"] = all_correct_example.detach().item()
+    reward_metrics["examples/mixed_response_ratio"] = mixed_example.float().mean().detach().item()
 
     easy_examples_ratio = (reward_tensor.view(-1, group_size).mean(-1) > 0.75).sum() / prompt_num
     reward_metrics["examples/easy_examples_ratio_0.75"] = easy_examples_ratio.detach().item()
 
     return reward_metrics
+
+
+def mixed_response_indices(reward_tensor: torch.Tensor, config, divisor: int = 1):
+    """Return rows belonging to prompts with both correct and incorrect rolls.
+
+    ``reward_tensor`` must be in original prompt-group order. Returned rows
+    are complete prompt groups so GRPO's group semantics remain intact.
+    ``divisor`` keeps the selected batch compatible with distributed workers.
+    """
+    group_size = max(1, int(config.actor_rollout_ref.rollout.n))
+    if reward_tensor.numel() == 0 or reward_tensor.numel() % group_size:
+        return torch.empty(0, dtype=torch.long, device=reward_tensor.device), 0
+
+    groups = reward_tensor.reshape(-1, group_size)
+    correct = groups == 1
+    mixed = correct.any(dim=-1) & (~correct).any(dim=-1)
+    prompt_indices = torch.nonzero(mixed, as_tuple=False).flatten()
+
+    # For n=8 and four GPUs this is a no-op. For other configurations, retain
+    # only a whole number of prompt groups that can be evenly dispatched.
+    divisor = max(1, int(divisor))
+    prompts_per_divisible_batch = divisor // math.gcd(group_size, divisor)
+    usable = (prompt_indices.numel() // prompts_per_divisible_batch) * prompts_per_divisible_batch
+    prompt_indices = prompt_indices[:usable]
+    if prompt_indices.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=reward_tensor.device), 0
+
+    rows = (prompt_indices[:, None] * group_size +
+            torch.arange(group_size, device=reward_tensor.device)[None, :]).reshape(-1)
+    return rows, int(prompt_indices.numel())
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
@@ -1763,6 +1801,15 @@ class RayPPOTrainer(object):
                         reward_tensor = reward_tensor.index_select(
                             0, balance_perm.to(device=reward_tensor.device))
 
+                    # The actor KL loss consumes the reference policy's token
+                    # log-probabilities.  Build them before advantages and
+                    # actor update whenever the actor-side KL term is enabled.
+                    if self.use_reference_policy and self.config.actor_rollout_ref.actor.get(
+                            'use_kl_loss', False):
+                        with _timer('ref', timing_raw):
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                        batch = batch.union(ref_log_prob)
+
                     with _timer('adv', timing_raw):
                         batch.batch['token_level_scores'] = reward_tensor
 
@@ -1787,6 +1834,26 @@ class RayPPOTrainer(object):
                     reward_metrics = compute_reward_metrics_grouped(reward_flat, self.config)
                     metrics.update(reward_metrics)
                     batch_num = len(batch)
+
+                    # Keep the complete sampled batch for reward/accuracy/pass
+                    # metrics, but only send mixed-correctness prompt groups to
+                    # the actor.  Map the prompt-order rows back to the live
+                    # (possibly seqlen-balanced) batch order.
+                    actor_update_rows_original, mixed_prompt_count = mixed_response_indices(
+                        reward_flat, self.config, divisor=int(self.actor_rollout_wg.world_size))
+                    if inv_balance_perm is not None and actor_update_rows_original.numel():
+                        actor_update_rows = inv_balance_perm.to(
+                            device=actor_update_rows_original.device)[actor_update_rows_original]
+                    else:
+                        actor_update_rows = actor_update_rows_original
+                    actor_update_rows = torch.sort(actor_update_rows).values
+                    actor_update_indices = actor_update_rows.detach().cpu().tolist()
+                    metrics.update({
+                        'examples/mixed_response_prompt_count': float(mixed_prompt_count),
+                        'examples/actor_update_response_count': float(len(actor_update_indices)),
+                        'examples/actor_update_response_ratio': (
+                            float(len(actor_update_indices)) / max(float(batch_num), 1.0)),
+                    })
 
                     easy_data_num += reward_metrics["examples/all_correct_example_ratio"] * batch_num
                     hard_data_num += reward_metrics["examples/format_example_ratio"] * batch_num
@@ -2020,16 +2087,35 @@ class RayPPOTrainer(object):
                         # update actor
                         with _timer('update_actor', timing_raw):
                             if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
-                                batch.meta_info['gxpo_trigger_enabled'] = (
+                                actor_update_batch = batch
+                                if actor_update_indices:
+                                    actor_update_batch = batch.select_via_index(actor_update_indices)
+                                    # select_via_index shares meta_info; copy it
+                                    # before replacing token accounting for the
+                                    # reduced actor batch.
+                                    actor_update_batch.meta_info = dict(batch.meta_info)
+                                    global_tokens = batch.meta_info.get('global_token_num')
+                                    if isinstance(global_tokens, (list, tuple)):
+                                        actor_update_batch.meta_info['global_token_num'] = [
+                                            global_tokens[i] for i in actor_update_indices]
+                                else:
+                                    actor_output = DataProto(meta_info={'metrics': {
+                                        'actor/update_skipped_no_mixed_prompts': 1.0,
+                                        'actor/mixed_response_prompt_count': 0.0,
+                                        'actor/update_response_count': 0.0,
+                                    }})
+
+                                if actor_update_indices:
+                                    actor_update_batch.meta_info['gxpo_trigger_enabled'] = (
                                     gxpo_trigger_enabled
-                                )
-                                batch.meta_info['gxpo_trigger_stop'] = self.stop_GXPO
-                                batch.meta_info['gxpo_trigger_z'] = gxpo_trigger_z
-                                batch.meta_info['gxpo_trigger_stat'] = gxpo_trigger_stat
-                                batch.meta_info['gxpo_trigger_streak'] = self.gxpo_trigger_streak
-                                batch.meta_info['gxpo_trigger_candidate'] = gxpo_trigger_candidate
-                                batch.meta_info['gxpo_entropy_window_ready'] = gxpo_baseline_ready
-                                actor_output = self.actor_rollout_wg.gxpo_update_actor(batch)
+                                    )
+                                    actor_update_batch.meta_info['gxpo_trigger_stop'] = self.stop_GXPO
+                                    actor_update_batch.meta_info['gxpo_trigger_z'] = gxpo_trigger_z
+                                    actor_update_batch.meta_info['gxpo_trigger_stat'] = gxpo_trigger_stat
+                                    actor_update_batch.meta_info['gxpo_trigger_streak'] = self.gxpo_trigger_streak
+                                    actor_update_batch.meta_info['gxpo_trigger_candidate'] = gxpo_trigger_candidate
+                                    actor_update_batch.meta_info['gxpo_entropy_window_ready'] = gxpo_baseline_ready
+                                    actor_output = self.actor_rollout_wg.gxpo_update_actor(actor_update_batch)
                             elif self.config.actor_rollout_ref.actor.get('use_sfpo', False) and not self.stop_SFPO:
                                 actor_output = self.actor_rollout_wg.sfpo_update_actor(batch)
                             else:
@@ -2097,10 +2183,11 @@ class RayPPOTrainer(object):
                         metrics.update(actor_output_metrics)
                     ####################################MODIFICATION####################################
 
-                    self.entropy_container.append(float(actor_output_metrics['actor/entropy_loss']))
-                    if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
-                        self.gxpo_entropy_container.append(
-                            float(actor_output_metrics['actor/entropy_loss']))
+                    actor_entropy_value = actor_output_metrics.get('actor/entropy_loss')
+                    if actor_entropy_value is not None:
+                        self.entropy_container.append(float(actor_entropy_value))
+                        if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
+                            self.gxpo_entropy_container.append(float(actor_entropy_value))
                     active_train_elapsed_s = time.monotonic() - active_train_start
 
                     # validate

@@ -16,7 +16,13 @@ from math_verify.metric import math_metric
 from math_verify.parser import LatexExtractionConfig, ExprExtractionConfig
 
 
-def compute_score(model_output: str, ground_truth: str) -> bool:
+def compute_score(model_output: str, ground_truth: str) -> float:
+    """Return binary correctness for math RL training.
+
+    Math-Verify can produce a non-zero partial/format score for an answer
+    that parses but is mathematically wrong. That score must not become
+    policy-reward credit for GXPO/GRPO.
+    """
     verify_func = math_metric(
         gold_extraction_target=(LatexExtractionConfig(),),
         pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
@@ -30,7 +36,7 @@ def compute_score(model_output: str, ground_truth: str) -> bool:
     except Exception as e:
         print(e)
 
-    return ret_score
+    return 1.0 if float(ret_score) == 1.0 else 0.0
 
 if __name__ == '__main__':
     solution_str = "Assistant: Here is the solution to the problem. \\boxed{\\frac{1}{2} + 32c }"
@@ -39,9 +45,9 @@ if __name__ == '__main__':
     print(compute_score(solution_str, ground_truth)) #1.0
     ground_truth = "\\frac{1}{3}"
     print(solution_str, ground_truth)
-    print(compute_score(solution_str, ground_truth)) #0.1
+    print(compute_score(solution_str, ground_truth)) #0.0
 
     solution_str = "The answer is \\boxed{1/2}"
     ground_truth = "\\frac{1}{2}"
     print(solution_str, ground_truth)
-    print(compute_score(solution_str, ground_truth)) #0
+    print(compute_score(solution_str, ground_truth)) #0.0

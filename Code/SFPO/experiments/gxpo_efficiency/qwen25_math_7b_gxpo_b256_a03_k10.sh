@@ -22,7 +22,8 @@ if [[ -z "${WANDB_API_KEY:-}" && "${WANDB_MODE:-online}" != "offline" ]]; then
   exit 2
 fi
 
-# Qwen2.5-Math-7B-Instruct | GXPO | batch 256 | PPO minibatch 64 | K=10 | alpha=0.3
+# Qwen2.5-Math-7B-Instruct | GXPO | batch 256 | PPO minibatch 64 | K=5 | alpha=0.3
+# Stability: no entropy bonus, 2048-token responses, reference KL enabled at 0.01.
 # Standalone Qwen 7B GXPO entrypoint. It defines the model-specific
 # configuration and invokes only the shared training implementation.
 
@@ -33,7 +34,7 @@ METHOD="gxpo"
 export MODEL_QWEN25_MATH_7B="$MODEL_ID"
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"
-export K="${K:-10}"
+export K="${K:-5}"
 export REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.3}"
 export GXPO_OPTIMIZER_STATE_MODE="${GXPO_OPTIMIZER_STATE_MODE:-transactional}"
 # Use the requested SFPO-style entropy trigger for the queued 7B run.
@@ -48,22 +49,26 @@ export GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-2}"
 export GXPO_RESET_ENTROPY_AFTER_WARMUP="${GXPO_RESET_ENTROPY_AFTER_WARMUP:-False}"
 export GXPO_TRIGGER_MIN_OBS="${GXPO_TRIGGER_MIN_OBS:-0}"
 export GXPO_MAX_ACTIVE_STEPS="${GXPO_MAX_ACTIVE_STEPS:-150}"
-export ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
-export ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
-export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-3072}"
+export ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.7}"
+export ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.8}"
+export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-2048}"
+export ENTROPY_COEFF="${ENTROPY_COEFF:-0.0}"
+export ACTOR_USE_KL_LOSS="${ACTOR_USE_KL_LOSS:-True}"
+export ACTOR_KL_LOSS_COEF="${ACTOR_KL_LOSS_COEF:-0.01}"
+export ACTOR_KL_LOSS_TYPE="${ACTOR_KL_LOSS_TYPE:-low_var_kl}"
 export GPU_IDS="${GPU_IDS:-0,1,2,3}"
 export GPU_COUNT="${GPU_COUNT:-4}"
 export FSDP_SIZE="${FSDP_SIZE:-4}"
 export ATTN_IMPL="${ATTN_IMPL:-flash_attention_3}"
-export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}"
+export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-16384}"
 export LOG_PROB_MICRO_BATCH_SIZE="${LOG_PROB_MICRO_BATCH_SIZE:-8}"
-export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-98304}"
-export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-1024}"
+export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-65536}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-512}"
 # Keep this conservative for the 7B actor; 0.65 is suitable for the 1.5B run
 # but was not safe for the 7B model's memory footprint.
-export VLLM_GPU_MEMORY_UTILIZATION="0.48"
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.40}"
 export WANDB_PROJECT="${WANDB_PROJECT:-gxpo-efficiency-final}"
 export WANDB_GROUP="${WANDB_GROUP:-qwen2.5-math-7b-instruct-gxpo}"
-export GXPO_RUN_NAME="${GXPO_RUN_NAME:-qwen25_math_7b_instruct_gxpo_b256_mb64_a0.3_k10_entropy_txopt_tau1.5_p2_m150_tp10_v048}"
+export GXPO_RUN_NAME="${GXPO_RUN_NAME:-qwen25_math_7b_instruct_gxpo_b256_mb64_a0.3_k5_kl01_noent_r2048_entropy_txopt_tau1.5_p2_m150}"
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
