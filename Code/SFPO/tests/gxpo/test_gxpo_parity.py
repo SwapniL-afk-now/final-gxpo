@@ -28,8 +28,8 @@ def load_gxpo_module():
 GXPO = load_gxpo_module()
 
 
-def production_ratio_scale(g0, g1, K, delta=1e-8):
-    return GXPO.compute_gxpo_retention_scale(g0, g1, K, delta)
+def production_ratio_scale(g0, g1, K, delta=1e-8, **kwargs):
+    return GXPO.compute_gxpo_retention_scale(g0, g1, K, delta, **kwargs)
 
 
 def test_scale_edge_cases():
@@ -46,6 +46,35 @@ def test_scale_edge_cases():
     assert clipped[3] and clipped[4] and clipped[7]
     assert torch.isfinite(ratio).all() and torch.isfinite(scale).all()
     assert scale.min() >= 1.0 and scale.max() <= 3.5
+
+
+def test_retention_uses_probe_clip_scales_and_relative_threshold():
+    g0 = torch.tensor([1e-6, 1.0, -2.0])
+    g1 = torch.tensor([7.0, 0.5, -1.0])
+    g0_before, g1_before = g0.clone(), g1.clone()
+    ratio, scale, active, clipped = production_ratio_scale(
+        g0, g1, K=2, clip_scale_g0=0.5, clip_scale_g1=0.25)
+
+    # RMS(g0) ~= 1.291, so the first coordinate is below 1e-3 * RMS and is
+    # neutral; the remaining coordinates use (c1*g1)/(c0*g0).
+    assert torch.equal(active, torch.tensor([False, True, True]))
+    assert torch.allclose(ratio, torch.tensor([1.0, 0.25, 0.25]))
+    assert torch.equal(scale, torch.ones_like(scale))
+    assert not clipped.any()
+    assert torch.equal(g0, g0_before)
+    assert torch.equal(g1, g1_before)
+
+
+def test_retention_ratio_clip_is_applied_after_clip_correction():
+    g0 = torch.tensor([2.0])
+    g1 = torch.tensor([10.0])
+    ratio, _, _, clipped = production_ratio_scale(
+        g0, g1, K=5, clip_scale_g0=0.5, clip_scale_g1=0.25)
+
+    # Raw g1/g0 is 5, while the ratio of the gradients that drove the clipped
+    # updates is 2.5; neither value should be confused with displacement ratios.
+    assert torch.allclose(ratio, torch.tensor([2.5]))
+    assert not clipped.item()
 
 
 def test_k_two_has_no_extra_extrapolation():
@@ -67,7 +96,7 @@ def test_diagonal_quadratic_exact_case():
     torch.manual_seed(2)
     h = torch.rand(1000, dtype=torch.float64) * 0.9 + 0.05
     eta = 1.0
-    theta0 = torch.randn(1000, dtype=torch.float64)
+    theta0 = torch.sign(torch.randn(1000, dtype=torch.float64)) * (torch.rand(1000, dtype=torch.float64) * 1.5 + 0.5)
     for K in (2, 4, 8):
         theta1 = theta0 - eta * h * theta0
         theta2 = theta1 - eta * h * theta1
@@ -124,8 +153,22 @@ def test_trigger_gate_uses_rolling_window_mean_and_std():
     assert state.sigma == 0.0
     assert z > 1e9
 
+    # The spike opened a candidate streak (z >= tau), so the baseline that scored it is
+    # pinned for the rest of the excursion: otherwise the spike would be folded into the
+    # mean/std before the next observation was scored, and trigger_patience > 1 could
+    # never be satisfied on a sustained excursion.
+    assert state.trigger_streak == 1
     z, _, triggered = state.update_trigger_state(
         step=4, g0_norm=10.0, g_slow_norm=10.0)
+    assert not triggered
+    assert state.mu == 10.0, 'baseline must stay frozen while a candidate streak is open'
+    assert z == 0.0
+
+    # Back under tau clears the streak, so the live rolling window resumes and now
+    # legitimately includes the spike.
+    assert state.trigger_streak == 0
+    z, _, triggered = state.update_trigger_state(
+        step=5, g0_norm=10.0, g_slow_norm=10.0)
     assert not triggered
     assert state.mu == 50.0 / 3.0
     assert z < 0.0
@@ -179,7 +222,17 @@ def test_gxpo_fallback_uses_sfpo_entropy_gate_in_trainer():
     worker_source = (REPO / 'verl' / 'workers' / 'fsdp_workers.py').read_text()
     actor_source = ACTOR_PATH.read_text()
     assert 'self.gxpo_entropy_container = []' in trainer_source
-    assert 'gxpo_trigger_z = (gxpo_trigger_stat - u) / std' in trainer_source
+    # The entropy gate runs through GXPOState rather than a second inline z-score, so the
+    # preceding-window ordering, the frozen streak baseline and the sustained-level
+    # criterion are shared with the gradient-signal path instead of reimplemented.
+    assert 'self._gxpo_gate.update_trigger_state(' in trainer_source
+    assert '_build_gxpo_entropy_gate' in trainer_source
+    assert 'gxpo_trigger_z = (gxpo_trigger_stat - u) / std' not in trainer_source, (
+        'the inline z-score gate must not come back: its window contained the sample it '
+        'was scoring, which caps abs(z) at sqrt(zscore_w - 1)')
+    # The SFPO path deliberately keeps its own inline gate so existing SFPO baselines
+    # remain reproducible.
+    assert 'sfpo_trigger_z = (self.entropy_container[-1] - u) / std' in trainer_source
     assert "batch.meta_info['gxpo_trigger_stop'] = self.stop_GXPO" in trainer_source
     assert "data.meta_info.get('gxpo_trigger_stop', False)" in worker_source
     assert "self.config.get('gxpo_trigger_signal', 'entropy') == 'entropy'" in actor_source
@@ -226,6 +279,25 @@ def test_probe_passes_skip_discarded_metrics():
     assert 'collect_metrics=skip_corrective' in step_source
     assert 'collect_metrics=False' in step_source
     assert 'collect_metrics=True' in step_source
+
+
+def test_actor_reports_retention_stability_diagnostics():
+    source = ACTOR_PATH.read_text()
+    for metric in (
+            "actor/gxpo_clip_scale_g0",
+            "actor/gxpo_clip_scale_g1",
+            "actor/gxpo_relative_threshold_reject_frac",
+            "actor/gxpo_ratio_clip_frac"):
+        assert metric in source
+    step = next(node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef) and node.name == "_gxpo_minibatch_step")
+    step_source = ast.get_source_segment(source, step)
+    assert "clip_scale_g0=clip_scale_g0" in step_source
+    assert "clip_scale_g1=clip_scale_g1" in step_source
+    assert step_source.index("gn0 = probe_clip_grads()") < step_source.index(
+        "clip_scale_g0 =")
+    assert step_source.index("gn1 = probe_clip_grads()") < step_source.index(
+        "clip_scale_g1 =")
 
 
 def test_attention_backend_is_configurable_with_fa2_default():

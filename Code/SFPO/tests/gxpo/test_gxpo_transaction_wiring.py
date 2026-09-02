@@ -41,7 +41,15 @@ def test_launchers_enable_transactional_mode_and_keep_requested_settings():
     assert 'GXPO_OPTIMIZER_STATE_MODE="${GXPO_OPTIMIZER_STATE_MODE:-transactional}"' in launcher_15
 
     assert 'MODEL_QWEN25_MATH_7B' in launcher_7
-    assert 'export K="${K:-10}"' in launcher_7
+    assert 'export K="${K:-5}"' in launcher_7
     assert 'PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-64}"' in launcher_7
     assert 'GXPO_OPTIMIZER_STATE_MODE="${GXPO_OPTIMIZER_STATE_MODE:-transactional}"' in launcher_7
-    assert 'ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"' in launcher_7
+    assert 'REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.3}"' in launcher_7
+    assert 'ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.8}"' in launcher_7
+
+    common = (EFFICIENCY / 'common.sh').read_text()
+    muon = (EFFICIENCY / 'qwen2.5_1.5b_muon.sh').read_text()
+    assert 'OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"' in common
+    assert 'actor_rollout_ref.actor.optim.name="$OPTIMIZER_NAME"' in common
+    assert 'OPTIMIZER_NAME="${OPTIMIZER_NAME:-muon}"' in muon
+    assert 'MUON_DISTRIBUTED_BACKEND="${MUON_DISTRIBUTED_BACKEND:-gather_scatter}"' in muon

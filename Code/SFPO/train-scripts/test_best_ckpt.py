@@ -3,9 +3,6 @@
 Run: python train-scripts/test_best_ckpt.py
 """
 import numpy as np
-import os
-import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ckpt_steps_to_remove
 
@@ -15,18 +12,23 @@ def _score(metrics):
     return RayPPOTrainer._best_ckpt_score(object(), metrics)
 
 
-def test_score_uses_exact_wandb_metric():
+def test_score_is_macro_mean_pass_at_1():
     m = {
-        "eval_greedy/avg_pass1": 0.42,
-        "val/pass_at_1/amc23": 0.99,
-        "val/pass_at_1/aime24": 0.01,
-        "eval_greedy/avg_pass1/seed0": 0.01,
+        'val/pass_at_1/amc23': 0.20,
+        'val/pass_at_1/aime24': 0.10,
+        'val/pass_at_1/aime25': 0.05,
+        'val/pass_at_1/aime26': 0.05,
+        # these must all be ignored
+        'val/pass_at_1/amc23/seed0': 0.99,
+        'val/pass_at_1/amc23/std': 0.99,
+        'val/pass_at_8/amc23': 0.99,
+        'val/avg_at_8/amc23': 0.99,
+        'val/test_score/amc23': 0.99,
     }
-    assert _score(m) == 0.42, _score(m)
+    assert abs(_score(m) - 0.10) < 1e-9, _score(m)
 
-    # Missing or non-finite W&B metric must never replace an existing best.
-    assert _score({}) == float("-inf")
-    assert _score({"eval_greedy/avg_pass1": float("nan")}) == float("-inf")
+    # no validation sources yet -> never beats an existing best
+    assert _score({}) == float('-inf')
 
 
 def test_retention_keeps_latest_and_pins_best():
@@ -61,7 +63,7 @@ def test_best_is_always_recoverable():
 
 
 if __name__ == '__main__':
-    test_score_uses_exact_wandb_metric()
+    test_score_is_macro_mean_pass_at_1()
     test_retention_keeps_latest_and_pins_best()
     test_best_is_always_recoverable()
     print('ok')

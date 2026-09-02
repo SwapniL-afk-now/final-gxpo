@@ -24,11 +24,30 @@ the expected output.
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
+import resource
+import signal
 import subprocess
 import sys
+import time
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+_MEMORY_LIMIT_MB = max(128, int(os.environ.get("VERIFIER_MEMORY_MB", "2048")))
+
+
+def _set_candidate_limits(timeout: float) -> None:
+    """Apply fail-closed CPU/address-space limits in the candidate child."""
+    try:
+        cpu_limit = max(1, math.ceil(timeout) + 1)
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+        memory_limit = _MEMORY_LIMIT_MB * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+    except (OSError, ValueError):
+        # The wall-clock timeout and process-group kill remain the fallback on
+        # platforms where one of these limits is unavailable.
+        pass
 
 
 def _extract_code(solution_str: str) -> str:
@@ -46,15 +65,15 @@ def compute_score(
     extra_info: dict | None = None,
     timeout: float = 6.0,
     continuous: bool = True,
+    stop_on_failure: bool = False,
 ) -> dict:
     """Score a completion against stdin/stdout test cases.
 
-    `ground_truth` is a JSON object (or already-decoded dict) with parallel
-    "inputs" and "outputs" lists. Each input is piped to the candidate program's
-    stdin in a fresh subprocess; stdout is compared (whitespace-normalized)
-    against the matching output. Scored as the pass fraction across all test
-    cases when `continuous=True` (else 1.0 only if every case passes), or -1.0 if
-    the code fails to run at all.
+    Each test case runs in a fresh subprocess. This function is called inside a
+    bounded verifier worker, so the former extra Manager/process wrapper is
+    unnecessary and would multiply process-launch overhead. ``stop_on_failure``
+    is intended for offline filtering, where a candidate must pass every test;
+    it leaves the default continuous reward behavior unchanged.
     """
     spec = json.loads(ground_truth) if isinstance(ground_truth, str) else ground_truth
     inputs = spec["inputs"]
@@ -62,18 +81,39 @@ def compute_score(
     code = _extract_code(solution_str)
 
     passed = 0
+    deadline = time.monotonic() + timeout
     for stdin, expected in zip(inputs, outputs, strict=True):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 [sys.executable, "-c", code],
-                input=stdin,
-                capture_output=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
+                start_new_session=True,
+                preexec_fn=lambda: _set_candidate_limits(timeout),
             )
-            if _normalize(proc.stdout) == _normalize(expected):
+            try:
+                stdout, _ = proc.communicate(input=stdin, timeout=remaining)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait()
+                if stop_on_failure:
+                    break
+                continue
+            if proc.returncode == 0 and _normalize(stdout) == _normalize(expected):
                 passed += 1
+            elif stop_on_failure:
+                break
         except Exception:
+            if stop_on_failure:
+                break
             continue
 
     total = len(inputs) or 1

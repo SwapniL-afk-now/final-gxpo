@@ -13,9 +13,11 @@ data:
 model:
   attn_implementation: flash_attention_2
   partial_pretrain: ~/models/gemma-1.1-7b-it
+  model_dtype: fp32
   fsdp_config:
     wrap_policy:
       min_num_params: 0
+    strategy: fsdp1
     cpu_offload: False
     offload_params: False
   external_lib: null
@@ -31,6 +33,11 @@ optim:
   weight_decay: 0.01
   warmup_steps_ratio: 0.1
   clip_grad: 1.0
+  # Offline sparse token-distribution distillation (opt-in for generic SFT).
+  kd_enabled: false
+  kd_topk: 32
+  kd_weight: 0.5
+  kd_temperature: 2.0
 ulysses_sequence_parallel_size: 1
 use_remove_padding: False
 trainer:
@@ -43,4 +50,16 @@ trainer:
   total_training_steps: null
   logger: ['console']
   seed: 1
-
+  test_freq: 0
+  greedy_eval_freq: 0
+  save_freq: 0
+  resumable_save_freq: 0
+  keep_best_only: true
+  eval_kind: math
+  eval_benchmark_root: null
+  eval_greedy_max_new_tokens: 512
+  eval_greedy_vllm_gpu_memory_utilization: 0.18
+  eval_greedy_vllm_tensor_parallel_size: 1
+  eval_greedy_vllm_data_parallel_size: 1
+  eval_greedy_vllm_max_num_batched_tokens: 32768
+  eval_greedy_vllm_max_num_seqs: 256

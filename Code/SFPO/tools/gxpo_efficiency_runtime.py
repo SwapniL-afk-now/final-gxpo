@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 BENCHMARK_ORDER = ("math500", "aime24", "aime25", "amc23", "minerva", "olympiadbench")
+CODE_BENCHMARK_ORDER = ("humanevalplus", "mbppplus", "livecodebench")
 BENCHMARK_DISPLAY = {
     "math500": "MATH-500",
     "aime24": "AIME24",
@@ -37,6 +38,9 @@ SOURCE_TO_BENCHMARK = {
     "amc23": "amc23",
     "minerva": "minerva",
     "olympiadbench": "olympiadbench",
+    "humanevalplus": "humanevalplus",
+    "mbppplus": "mbppplus",
+    "livecodebench": "livecodebench",
 }
 
 

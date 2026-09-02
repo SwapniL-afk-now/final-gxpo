@@ -25,9 +25,22 @@ if [[ ! -w "$HF_HOME/hub" ]]; then
 fi
 export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
 mkdir -p "$HF_HUB_CACHE"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  for candidate in "$(command -v python 2>/dev/null || true)"                    "$GXPO_PROJECT_ROOT/.venv/bin/python"                    "/workspace/gradient-extrapolation-based-policy-optimization/.venv-h200/bin/python"                    "/venv/main/bin/python"                    "$(command -v python3 2>/dev/null || true)"; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "${PYTHON_BIN:-}" || ! -x "$PYTHON_BIN" ]]; then
+  echo "No usable Python interpreter found for the GXPO launcher" >&2
+  exit 2
+fi
+export PYTHON_BIN
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_3}"
 export ATTN_IMPL
-python - "$ATTN_IMPL" <<'PY'
+"$PYTHON_BIN" - "$ATTN_IMPL" <<'PY'
 import importlib.util
 import sys
 
@@ -49,7 +62,7 @@ FINAL_EVAL_SEEDS="${FINAL_EVAL_SEEDS:-0 1 2 3}"
 MAX_STEPS="${MAX_STEPS:-400}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 SFPO_WARMUP_STEPS="${SFPO_WARMUP_STEPS:-50}"
-GXPO_WARMUP_STEPS="${GXPO_WARMUP_STEPS:-50}"
+GXPO_WARMUP_STEPS="${GXPO_WARMUP_STEPS:-0}"
 GXPO_TAU="${GXPO_TAU:-3.0}"
 GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
 GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-3}"
@@ -73,6 +86,12 @@ VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 LR="${LR:-1e-6}"
+OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
+MUON_MOMENTUM="${MUON_MOMENTUM:-0.95}"
+MUON_NS_STEPS="${MUON_NS_STEPS:-5}"
+MUON_NESTEROV="${MUON_NESTEROV:-True}"
+MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-1e-2}"
+MUON_DISTRIBUTED_BACKEND="${MUON_DISTRIBUTED_BACKEND:-gather_scatter}"
 USE_LIGER="${USE_LIGER:-True}"
 OPTIM_FUSED="${OPTIM_FUSED:-False}"
 ENABLE_GRADIENT_CHECKPOINTING="${ENABLE_GRADIENT_CHECKPOINTING:-True}"
@@ -191,6 +210,24 @@ TRAIN_FILES="['$DAPO_TRAIN','$LIGHTEVAL_TRAIN']"
 VAL_FILES="['$MATH500','$AIME24','$AIME25','$AMC23','$MINERVA','$OLYMPIAD']"
 
 METHOD_FLAGS=()
+OPTIMIZER_FLAGS=()
+case "${OPTIMIZER_NAME,,}" in
+  adamw)
+    ;;
+  muon)
+    OPTIMIZER_FLAGS+=(
+      +actor_rollout_ref.actor.optim.muon_momentum="$MUON_MOMENTUM"
+      +actor_rollout_ref.actor.optim.muon_ns_steps="$MUON_NS_STEPS"
+      +actor_rollout_ref.actor.optim.muon_nesterov="$MUON_NESTEROV"
+      +actor_rollout_ref.actor.optim.weight_decay="$MUON_WEIGHT_DECAY"
+      +actor_rollout_ref.actor.optim.muon_distributed_backend="$MUON_DISTRIBUTED_BACKEND"
+    )
+    ;;
+  *)
+    echo "Unsupported OPTIMIZER_NAME=$OPTIMIZER_NAME (expected adamw or muon)" >&2
+    exit 2
+    ;;
+esac
 # Gate v2 (opt-in; see .audit/gxpo_algorithm_findings.md):
 #   GXPO_TRIGGER_ROBUST=1   -> median/MAD z-score (resists early-warmup transient bursts)
 #   GXPO_TRIGGER_MIN_OBS=N  -> gate cannot trip until N scored post-warmup observations
@@ -299,6 +336,12 @@ gxpo_zscore_w=$GXPO_ZSCORE_W
 gxpo_trigger_signal=$GXPO_TRIGGER_SIGNAL
 gxpo_shutoff_mode=$GXPO_SHUTOFF_MODE
 gxpo_optimizer_state_mode=$GXPO_OPTIMIZER_STATE_MODE
+optimizer=$OPTIMIZER_NAME
+muon_momentum=$MUON_MOMENTUM
+muon_ns_steps=$MUON_NS_STEPS
+muon_nesterov=$MUON_NESTEROV
+muon_weight_decay=$MUON_WEIGHT_DECAY
+muon_distributed_backend=$MUON_DISTRIBUTED_BACKEND
 gxpo_trigger_robust=${GXPO_TRIGGER_ROBUST:-0}
 gxpo_trigger_min_obs=${GXPO_TRIGGER_MIN_OBS:-0}
 gxpo_max_active_steps=${GXPO_MAX_ACTIVE_STEPS:-0}
@@ -317,7 +360,7 @@ validation_files=$VAL_FILES
 run_dir=$RUN_DIR
 EOF
 
-python -u -m verl.trainer.main_ppo \
+"$PYTHON_BIN" -u -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \
   +algorithm.norm_adv_by_std_in_grpo=False \
   +algorithm.use_kl_in_reward=False \
@@ -337,7 +380,8 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.model.attn_implementation="$ATTN_IMPL" \
   +actor_rollout_ref.model.use_liger="$USE_LIGER" \
   actor_rollout_ref.actor.optim.lr="$LR" \
-  +actor_rollout_ref.actor.optim.name=adamw \
+  +actor_rollout_ref.actor.optim.name="$OPTIMIZER_NAME" \
+  "${OPTIMIZER_FLAGS[@]}" \
   +actor_rollout_ref.actor.optim.fused="$OPTIM_FUSED" \
   actor_rollout_ref.actor.use_torch_compile="$USE_TORCH_COMPILE" \
   +actor_rollout_ref.actor.data_loader_seed="$TRAIN_SEED" \

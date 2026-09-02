@@ -36,22 +36,27 @@ def _extract_code(solution_str: str) -> str:
     return matches[-1] if matches else solution_str
 
 
-def _run(code: str, test: str, entry_point: str, result: list) -> None:
+def _run(code: str, test: str, entry_point: str, result_conn) -> None:
     namespace: dict = {}
+    passed = False
     try:
         exec(code, namespace)  # noqa: S102 - sandboxed in a separate, timeout-bounded process
         exec(test, namespace)  # noqa: S102
         if entry_point not in namespace:
-            result.append(False)
             return
         if "check" in namespace:
             namespace["check"](namespace[entry_point])
         # else: MBPP+-style `test` scripts call the entry point directly at module
         # level, so simply exec'ing it above already ran (and would have raised on
         # failure) the assertions.
-        result.append(True)
+        passed = True
     except Exception:
-        result.append(False)
+        passed = False
+    finally:
+        try:
+            result_conn.send(passed)
+        finally:
+            result_conn.close()
 
 
 def compute_score(
@@ -80,14 +85,15 @@ def compute_score(
     completion = _extract_code(solution_str)
     code = completion if f"def {entry_point}" in completion else f"{prompt}\n{completion}"
 
-    manager = multiprocessing.Manager()
-    result = manager.list()
-    p = multiprocessing.Process(target=_run, args=(code, test, entry_point, result))
+    result_conn, child_conn = multiprocessing.Pipe(duplex=False)
+    p = multiprocessing.Process(target=_run, args=(code, test, entry_point, child_conn))
     p.start()
+    child_conn.close()
     p.join(timeout=timeout)
     if p.is_alive():
         p.kill()
         p.join()
 
-    passed = bool(result) and result[0] is True
+    passed = bool(result_conn.poll()) and result_conn.recv() is True
+    result_conn.close()
     return {"score": 1.0 if passed else -1.0, "acc": passed}

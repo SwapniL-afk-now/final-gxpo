@@ -546,13 +546,21 @@ class DataParallelPPOActor(BasePPOActor):
                             select_keys,
                             non_tensor_select_keys=None,
                             recompute_old_log_probs=False,
-                            collect_metrics=True):
+                            collect_metrics=True,
+                            collect_gate_entropy=False):
         """Zero grads and run one full forward/backward over a PPO mini-batch.
 
         Counts as exactly one backward pass (gradient accumulation over
         micro-batches). Does NOT clip or step the optimizer. When
         `recompute_old_log_probs`, old_log_probs are refreshed under no_grad at
         the current parameters (GXPO probe/correction passes).
+
+        `collect_gate_entropy` emits `actor/gxpo_gate_entropy` regardless of
+        `collect_metrics`. The shutoff gate needs entropy sampled at the SAME point in
+        every update -- the g0 probe, at theta0 -- because `actor/entropy_loss` is sourced
+        from pass 3 (at theta_tilde) on extrapolating steps and from the single pass (at
+        theta_prev) on fallback steps, which puts a level shift in the gate's own series
+        exactly when GXPO shuts off.
         """
         # split batch into micro_batches
         if has_multi_modal_inputs:
@@ -607,7 +615,7 @@ class DataParallelPPOActor(BasePPOActor):
             # Entropy is consumed only through the logged entropy_loss metric and the
             # `- entropy_loss * entropy_coeff` term. When metrics are not collected
             # and the coefficient is zero, skip the softmax+logsumexp entirely.
-            need_entropy = collect_metrics or entropy_coeff != 0
+            need_entropy = collect_metrics or collect_gate_entropy or entropy_coeff != 0
 
             # all return: (bsz, response_length)
             if need_entropy:
@@ -659,6 +667,9 @@ class DataParallelPPOActor(BasePPOActor):
             self.raw_backward_calls += 1
             self._gxpo_power_guard(backward_start)
 
+            if collect_gate_entropy:
+                append_to_dict(metrics, {'actor/gxpo_gate_entropy': entropy_loss.detach()})
+
             if collect_metrics:
                 # GPU-scalar accumulation with a single deferred D2H sync per
                 # mini-batch below, instead of one .item() sync per micro-batch.
@@ -673,7 +684,7 @@ class DataParallelPPOActor(BasePPOActor):
         # Materialize deferred GPU scalars in one sync. Values are bit-identical to
         # the previous per-micro-batch .item() conversions; list lengths unchanged.
         for key in ('actor/entropy_loss', 'actor/pg_loss', 'actor/pg_clipfrac', 'actor/ppo_kl',
-                    'actor/kl_loss'):
+                    'actor/kl_loss', 'actor/gxpo_gate_entropy'):
             vals = metrics.get(key)
             if vals and isinstance(vals[0], torch.Tensor):
                 metrics[key] = torch.stack(vals).tolist()
@@ -733,6 +744,9 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_cos_g0_gslow': 0.0,
             'actor/gxpo_inactive_frac': 0.0,
             'actor/gxpo_ratio_clip_frac': 0.0,
+            'actor/gxpo_clip_scale_g0': 0.0,
+            'actor/gxpo_clip_scale_g1': 0.0,
+            'actor/gxpo_relative_threshold_reject_frac': 0.0,
         }
 
     def _gxpo_init_buffers(self):
@@ -801,7 +815,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         def standard_step(fallback_triggered=False):
             metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                               non_tensor_select_keys)
+                                               non_tensor_select_keys, collect_gate_entropy=True)
             step_start = time.perf_counter()
             grad_norm = self._optimizer_step()
             self._gxpo_power_guard(step_start)
@@ -859,7 +873,8 @@ class DataParallelPPOActor(BasePPOActor):
         # ablation has no Pass 3 to source them from, and ray_trainer reads actor/entropy_loss every step.
         try:
             probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                     non_tensor_select_keys, collect_metrics=skip_corrective)
+                                     non_tensor_select_keys, collect_metrics=skip_corrective,
+                                     collect_gate_entropy=True)
         except BaseException:
             restore_probe_state()
             raise
@@ -867,6 +882,7 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_capture_grads(g0_bufs)
         step_start = time.perf_counter()
         gn0 = probe_clip_grads().detach().item()
+        clip_scale_g0 = min(1.0, float(self.config.grad_clip) / (abs(gn0) + 1e-12))
         valid_gn0 = (gn0 == gn0 and abs(gn0) != float('inf') and gn0 > 1e-8)
         valid_gn0_global = self._all_ranks_flag(valid_gn0, device)
         if valid_gn0_global:
@@ -887,6 +903,7 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_capture_grads(g1_bufs)
         step_start = time.perf_counter()
         gn1 = probe_clip_grads().detach().item()
+        clip_scale_g1 = min(1.0, float(self.config.grad_clip) / (abs(gn1) + 1e-12))
         valid_gn1 = (gn1 == gn1 and abs(gn1) != float('inf'))
         valid_gn1_global = self._all_ranks_flag(valid_gn1, device)
         if valid_gn1_global:
@@ -928,13 +945,15 @@ class DataParallelPPOActor(BasePPOActor):
                     torch.cuda.synchronize()
                 # ---- ALGORITHMIC PATH: retention scale + reposition write stay
                 # ---- op-for-op identical to the previous per-parameter loop.
-                r, scale, active, ratio_clipped = compute_gxpo_retention_scale(g0b, g1b, K, delta)
+                r, scale, active, ratio_clipped = compute_gxpo_retention_scale(
+                    g0b, g1b, K, delta, clip_scale_g0=clip_scale_g0, clip_scale_g1=clip_scale_g1)
                 stats[2] += (g0b * g1b).sum()
                 stats[7] += active.sum()
                 stats[8] += g0b.numel()
                 stats[14] += ratio_clipped.sum()
                 stats[9] += scale.float().sum()
-                scale_max = torch.maximum(scale_max, scale.float().amax().reshape(1))
+                if scale.numel():
+                    scale_max = torch.maximum(scale_max, scale.float().amax().reshape(1))
 
                 stats[5] += r.sum()
                 stats[6] += r.square().sum()
@@ -1069,6 +1088,12 @@ class DataParallelPPOActor(BasePPOActor):
             self._gxpo_release_buffers()
 
         metrics = pass3_metrics
+        # probe_metrics is otherwise discarded whenever a corrective pass exists, but it
+        # carries the gate's entropy observation (sampled at theta0). Without this the
+        # gate would silently fall back to the pass-3 value measured at theta_tilde.
+        gate_entropy = probe_metrics.get('actor/gxpo_gate_entropy')
+        if gate_entropy is not None and 'actor/gxpo_gate_entropy' not in metrics:
+            metrics['actor/gxpo_gate_entropy'] = gate_entropy
         append_to_dict(metrics, {'actor/grad_norm': float(gn_slow)})
         append_to_dict(metrics, {
             'actor/gxpo_enabled': 1.0,
@@ -1089,6 +1114,10 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_cos_g0_gslow': dot0slow / (g0_norm * gslow_norm + eps),
             'actor/gxpo_inactive_frac': 1.0 - n_active / max(n_total, 1.0),
             'actor/gxpo_ratio_clip_frac': ratio_clipped / max(n_active, 1.0),
+            'actor/gxpo_clip_scale_g0': clip_scale_g0,
+            'actor/gxpo_clip_scale_g1': clip_scale_g1,
+            'actor/gxpo_relative_threshold_reject_frac':
+                1.0 - n_active / max(n_total, 1.0),
             'actor/gxpo_fallback_triggered': 0.0,
             'reposition/jump_norm': abs(alpha) * dispK_norm,
             'reposition/jump_relative_to_param_norm': abs(alpha) * dispK_norm / (param_norm + eps),
@@ -1124,7 +1153,13 @@ class DataParallelPPOActor(BasePPOActor):
         # the ratio from global counts before making the branch decision.
         format_error_ratio, format_error_count, format_sample_count = (
             self._global_format_error_ratio(data))
-        history_ready = len(self.gxpo_state.trigger_history) >= self.gxpo_state.zscore_w
+        # Under gxpo_trigger_signal=entropy the actor's GXPOState is bypassed entirely, so
+        # its trigger_history stays empty forever and this guard could never engage. The
+        # trainer owns that gate and already ships its readiness in meta_info; read it.
+        if str(self.config.get('gxpo_trigger_signal', 'entropy')).lower() == 'entropy':
+            history_ready = bool(data.meta_info.get('gxpo_entropy_window_ready', False))
+        else:
+            history_ready = len(self.gxpo_state.trigger_history) >= self.gxpo_state.zscore_w
         history_ready = self._all_ranks_flag(
             history_ready, data.batch['token_level_scores'].device,
             reduce_op=torch.distributed.ReduceOp.MIN)

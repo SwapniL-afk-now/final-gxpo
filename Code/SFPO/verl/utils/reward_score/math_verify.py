@@ -33,8 +33,10 @@ def compute_score(model_output: str, ground_truth: str) -> float:
     ground_truth_boxed = "\\boxed{" + str(ground_truth) + "}"
     try:
         ret_score, _ = verify_func([ground_truth_boxed], [model_output])
-    except Exception as e:
-        print(e)
+    except BaseException as e:
+        # math_verify.TimeoutException inherits directly from BaseException.
+        # A pathological answer must be scored as incorrect, never abort training.
+        print(f"[math_verify] verifier failure; assigning zero reward: {type(e).__name__}: {e}")
 
     return 1.0 if float(ret_score) == 1.0 else 0.0
 

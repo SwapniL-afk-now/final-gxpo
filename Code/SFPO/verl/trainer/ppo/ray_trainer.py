@@ -53,6 +53,7 @@ from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from .presampling_selector import DataProfiler
 from tools.gxpo_efficiency_runtime import (
+    CODE_BENCHMARK_ORDER,
     BENCHMARK_ORDER, append_jsonl, json_safe, make_run_manifest, sample_gpu_telemetry,
     scalar, source_to_benchmark, write_json,
 )
@@ -472,6 +473,11 @@ class RayPPOTrainer(object):
         self.gxpo_trigger_streak = 0
         self.gxpo_trigger_step = None
         self.gxpo_entropy_reset_done = False
+        # The entropy gate runs through the same GXPOState machine as the gradient-signal
+        # gate instead of a second inline z-score, so `gxpo_tau`, `gxpo_trigger_patience`,
+        # `gxpo_zscore_w` and the sustained-level criterion mean one thing everywhere.
+        # Built lazily on first use: the actor config is not fully resolved at __init__.
+        self._gxpo_gate = None
 
         self.targeted_easy = self.config.data.get('target_zero_variance', 0.25) / 3
         self.targeted_hard = self.config.data.get('target_zero_variance', 0.25) * 2 / 3 # more exploration on hard examples, because they are more likely to change (conidering that overall reward is increasing.)
@@ -745,15 +751,18 @@ class RayPPOTrainer(object):
             benchmark = source_to_benchmark(source)
             if benchmark is not None:
                 values[benchmark] = float(value)
-        for benchmark in BENCHMARK_ORDER:
+        benchmark_order = (CODE_BENCHMARK_ORDER
+                          if any(key in values for key in CODE_BENCHMARK_ORDER)
+                          else BENCHMARK_ORDER)
+        for benchmark in benchmark_order:
             if benchmark in values:
                 result[f'eval_greedy/{benchmark}_pass1'] = values[benchmark]
-        if os.environ.get('GXPO_EFFICIENCY_RUN') and set(values) != set(BENCHMARK_ORDER):
+        if os.environ.get('GXPO_EFFICIENCY_RUN') and benchmark_order == BENCHMARK_ORDER and set(values) != set(BENCHMARK_ORDER):
             missing = sorted(set(BENCHMARK_ORDER) - set(values))
             raise RuntimeError(f'GXPO efficiency validation requires all six benchmarks; missing {missing}')
         if values:
             # Macro-average across benchmark datasets, never across examples.
-            result['eval_greedy/avg_pass1'] = float(np.mean([values[k] for k in BENCHMARK_ORDER if k in values]))
+            result['eval_greedy/avg_pass1'] = float(np.mean([values[k] for k in benchmark_order if k in values]))
             result['eval_greedy/benchmark_count'] = len(values)
         result['eval_greedy/global_step'] = int(self.global_steps)
         return result
@@ -1005,11 +1014,48 @@ class RayPPOTrainer(object):
                        'type': 'model_only',
                        'path': os.path.relpath(best_local_folder, self.config.trainer.default_local_dir)}, f)
 
+    def _prune_old_checkpoints(self, pending_step=None):
+        """Delete stale global_step_* dirs, keeping the newest `keep_last_ckpts`.
+
+        `pending_step` is the checkpoint that is about to be written. Counting it
+        toward the retention budget lets the retired checkpoint's space be freed
+        *before* the write, so peak disk usage is one full checkpoint rather than
+        two. The separate best model-only checkpoint lives under `best_checkpoint/`
+        and is retained independently by _save_best_model_checkpoint.
+        """
+        if self.config.trainer.get('keep_all_ckpts', False):
+            return
+        n = max(int(self.config.trainer.get('keep_last_ckpts', 1)), 1)
+        root = self.config.trainer.default_local_dir
+
+        steps = []
+        for d in os.listdir(root):
+            if not d.startswith('global_step_'):
+                continue
+            try:
+                steps.append(int(d.split('_')[-1]))
+            except ValueError:
+                continue  # Ignore malformed directories
+        if pending_step is not None and pending_step not in steps:
+            steps.append(pending_step)
+
+        for step in ckpt_steps_to_remove(steps, n):
+            if step == pending_step:
+                continue
+            dir_to_remove = os.path.join(root, f'global_step_{step}')
+            print(f"Removing old checkpoint directory: {dir_to_remove}")
+            shutil.rmtree(dir_to_remove, ignore_errors=True)
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
                                                 f'global_step_{self.global_steps}')
         actor_local_path = os.path.join(local_global_step_folder, 'actor')
+
+        # Free the retired checkpoint before writing the new one. A 7B full
+        # checkpoint is ~85 GiB here, so pruning afterwards requires room for two
+        # simultaneously and exhausts the volume mid-write.
+        self._prune_old_checkpoints(pending_step=self.global_steps)
 
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, f'global_step_{self.global_steps}', 'actor')
@@ -1074,27 +1120,6 @@ class RayPPOTrainer(object):
         local_sampling_num = os.path.join(self.config.trainer.default_local_dir, 'sampling_num.txt')
         with open(local_sampling_num, 'w') as f:
             f.write(str(self.sampling_num))
-
-        # Keep only the latest n full checkpoints. The separate best model-only
-        # checkpoint is retained independently by _save_best_model_checkpoint.
-        n = max(int(self.config.trainer.get('keep_last_ckpts', 1)), 1)
-        if self.config.trainer.get('keep_all_ckpts', False):
-            return
-
-        checkpoint_dirs = [d for d in os.listdir(self.config.trainer.default_local_dir)
-                        if d.startswith('global_step_')]
-        steps = []
-        for d in checkpoint_dirs:
-            try:
-                step = int(d.split('_')[-1])
-                steps.append(step)
-            except ValueError:
-                continue  # Ignore malformed directories
-
-        for step in ckpt_steps_to_remove(steps, n):
-            dir_to_remove = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
-            print(f"Removing old checkpoint directory: {dir_to_remove}")
-            shutil.rmtree(dir_to_remove, ignore_errors=True)
 
     def _load_checkpoint(self):
         print('self.config.trainer.resume_mode', self.config.trainer.resume_mode)
@@ -1487,6 +1512,11 @@ class RayPPOTrainer(object):
                 'gxpo/trigger_candidate': scalar(metrics.get('actor/gxpo_trigger_candidate'), 0.0),
                 'gxpo/trigger_patience': scalar(actor_cfg.get('gxpo_trigger_patience'), 1.0),
                 'gxpo/entropy_window_ready': scalar(metrics.get('actor/gxpo_entropy_window_ready'), 0.0),
+                'gxpo/level_ratio': scalar(metrics.get('actor/gxpo_level_ratio'), 0.0),
+                'gxpo/level_limit': scalar(metrics.get('actor/gxpo_level_limit'), 0.0),
+                'gxpo/level_streak': scalar(metrics.get('actor/gxpo_level_streak'), 0.0),
+                'gxpo/level_baseline': scalar(metrics.get('actor/gxpo_level_baseline'), 0.0),
+                'gxpo/gate_entropy': scalar(metrics.get('actor/gxpo_gate_entropy')),
                 'gxpo/trigger_warmup_active': scalar(metrics.get('actor/gxpo_trigger_warmup_active'), 0.0),
             })
         elif actor_cfg.get('use_sfpo', False):
@@ -1524,6 +1554,45 @@ class RayPPOTrainer(object):
             validation_path = os.path.join(self._efficiency_run_dir, 'greedy_validation.jsonl')
             keep_last_validations = self.config.trainer.get('keep_last_validations', 0)
             write_retained_jsonl(validation_path, val_row, keep_last_validations)
+
+    def _build_gxpo_entropy_gate(self, actor_cfg):
+        """Trainer-side GXPOState driving the SFPO-style entropy shutoff.
+
+        The actor's own GXPOState is unreachable under ``gxpo_trigger_signal=entropy``
+        (``update_policy_gxpo`` short-circuits it), and it lives in a different process, so
+        the gate is owned here. Reusing GXPOState rather than an inline z-score buys three
+        things the inline version did not have:
+
+        * ``update_stats`` scores each observation against the **preceding** window instead
+          of one that already contains it (a self-inclusive window caps abs(z) at
+          ``sqrt(zscore_w - 1)``, so a nominal tau of 3.0 demanded >55% of the theoretical
+          maximum deviation);
+        * a frozen baseline while a candidate streak is open, which is what makes
+          ``trigger_patience > 1`` satisfiable at all;
+        * the relative sustained-level criterion, which catches a slow entropy drift that a
+          windowed z-score structurally cannot see.
+
+        ``gxpo_omega`` supplies the relative threshold. Entropy is not scale-portable
+        (0.10-0.35 nats on the Qwen-Math runs, 4.2-4.7 on Llama-3.2-3B), so the level test
+        must be relative to this run's own post-warmup baseline rather than absolute.
+        """
+        from verl.workers.actor.gxpo_state import GXPOState
+        return GXPOState(
+            tau=float(actor_cfg.get('gxpo_tau', 3.0)),
+            omega=float(actor_cfg.get('gxpo_omega', 0.1)),
+            zscore_w=int(actor_cfg.get('gxpo_zscore_w', 30)),
+            # The gate observes completed outer batches; warmup and the post-warmup reset
+            # are applied by the caller, which owns `global_steps`.
+            warmup_steps=0,
+            shutoff_mode='legacy_g0',
+            fallback_mode=str(actor_cfg.get('gxpo_fallback_mode', 'permanent')).lower(),
+            fallback_window=int(actor_cfg.get('gxpo_fallback_window', 10)),
+            trigger_patience=max(1, int(actor_cfg.get('gxpo_trigger_patience', 1))),
+            trigger_robust=bool(actor_cfg.get('gxpo_trigger_robust', False)),
+            min_post_warmup_obs=int(actor_cfg.get('gxpo_trigger_min_obs', 0)),
+            sustain_window=int(actor_cfg.get('gxpo_trigger_sustain_w', 10)),
+            relative_threshold=float(actor_cfg.get('gxpo_omega', 0.1)),
+        )
 
     def fit(self):
         """
@@ -1835,24 +1904,34 @@ class RayPPOTrainer(object):
                     metrics.update(reward_metrics)
                     batch_num = len(batch)
 
+                    actor_cfg = self.config.actor_rollout_ref.actor
                     # Keep the complete sampled batch for reward/accuracy/pass
-                    # metrics, but only send mixed-correctness prompt groups to
-                    # the actor.  Map the prompt-order rows back to the live
-                    # (possibly seqlen-balanced) batch order.
-                    actor_update_rows_original, mixed_prompt_count = mixed_response_indices(
+                    # metrics. When enabled, only mixed-correctness prompt
+                    # groups are sent to the actor. Map the prompt-order rows
+                    # back to the live (possibly seqlen-balanced) batch order.
+                    # GXPO retains the historical filtering default; GRPO can
+                    # opt in explicitly through filter_mixed_responses.
+                    filter_mixed_responses = bool(actor_cfg.get(
+                        'filter_mixed_responses', actor_cfg.get('use_gxpo', False)))
+                    mixed_rows_original, mixed_prompt_count = mixed_response_indices(
                         reward_flat, self.config, divisor=int(self.actor_rollout_wg.world_size))
-                    if inv_balance_perm is not None and actor_update_rows_original.numel():
-                        actor_update_rows = inv_balance_perm.to(
-                            device=actor_update_rows_original.device)[actor_update_rows_original]
+                    if filter_mixed_responses:
+                        if inv_balance_perm is not None and mixed_rows_original.numel():
+                            actor_update_rows = inv_balance_perm.to(
+                                device=mixed_rows_original.device)[mixed_rows_original]
+                        else:
+                            actor_update_rows = mixed_rows_original
+                        actor_update_rows = torch.sort(actor_update_rows).values
+                        actor_update_indices = actor_update_rows.detach().cpu().tolist()
                     else:
-                        actor_update_rows = actor_update_rows_original
-                    actor_update_rows = torch.sort(actor_update_rows).values
-                    actor_update_indices = actor_update_rows.detach().cpu().tolist()
+                        actor_update_indices = list(range(batch_num))
                     metrics.update({
                         'examples/mixed_response_prompt_count': float(mixed_prompt_count),
                         'examples/actor_update_response_count': float(len(actor_update_indices)),
                         'examples/actor_update_response_ratio': (
                             float(len(actor_update_indices)) / max(float(batch_num), 1.0)),
+                        'examples/mixed_response_filtering_enabled': float(
+                            filter_mixed_responses),
                     })
 
                     easy_data_num += reward_metrics["examples/all_correct_example_ratio"] * batch_num
@@ -2012,6 +2091,8 @@ class RayPPOTrainer(object):
                         if self.gxpo_entropy_container else 0.0
                     )
                     if actor_cfg.get('use_gxpo', False):
+                        if self._gxpo_gate is None:
+                            self._gxpo_gate = self._build_gxpo_entropy_gate(actor_cfg)
                         gxpo_warmup_steps = int(actor_cfg.get('gxpo_warmup_steps', 0))
                         gxpo_trigger_enabled = self.global_steps > gxpo_warmup_steps
                         gxpo_zscore_w = int(actor_cfg.get('gxpo_zscore_w', 30))
@@ -2025,6 +2106,10 @@ class RayPPOTrainer(object):
                             self.gxpo_entropy_reset_done = True
                             self.gxpo_trigger_streak = 0
                             gxpo_trigger_stat = 0.0
+                            # The gate's own rolling window and the frozen level baseline
+                            # must start from the post-warmup regime too, or the level
+                            # criterion would measure the drift against fast-phase entropy.
+                            self._gxpo_gate.reset_trigger_baseline()
 
                         gxpo_fallback_mode = str(
                         actor_cfg.get('gxpo_fallback_mode', 'permanent')).lower()
@@ -2040,38 +2125,54 @@ class RayPPOTrainer(object):
                         self.stop_GXPO = False
                         self.gxpo_trigger_step = None
                         self.gxpo_trigger_streak = 0
+                        if self._gxpo_gate is not None:
+                            # Re-arm the criterion engine too, keeping the rolling window
+                            # and level baseline it already learned (a cold reset would
+                            # re-derive "normal" from the post-fallback GRPO regime).
+                            self._gxpo_gate.trigger_index = float('inf')
+                            self._gxpo_gate.trigger_streak = 0
+                            self._gxpo_gate.level_streak = 0
+                            self._gxpo_gate._frozen_baseline = None
                         print(
                             f'[GXPO] temporary fallback ended at outer batch '
                             f'{self.global_steps}; re-arming GXPO')
 
-                    gxpo_baseline_ready = (
-                        gxpo_zscore_w > 0 and
-                        len(self.gxpo_entropy_container) >= gxpo_zscore_w)
-                    if (gxpo_trigger_enabled and gxpo_baseline_ready and
-                            not self.stop_GXPO and gxpo_trigger_signal == 'entropy'):
-                        # SFPO ordering: score the latest completed outer
-                        # batch against the preceding rolling window.
-                        u = float(np.mean(self.gxpo_entropy_container[-gxpo_zscore_w:]))
-                        std = float(np.std(self.gxpo_entropy_container[-gxpo_zscore_w:])) + 1e-9
-                        gxpo_trigger_z = (gxpo_trigger_stat - u) / std
+                    gxpo_level_ratio = 0.0
+                    if (gxpo_trigger_enabled and not self.stop_GXPO and
+                            gxpo_trigger_signal == 'entropy' and self.gxpo_entropy_container):
+                        # Score the latest completed outer batch through GXPOState rather
+                        # than an inline z-score. update_stats scores against the PRECEDING
+                        # window (the inline version's window already contained the sample
+                        # it was scoring, which caps |z| at sqrt(w-1) ~= 5.39 for w=30 and
+                        # made tau=3.0 demand >55% of the theoretical maximum deviation),
+                        # holds the baseline fixed while a candidate streak is open, and
+                        # additionally applies the relative sustained-level criterion that
+                        # catches a slow drift a rolling mean would simply follow.
+                        gxpo_trigger_z, _, gxpo_gate_fired = self._gxpo_gate.update_trigger_state(
+                            step=int(self.global_steps),
+                            g0_norm=gxpo_trigger_stat,
+                            g_slow_norm=gxpo_trigger_stat,
+                            allow_trigger=True,
+                            stat_override=gxpo_trigger_stat)
                         gxpo_trigger_candidate = gxpo_trigger_z >= float(
                             actor_cfg.get('gxpo_tau', 3.0))
-                        if gxpo_trigger_candidate:
-                            self.gxpo_trigger_streak += 1
-                        else:
-                            self.gxpo_trigger_streak = 0
-                        gxpo_trigger_patience = max(
-                            1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
-                        if (self.gxpo_trigger_streak >= gxpo_trigger_patience and
-                                not self.stop_GXPO):
+                        # Either criterion can own the streak; report whichever is further
+                        # along so the logged streak matches the criterion about to fire.
+                        self.gxpo_trigger_streak = max(self._gxpo_gate.trigger_streak,
+                                                       self._gxpo_gate.level_streak)
+                        gxpo_level_ratio = self._gxpo_gate.level_ratio()
+                        if gxpo_gate_fired and not self.stop_GXPO:
                             self.stop_GXPO = True
                             if self.gxpo_trigger_step is None:
                                 self.gxpo_trigger_step = int(self.global_steps)
+                            reason = ('sustained level' if self._gxpo_gate.level_streak
+                                      >= self._gxpo_gate.trigger_patience else 'z-score')
                             print(
                                 f'[GXPO] entropy shutoff triggered at outer batch '
-                                f'{self.global_steps}: z={gxpo_trigger_z:.3f} '
-                                f'>= tau={float(actor_cfg.get("gxpo_tau", 3.0)):.3f} '
-                                f'after {gxpo_trigger_patience} consecutive observations '
+                                f'{self.global_steps} via {reason}: z={gxpo_trigger_z:.3f} '
+                                f'(tau={float(actor_cfg.get("gxpo_tau", 3.0)):.3f}), '
+                                f'level={gxpo_level_ratio:.3f}x baseline '
+                                f'(limit {1.0 + self._gxpo_gate.relative_threshold:.3f}x) '
                                 f'-> {gxpo_fallback_mode} fallback')
                     elif self.stop_GXPO:
                         # Do not accumulate trigger streaks while temporary GRPO
@@ -2080,13 +2181,21 @@ class RayPPOTrainer(object):
                         gxpo_trigger_z = 0.0
                         gxpo_trigger_candidate = False
                         self.gxpo_trigger_streak = 0
+                    # "Ready" now means the gate itself holds a full scoring window, which is
+                    # what the actor's degenerate-batch guard needs to know (it used to ask
+                    # the actor's GXPOState, whose history is never populated in this mode).
+                    gxpo_baseline_ready = bool(
+                        self._gxpo_gate is not None and gxpo_zscore_w > 0 and
+                        len(self._gxpo_gate.trigger_history) >= gxpo_zscore_w)
 
                     # implement critic warmup
                     ####################################MODIFICATION####################################
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer('update_actor', timing_raw):
-                            if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
+                            use_gxpo = self.config.actor_rollout_ref.actor.get('use_gxpo', False)
+                            use_sfpo = self.config.actor_rollout_ref.actor.get('use_sfpo', False)
+                            if use_gxpo or (filter_mixed_responses and not use_sfpo):
                                 actor_update_batch = batch
                                 if actor_update_indices:
                                     actor_update_batch = batch.select_via_index(actor_update_indices)
@@ -2106,16 +2215,19 @@ class RayPPOTrainer(object):
                                     }})
 
                                 if actor_update_indices:
-                                    actor_update_batch.meta_info['gxpo_trigger_enabled'] = (
-                                    gxpo_trigger_enabled
-                                    )
-                                    actor_update_batch.meta_info['gxpo_trigger_stop'] = self.stop_GXPO
-                                    actor_update_batch.meta_info['gxpo_trigger_z'] = gxpo_trigger_z
-                                    actor_update_batch.meta_info['gxpo_trigger_stat'] = gxpo_trigger_stat
-                                    actor_update_batch.meta_info['gxpo_trigger_streak'] = self.gxpo_trigger_streak
-                                    actor_update_batch.meta_info['gxpo_trigger_candidate'] = gxpo_trigger_candidate
-                                    actor_update_batch.meta_info['gxpo_entropy_window_ready'] = gxpo_baseline_ready
-                                    actor_output = self.actor_rollout_wg.gxpo_update_actor(actor_update_batch)
+                                    if use_gxpo:
+                                        actor_update_batch.meta_info['gxpo_trigger_enabled'] = (
+                                        gxpo_trigger_enabled
+                                        )
+                                        actor_update_batch.meta_info['gxpo_trigger_stop'] = self.stop_GXPO
+                                        actor_update_batch.meta_info['gxpo_trigger_z'] = gxpo_trigger_z
+                                        actor_update_batch.meta_info['gxpo_trigger_stat'] = gxpo_trigger_stat
+                                        actor_update_batch.meta_info['gxpo_trigger_streak'] = self.gxpo_trigger_streak
+                                        actor_update_batch.meta_info['gxpo_trigger_candidate'] = gxpo_trigger_candidate
+                                        actor_update_batch.meta_info['gxpo_entropy_window_ready'] = gxpo_baseline_ready
+                                        actor_output = self.actor_rollout_wg.gxpo_update_actor(actor_update_batch)
+                                    else:
+                                        actor_output = self.actor_rollout_wg.update_actor(actor_update_batch)
                             elif self.config.actor_rollout_ref.actor.get('use_sfpo', False) and not self.stop_SFPO:
                                 actor_output = self.actor_rollout_wg.sfpo_update_actor(batch)
                             else:
@@ -2146,6 +2258,16 @@ class RayPPOTrainer(object):
                                 'actor/gxpo_trigger_warmup_active': float(
                                     not (gxpo_trigger_enabled and gxpo_baseline_ready)),
                                 'actor/gxpo_entropy_window_ready': float(gxpo_baseline_ready),
+                                'actor/gxpo_level_ratio': float(gxpo_level_ratio),
+                                'actor/gxpo_level_limit': float(
+                                    1.0 + (self._gxpo_gate.relative_threshold
+                                           if self._gxpo_gate is not None else 0.0)),
+                                'actor/gxpo_level_streak': float(
+                                    self._gxpo_gate.level_streak
+                                    if self._gxpo_gate is not None else 0.0),
+                                'actor/gxpo_level_baseline': float(
+                                    (self._gxpo_gate.baseline_level or 0.0)
+                                    if self._gxpo_gate is not None else 0.0),
                                 'actor/gxpo_trigger_patience': float(
                                     max(1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
                                 ),
@@ -2186,8 +2308,18 @@ class RayPPOTrainer(object):
                     actor_entropy_value = actor_output_metrics.get('actor/entropy_loss')
                     if actor_entropy_value is not None:
                         self.entropy_container.append(float(actor_entropy_value))
-                        if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
-                            self.gxpo_entropy_container.append(float(actor_entropy_value))
+                    if self.config.actor_rollout_ref.actor.get('use_gxpo', False):
+                        # Prefer the probe-pass entropy, which is measured at theta0 on
+                        # both GXPO and fallback steps. 'actor/entropy_loss' comes from
+                        # pass 3 (at theta_tilde, after the reposition) on GXPO steps but
+                        # from the single pass (at theta_prev) on fallback steps, so a
+                        # gate fed from it sees a level shift at the exact moment GXPO
+                        # switches off. Fall back to it only if the probe key is absent.
+                        gate_entropy = actor_output_metrics.get('actor/gxpo_gate_entropy')
+                        if gate_entropy is None:
+                            gate_entropy = actor_entropy_value
+                        if gate_entropy is not None:
+                            self.gxpo_entropy_container.append(float(gate_entropy))
                     active_train_elapsed_s = time.monotonic() - active_train_start
 
                     # validate

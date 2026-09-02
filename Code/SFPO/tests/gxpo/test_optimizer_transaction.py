@@ -120,3 +120,30 @@ def test_context_rolls_back_on_error():
     assert torch.equal(restored['exp_avg'], baseline['exp_avg'])
     assert torch.equal(restored['exp_avg_sq'], baseline['exp_avg_sq'])
     assert restored['step'] == baseline['step']
+
+
+def test_muon_probe_state_is_restored():
+    from omegaconf import OmegaConf
+    from verl.workers.muon import build_muon
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4, bias=False))
+    config = OmegaConf.create({
+        "lr": 0.1, "weight_decay": 0.0, "betas": (0.9, 0.999),
+        "muon_momentum": 0.95, "muon_ns_steps": 2, "muon_nesterov": True,
+        "muon_distributed_backend": "gather_scatter",
+    })
+    optimizer = build_muon(model, config)
+    loss = model(torch.ones(2, 4)).sum()
+    loss.backward()
+    optimizer.step()
+    baseline = optimizer.state[model[0].weight]["momentum_buffer"].detach().clone()
+
+    transaction = snapshot_optimizer_state(optimizer)
+    for value in (2.0, 3.0):
+        optimizer.zero_grad(set_to_none=True)
+        model(torch.full((2, 4), value)).sum().backward()
+        optimizer.step()
+    transaction.restore()
+
+    restored = optimizer.state[model[0].weight]["momentum_buffer"]
+    assert torch.equal(restored, baseline)

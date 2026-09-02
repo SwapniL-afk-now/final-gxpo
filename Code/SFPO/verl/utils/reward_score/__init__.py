@@ -14,7 +14,10 @@
 # from . import gsm8k, math, prime_math, prime_code
 
 
-def _default_compute_score(prompt_str, data_source, solution_str, ground_truth, extra_info=None):
+def _default_compute_score(
+    prompt_str, data_source, solution_str, ground_truth, extra_info=None,
+    stop_on_failure=False,
+):
     if data_source == 'openai/gsm8k':
         # from . import gsm8k
         # res = gsm8k.compute_score(solution_str, ground_truth)
@@ -32,6 +35,7 @@ def _default_compute_score(prompt_str, data_source, solution_str, ground_truth, 
             'AI-MO/aimo-validation-amc',
             'math-ai/minervamath',
             'math-ai/olympiadbench',
+            'wangx0t/numina-deepseek-DeepSeek-R1-Distill-Qwen-7B',
     }:
         # Use Math-Verify for all final GXPO math training/validation sources.
         from . import math_verify
@@ -52,7 +56,10 @@ def _default_compute_score(prompt_str, data_source, solution_str, ground_truth, 
     elif data_source == 'livecodebench':
         # stdin/stdout code exec (ported from JEPA repo; no pyext dependency)
         from . import stdio_code
-        res = stdio_code.compute_score(solution_str, ground_truth, extra_info=extra_info, continuous=True)
+        res = stdio_code.compute_score(
+            solution_str, ground_truth, extra_info=extra_info, continuous=True,
+            stop_on_failure=stop_on_failure,
+        )
     elif data_source in ['humanevalplus', 'mbppplus']:
         # assert-based EvalPlus code exec (ported from JEPA repo)
         from . import codegen_plus

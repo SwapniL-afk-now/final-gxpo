@@ -23,8 +23,14 @@ import os
 os.environ['NCCL_DEBUG'] = 'WARN'
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
+import json
 import logging
+import math
 import re
+import shutil
+import subprocess
+import sys
+import time
 from contextlib import nullcontext
 import torch
 import torch.distributed
@@ -36,9 +42,20 @@ from omegaconf import OmegaConf
 from verl.utils.torch_functional import get_cosine_schedule_with_warmup
 from tensordict import TensorDict
 from torch.utils.data import DataLoader, DistributedSampler
-from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+try:
+    from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+    _FLASH_ATTN_AVAILABLE = True
+except (ImportError, OSError):
+    # Standard SFT does not need flash-attn; keep the import optional so the
+    # eager-attention fallback can run on environments without its CUDA ABI.
+    _FLASH_ATTN_AVAILABLE = False
+    pad_input = unpad_input = rearrange = index_first_axis = None
 
-from verl.utils.fsdp_utils import get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager
+from verl.utils.fsdp_utils import (
+    get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager,
+    offload_fsdp_model_to_cpu, load_fsdp_model_to_gpu,
+    offload_fsdp_optimizer, load_fsdp_optimizer,
+)
 from verl.utils.dataset import SFTDataset
 from verl.utils.fs import copy_to_local
 from verl.utils.tracking import Tracking
@@ -47,10 +64,14 @@ from torch.distributed.device_mesh import DeviceMesh
 
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils.debug import log_gpu_memory_usage
+from verl.trainer.sft_utils import resolve_total_training_steps
+from verl.trainer.kd_utils import sparse_topk_kd_loss
 from verl.utils.attention import resolve_attention_implementation
 from peft import LoraConfig, TaskType, get_peft_model
 
 from verl.workers.sharding_manager import FSDPUlyssesShardingManager
+from verl.workers.actor.optimizer_transaction import snapshot_optimizer_state
+from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl import DataProto
 
@@ -93,10 +114,25 @@ class FSDPSFTTrainer(object):
 
         # normalize dp size
         self._normalize_config_bsz()
+        self.fsdp_strategy = str(self.config.model.fsdp_config.get('strategy', 'fsdp1')).lower()
+        if self.fsdp_strategy not in {'fsdp1', 'fsdp2'}:
+            raise ValueError(f'Unsupported SFT FSDP strategy: {self.fsdp_strategy!r}')
+        self._is_fsdp2 = self.fsdp_strategy == 'fsdp2'
 
         # Set sequence parallel size
         self.config.ulysses_sequence_parallel_size = getattr(self.config, 'ulysses_sequence_parallel_size', 1)
         self.use_remove_padding = getattr(self.config, 'use_remove_padding', False)
+        self.kd_enabled = bool(self.config.optim.get('kd_enabled', False))
+        self.kd_topk = int(self.config.optim.get('kd_topk', 32))
+        self.kd_weight = float(self.config.optim.get('kd_weight', 0.5))
+        self.kd_temperature = float(self.config.optim.get('kd_temperature', 2.0))
+        if self.kd_enabled:
+            if not 0.0 <= self.kd_weight <= 1.0:
+                raise ValueError('optim.kd_weight must be in [0, 1]')
+            if self.kd_temperature <= 0 or self.kd_topk <= 0:
+                raise ValueError('KD temperature and top-K must be positive')
+            if self.config.ulysses_sequence_parallel_size > 1:
+                raise ValueError('Sparse KD currently supports data-parallel FSDP, not Ulysses SP')
         if self.device_mesh.get_rank() == 0:
             print(f'Using sequence parallel size: {self.config.ulysses_sequence_parallel_size}')
             print(f'Using remove padding: {self.use_remove_padding}')
@@ -107,8 +143,21 @@ class FSDPSFTTrainer(object):
 
         # GXPO-style update on the supervised objective: shutoff gate + lazily allocated
         # per-parameter buffers. Absent `optim.use_gxpo` keeps the plain 1-pass SFT path.
+        self._backward_calls = 0
+        self._cumulative_train_time = 0.0
+        self._cumulative_tokens = 0
         self.gxpo_state = None
         self._gxpo_bufs = None
+        self._best_eval_score = float('-inf')
+        self._best_eval_step = None
+        self.gxpo_optimizer_state_mode = str(
+            self.config.optim.get("gxpo_optimizer_state_mode", "transactional")
+        ).lower()
+        if self.gxpo_optimizer_state_mode not in {"transactional", "legacy"}:
+            raise ValueError(
+                "optim.gxpo_optimizer_state_mode must be transactional or legacy, "
+                f"got {self.gxpo_optimizer_state_mode!r}"
+            )
         if self.config.optim.get('use_gxpo', False):
             from verl.workers.actor.gxpo_state import GXPOState
             self.gxpo_state = GXPOState(
@@ -120,6 +169,12 @@ class FSDPSFTTrainer(object):
                 zscore_w=self.config.optim.get('gxpo_zscore_w', 30),
                 shutoff_mode=self.config.optim.get('gxpo_shutoff_mode', 'trajectory_aware'),
                 warmup_steps=self.config.optim.get('gxpo_warmup', 0),
+                trigger_patience=self.config.optim.get("gxpo_trigger_patience", 1),
+                trigger_robust=self.config.optim.get("gxpo_trigger_robust", False),
+                min_post_warmup_obs=self.config.optim.get("gxpo_min_post_warmup_obs", 0),
+                max_active_steps=self.config.optim.get("gxpo_max_active_steps", 0),
+                abs_threshold=self.config.optim.get("gxpo_abs_threshold", 0.0),
+                sustain_window=self.config.optim.get("gxpo_sustain_window", 10),
             )
 
         # TODO: add checkpoint manager
@@ -147,7 +202,9 @@ class FSDPSFTTrainer(object):
                                         response_key=config.data.response_key,
                                         response_dict_keys=config.data.get('response_dict_keys', None),
                                         max_length=config.data.max_length,
-                                        truncation=config.data.truncation)
+                                        truncation=config.data.truncation,
+                                        kd_enabled=self.kd_enabled,
+                                        kd_topk=self.kd_topk)
         self.val_dataset = SFTDataset(parquet_files=config.data.val_files,
                                       tokenizer=self.tokenizer,
                                       prompt_key=config.data.prompt_key,
@@ -155,7 +212,9 @@ class FSDPSFTTrainer(object):
                                       response_key=config.data.response_key,
                                       response_dict_keys=config.data.get('response_dict_keys', None),
                                       max_length=config.data.max_length,
-                                      truncation=config.data.truncation)
+                                      truncation=config.data.truncation,
+                                      kd_enabled=self.kd_enabled,
+                                      kd_topk=self.kd_topk)
 
         # build dataloader
         # Use data parallel rank and size instead of global rank and world size
@@ -200,6 +259,55 @@ class FSDPSFTTrainer(object):
                                          pin_memory=True,
                                          drop_last=True)
 
+
+    def _wrap_fsdp2_model(self):
+        """Apply PyTorch composable FSDP2 to transformer blocks and the root model."""
+        from torch.distributed._composable.fsdp import (
+            CPUOffloadPolicy,
+            MixedPrecisionPolicy,
+            OffloadPolicy,
+            fully_shard,
+        )
+
+        fsdp_config = self.config.model.fsdp_config
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            output_dtype=torch.bfloat16,
+            cast_forward_inputs=True,
+        )
+        offload_policy = (
+            CPUOffloadPolicy()
+            if fsdp_config.get('cpu_offload', False)
+            else OffloadPolicy()
+        )
+        layer_names = set(getattr(self.model, '_no_split_modules', None) or ())
+        wrapped = 0
+        # FSDP2 requires child modules to be sharded before their parent.
+        for module in self.model.modules():
+            if module is self.model:
+                continue
+            if module.__class__.__name__ in layer_names:
+                fully_shard(
+                    module,
+                    mesh=self.device_mesh,
+                    mp_policy=mp_policy,
+                    offload_policy=offload_policy,
+                    reshard_after_forward=True,
+                )
+                wrapped += 1
+        fully_shard(
+            self.model,
+            mesh=self.device_mesh,
+            mp_policy=mp_policy,
+            offload_policy=offload_policy,
+            reshard_after_forward=True,
+        )
+        self.fsdp_model = self.model
+        if self.device_mesh.get_rank() == 0:
+            print(f'FSDP2 fully_shard wrapped {wrapped} transformer blocks; '
+                  f'cpu_offload={fsdp_config.get("cpu_offload", False)}')
+
     def _build_model_optimizer(self):
         # TODO (zhangchi.usc1992):
         # 1. support pretrain from random weights
@@ -231,10 +339,20 @@ class FSDPSFTTrainer(object):
         init_context = get_init_weight_context_manager(use_meta_tensor=not config.tie_word_embeddings,
                                                        mesh=self.device_mesh)
 
+        requested_dtype = str(self.config.model.get('model_dtype', 'fp32')).lower()
+        dtype_map = {'fp32': torch.float32, 'float32': torch.float32,
+                     'bf16': torch.bfloat16, 'bfloat16': torch.bfloat16,
+                     'fp16': torch.float16, 'float16': torch.float16}
+        if requested_dtype not in dtype_map:
+            raise ValueError(f'Unsupported SFT model_dtype={requested_dtype!r}')
+        model_dtype = dtype_map[requested_dtype]
+        if self.device_mesh.get_rank() == 0:
+            print(f'SFT parameter dtype: {requested_dtype}; FSDP compute dtype: bfloat16')
+
         with init_context():
             self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(local_model_path,
                                                                                config=config,
-                                                                               torch_dtype=torch.float32,
+                                                                               torch_dtype=model_dtype,
                                                                                attn_implementation=attn_implementation,
                                                                                trust_remote_code=trust_remote_code)
 
@@ -270,25 +388,36 @@ class FSDPSFTTrainer(object):
         if self.device_mesh.get_rank() == 0:
             print(auto_wrap_policy)
 
-        if not self.config.model.fsdp_config.cpu_offload:
-            cpu_offload = None
+        if self._is_fsdp2:
+            self._wrap_fsdp2_model()
         else:
-            cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
+            if not self.config.model.fsdp_config.cpu_offload:
+                cpu_offload = None
+            else:
+                cpu_offload = CPUOffload(offload_params=self.config.model.fsdp_config.offload_params)
 
-        self.fsdp_model = FSDP(module=self.model,
-                               auto_wrap_policy=auto_wrap_policy,
-                               param_init_fn=init_fn,
-                               sharding_strategy=ShardingStrategy.FULL_SHARD,
-                               mixed_precision=mixed_precision,
-                               device_mesh=self.device_mesh,
-                               sync_module_states=True,
-                               device_id=torch.cuda.current_device(),
-                               cpu_offload=cpu_offload,
-                               use_orig_params=False)
+            self.fsdp_model = FSDP(module=self.model,
+                                   auto_wrap_policy=auto_wrap_policy,
+                                   param_init_fn=init_fn,
+                                   sharding_strategy=ShardingStrategy.FULL_SHARD,
+                                   mixed_precision=mixed_precision,
+                                   device_mesh=self.device_mesh,
+                                   sync_module_states=True,
+                                   device_id=torch.cuda.current_device(),
+                                   cpu_offload=cpu_offload,
+                                   use_orig_params=False)
 
-        log_gpu_memory_usage('After FSDP wrapping', logger=logger)
+            log_gpu_memory_usage('After FSDP wrapping', logger=logger)
 
-        self.optimizer = optim.AdamW(self.fsdp_model.parameters(),
+        trainable_parameters = [parameter for parameter in self.fsdp_model.parameters()
+                                if parameter.requires_grad]
+        if not trainable_parameters:
+            raise RuntimeError('SFT model has no trainable parameters')
+        if requested_dtype in {'bf16', 'bfloat16', 'fp16', 'float16'}:
+            raise ValueError(
+                'Transactional SFT requires FP32 master parameters; set model.model_dtype=fp32'
+            )
+        self.optimizer = optim.AdamW(trainable_parameters,
                                      lr=self.config.optim.lr,
                                      betas=self.config.optim.betas,
                                      weight_decay=self.config.optim.weight_decay)
@@ -296,7 +425,11 @@ class FSDPSFTTrainer(object):
         log_gpu_memory_usage('After initialize optimizer', logger=logger)
 
         self.steps_per_epoch = len(self.train_dataloader)
-        self.total_steps = self.steps_per_epoch * self.config.trainer.total_epochs
+        self.total_steps = resolve_total_training_steps(
+            self.steps_per_epoch,
+            self.config.trainer.total_epochs,
+            self.config.trainer.get('total_training_steps', None),
+        )
 
         if self.device_mesh.get_rank() == 0:
             print(
@@ -308,103 +441,206 @@ class FSDPSFTTrainer(object):
         self.lr_scheduler = get_cosine_schedule_with_warmup(optimizer=self.optimizer,
                                                             num_warmup_steps=num_warmup_steps,
                                                             num_training_steps=self.total_steps)
+        self.checkpoint_manager = None
+        if not self._is_fsdp2:
+            self.checkpoint_manager = FSDPCheckpointManager(
+                model=self.fsdp_model, optimizer=self.optimizer,
+                lr_scheduler=self.lr_scheduler, processing_class=self.tokenizer
+            )
 
     def _compute_loss_and_backward(self, batch, do_backward=True):
-        """Compute loss with optional sequence parallelism and remove padding features"""
+        """Compute response CE and optional offline sparse teacher KD."""
         use_sp = self.use_remove_padding and self.config.ulysses_sequence_parallel_size > 1
+        if use_sp and not _FLASH_ATTN_AVAILABLE:
+            raise RuntimeError("Sequence-parallel SFT requires a compatible flash-attn installation")
+        if use_sp and self.kd_enabled:
+            raise RuntimeError("Sparse teacher KD is not implemented for Ulysses sequence parallelism")
 
-        # Move inputs to GPU and prepare loss mask
         input_ids = batch['input_ids'].cuda()
         attention_mask = batch['attention_mask'].cuda()
         position_ids = batch['position_ids'].cuda()
-        loss_mask = batch.pop('loss_mask')[:, :-1].reshape(-1).cuda()
+        loss_mask_2d = batch.pop('loss_mask')[:, :-1].cuda()
+        loss_mask = loss_mask_2d.reshape(-1)
         loss_fct = nn.CrossEntropyLoss(reduction='none')
 
-        # Context manager for sequence parallel if needed
+        kd_tensors = None
+        if self.kd_enabled:
+            required = (
+                'kd_teacher_ids', 'kd_teacher_logprobs', 'kd_teacher_counts',
+                'kd_teacher_mass', 'kd_token_mask', 'kd_source_id',
+            )
+            missing = [name for name in required if name not in batch]
+            if missing:
+                raise ValueError(f'KD batch is missing tensors: {missing}')
+            kd_tensors = {
+                name: batch.pop(name).cuda()
+                for name in required
+            }
+
         context = self.sharding_manager if use_sp else nullcontext()
         with context:
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                student_shift_logits = None
                 if not use_sp:
-                    # Standard forward pass without sequence parallel
                     labels = input_ids[:, 1:].contiguous()
-                    output = self.fsdp_model(input_ids=input_ids,
-                                             attention_mask=attention_mask,
-                                             position_ids=position_ids,
-                                             use_cache=False)
-                    logits = output.logits
-
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_labels = labels.contiguous()
-                    # Flatten the tokens
-                    shift_logits = shift_logits.view(-1, self.model.config.vocab_size)
-                    shift_labels = shift_labels.view(-1)
-                    # Enable model parallelism
-                    shift_labels = shift_labels.to(shift_logits.device)
-                    loss = loss_fct(shift_logits, shift_labels)
-                    loss = loss * loss_mask.to(loss.device)
+                    output = self.fsdp_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        use_cache=False,
+                    )
+                    student_shift_logits = output.logits[..., :-1, :].contiguous()
+                    flat_logits = student_shift_logits.view(-1, self.model.config.vocab_size)
+                    flat_labels = labels.view(-1).to(flat_logits.device)
+                    token_loss = loss_fct(flat_logits, flat_labels)
+                    token_loss = token_loss * loss_mask.to(token_loss.device)
                 else:
-                    # IMPORTANT: We have a big assumption here, so we can shard the SAME sequence across SP ranks
-                    # i.e., each GPU has <1 sequence, and each SP group has 1 sequence
-                    # 1. All SP ranks will receive the *SAME* batch
-                    # 2. Different SP groups will receive *DIFFERENT* batches
-                    # This is implemented by the DistributedSampler
-
                     batch_size, seqlen = input_ids.shape
-                    # Remove padding
-                    input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
-                                                               attention_mask)  # input_ids_rmpad (total_nnz, ...)
-                    input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
-
-                    # Unpad position_ids to align rotary
-                    position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
-                                                          indices).transpose(0, 1)
-
-                    # Pad and slice inputs for sequence parallelism
-                    input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = ulysses_pad_and_slice_inputs(
-                        input_ids_rmpad, position_ids_rmpad, sp_size=get_ulysses_sequence_parallel_world_size())
-                    # For computing loss
-                    input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+                    input_ids_rmpad, indices, *_ = unpad_input(
+                        input_ids.unsqueeze(-1), attention_mask
+                    )
+                    input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
+                    position_ids_rmpad = index_first_axis(
+                        rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
+                    ).transpose(0, 1)
+                    input_ids_rmpad_sliced, position_ids_rmpad_padded, pad_size = (
+                        ulysses_pad_and_slice_inputs(
+                            input_ids_rmpad,
+                            position_ids_rmpad,
+                            sp_size=get_ulysses_sequence_parallel_world_size(),
+                        )
+                    )
+                    input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)
                     input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
-                        input_ids_rmpad_rolled, None, get_ulysses_sequence_parallel_world_size())
-                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
-
-                    # Forward pass
+                        input_ids_rmpad_rolled,
+                        None,
+                        get_ulysses_sequence_parallel_world_size(),
+                    )
                     output = self.fsdp_model(
                         input_ids=input_ids_rmpad_sliced,
-                        attention_mask=None,  # Not needed with flash attention varlen
+                        attention_mask=None,
                         position_ids=position_ids_rmpad_padded,
-                        use_cache=False)
-
-                    # Compute loss locally then aggregate
+                        use_cache=False,
+                    )
                     logits_rmpad = output.logits.squeeze(0)
-                    input_ids_rmpad_rolled = input_ids_rmpad_rolled.to(logits_rmpad.device)
-                    loss = loss_fct(logits_rmpad, input_ids_rmpad_rolled)
-                    # Gather and unpad for sequence parallelism
-                    loss = gather_outpus_and_unpad(loss, gather_dim=0, unpad_dim=0, padding_size=pad_size)
-
-                    # This is the loss collected from all ulysses ranks
-                    full_loss = pad_input(hidden_states=loss.unsqueeze(-1),
-                                          indices=indices,
-                                          batch=batch_size,
-                                          seqlen=seqlen)
-                    full_loss = full_loss.squeeze(-1)[:, :-1]  # Remove last token's loss
-                    full_loss = full_loss.reshape(-1)
-                    loss_mask = loss_mask.to(full_loss.device)
-                    loss = full_loss * loss_mask
+                    token_loss = loss_fct(
+                        logits_rmpad, input_ids_rmpad_rolled.squeeze(0).to(logits_rmpad.device)
+                    )
+                    token_loss = gather_outpus_and_unpad(
+                        token_loss, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                    )
+                    token_loss = pad_input(
+                        hidden_states=token_loss.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    ).squeeze(-1)[:, :-1].reshape(-1)
+                    token_loss = token_loss * loss_mask.to(token_loss.device)
 
                 valid_token_this_rank = torch.sum(loss_mask)
-
+                if int(valid_token_this_rank.item()) <= 0:
+                    raise ValueError('SFT batch has no response tokens')
                 if self.config.data.balance_dp_token:
                     torch.distributed.all_reduce(valid_token_this_rank)
-                    dp_size = self.ulysses_device_mesh.size('dp') if use_sp else torch.distributed.get_world_size()
+                    dp_size = (
+                        self.ulysses_device_mesh.size('dp')
+                        if use_sp else torch.distributed.get_world_size()
+                    )
                 else:
                     dp_size = 1
+                ce_sum = torch.sum(token_loss)
+                ce_loss = ce_sum / valid_token_this_rank * dp_size
+                final_loss = ce_loss
+                components = {
+                    'ce_sum': ce_sum.detach().float(),
+                    'ce_count': valid_token_this_rank.detach().float(),
+                }
 
-                loss = torch.sum(loss) / valid_token_this_rank * dp_size
+                if self.kd_enabled:
+                    teacher_ids = kd_tensors['kd_teacher_ids']
+                    teacher_logprobs = kd_tensors['kd_teacher_logprobs']
+                    teacher_counts = kd_tensors['kd_teacher_counts']
+                    teacher_mass = kd_tensors['kd_teacher_mass'].float()
+                    kd_mask = kd_tensors['kd_token_mask'].bool() & loss_mask_2d.bool()
+                    kd_sum, kd_count, kd_token_losses = sparse_topk_kd_loss(
+                        student_shift_logits,
+                        teacher_ids,
+                        teacher_logprobs,
+                        teacher_counts,
+                        kd_mask,
+                        self.kd_temperature,
+                    )
+                    expected_count = loss_mask_2d.sum()
+                    if int(kd_count.item()) != int(expected_count.item()):
+                        raise ValueError(
+                            f'KD coverage is incomplete: {int(kd_count.item())}/'
+                            f'{int(expected_count.item())} response tokens'
+                        )
+                    kd_loss = kd_sum / kd_count * dp_size
+                    final_loss = (1.0 - self.kd_weight) * ce_loss + self.kd_weight * kd_loss
+                    source_ids = kd_tensors['kd_source_id'].long()
+                    source_masks = {
+                        'teacher': (source_ids == 0).unsqueeze(1) & kd_mask,
+                        'fallback': (source_ids == 1).unsqueeze(1) & kd_mask,
+                    }
+                    source_expected_masks = {
+                        'teacher': (source_ids == 0).unsqueeze(1) & loss_mask_2d.bool(),
+                        'fallback': (source_ids == 1).unsqueeze(1) & loss_mask_2d.bool(),
+                    }
+                    ce_tokens_2d = token_loss.view_as(loss_mask_2d)
+                    components.update({
+                        'kd_sum': kd_sum.detach().float(),
+                        'kd_count': kd_count.detach().float(),
+                        'kd_expected': expected_count.detach().float(),
+                        'kd_mass_sum': (teacher_mass * kd_mask).sum().detach().float(),
+                    })
+                    for source_name, source_mask in source_masks.items():
+                        components[f'kd_{source_name}_sum'] = (
+                            kd_token_losses * source_mask
+                        ).sum().detach().float()
+                        components[f'kd_{source_name}_count'] = source_mask.sum().detach().float()
+                        components[f'kd_{source_name}_expected'] = (
+                            source_expected_masks[source_name].sum().detach().float()
+                        )
+                        components[f'ce_{source_name}_sum'] = (
+                            ce_tokens_2d * source_mask
+                        ).sum().detach().float()
+                        components[f'ce_{source_name}_count'] = source_mask.sum().detach().float()
 
+                self._last_loss_components = components
                 if do_backward:
-                    loss.backward()
-                return loss
+                    final_loss.backward()
+                    self._backward_calls += 1
+                return final_loss
+
+
+    def _clip_grad_norm(self):
+        if not self._is_fsdp2:
+            return self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+
+        # FSDP2 CPUOffloadPolicy exposes gradients as CPU-backed DTensors.
+        # Compute on local shards, then reduce only scalar statistics on CUDA;
+        # applying arithmetic directly to a CPU DTensor would dispatch an
+        # unsupported CPU collective with NCCL.
+        total_sq = 0.0
+        local_grads = []
+        for parameter in self.fsdp_model.parameters():
+            grad = parameter.grad
+            if grad is None:
+                continue
+            local = grad.to_local() if hasattr(grad, "to_local") else grad
+            local_grads.append(local)
+            total_sq += float(local.detach().float().pow(2).sum().item())
+        norm = torch.tensor(total_sq, dtype=torch.float64, device=torch.cuda.current_device())
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(norm, op=torch.distributed.ReduceOp.SUM)
+        total_norm = norm.sqrt()
+        max_norm = float(self.config.optim.clip_grad)
+        clip_coef = min(1.0, max_norm / (float(total_norm.item()) + 1e-6))
+        if clip_coef < 1.0:
+            for local in local_grads:
+                local.mul_(clip_coef)
+        return total_norm.to(dtype=torch.float32)
 
     def _accumulate_and_clip(self, batch: TensorDict, capture_bufs=None):
         """One full gradient pass over `batch`: zero_grad, accumulate micro-batches, clip.
@@ -424,18 +660,73 @@ class FSDPSFTTrainer(object):
         micro_batches = batch.split(self.config.data.micro_batch_size_per_gpu)
         n_micro_batches = len(micro_batches)
         step_loss = 0
+        component_sums = {}
         for micro_batch in micro_batches:
-            loss = self._compute_loss_and_backward(batch=micro_batch.clone(recurse=False)) / n_micro_batches
+            loss = self._compute_loss_and_backward(
+                batch=micro_batch.clone(recurse=False)
+            ) / n_micro_batches
             step_loss += loss.item()
+            for key, value in self._last_loss_components.items():
+                component_sums[key] = component_sums.get(key, 0.0) + value
+        self._last_pass_components = component_sums
 
         if capture_bufs is not None:
             self._gxpo_capture_grads(capture_bufs)
 
-        grad_norm = self.fsdp_model.clip_grad_norm_(max_norm=self.config.optim.clip_grad)
+        grad_norm = self._clip_grad_norm()
         return step_loss, grad_norm
+
+    def _distillation_metrics(self):
+        if not self.kd_enabled:
+            return {}
+        names = (
+            'ce_sum', 'ce_count', 'kd_sum', 'kd_count', 'kd_expected', 'kd_mass_sum',
+            'kd_teacher_sum', 'kd_teacher_count', 'kd_teacher_expected',
+            'ce_teacher_sum', 'ce_teacher_count',
+            'kd_fallback_sum', 'kd_fallback_count', 'kd_fallback_expected',
+            'ce_fallback_sum', 'ce_fallback_count',
+        )
+        values = torch.stack([
+            torch.as_tensor(
+                self._last_pass_components.get(name, 0.0),
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            for name in names
+        ])
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.SUM)
+        stats = dict(zip(names, values.tolist()))
+
+        def average(sum_name, count_name):
+            count = stats[count_name]
+            return stats[sum_name] / count if count > 0 else 0.0
+
+        ce_loss = average('ce_sum', 'ce_count')
+        kd_loss = average('kd_sum', 'kd_count')
+        return {
+            'train/ce_loss': ce_loss,
+            'train/kd_loss': kd_loss,
+            'train/combined_loss': (1.0 - self.kd_weight) * ce_loss + self.kd_weight * kd_loss,
+            'train/kd_coverage': stats['kd_count'] / max(stats['kd_expected'], 1.0),
+            'train/kd_topk_mass': stats['kd_mass_sum'] / max(stats['kd_count'], 1.0),
+            'train/kd_teacher_loss': average('kd_teacher_sum', 'kd_teacher_count'),
+            'train/ce_teacher_loss': average('ce_teacher_sum', 'ce_teacher_count'),
+            'train/kd_teacher_coverage': stats['kd_teacher_count'] / max(
+                stats['kd_teacher_expected'], 1.0
+            ),
+            'train/kd_fallback_loss': average('kd_fallback_sum', 'kd_fallback_count'),
+            'train/ce_fallback_loss': average('ce_fallback_sum', 'ce_fallback_count'),
+            'train/kd_fallback_coverage': stats['kd_fallback_count'] / max(
+                stats['kd_fallback_expected'], 1.0
+            ),
+        }
 
     def training_step(self, batch: TensorDict):
         self.fsdp_model.train()
+        step_start = time.perf_counter()
+        backward_start = self._backward_calls
+        token_count = int(batch['loss_mask'].sum().item())
 
         log_gpu_memory_usage('Before optimizer zero_grad', logger=logger)
 
@@ -448,6 +739,7 @@ class FSDPSFTTrainer(object):
             log_gpu_memory_usage('After optimizer step', logger=logger)
             metrics = {'train/grad_norm': grad_norm.detach().item(), 'train/gxpo_enabled': 0.0}
 
+        metrics.update(self._distillation_metrics())
         self.lr_scheduler.step()
 
         # reduce loss across dp ranks
@@ -457,6 +749,22 @@ class FSDPSFTTrainer(object):
 
         step_loss = torch.tensor(step_loss).cuda()
         torch.distributed.all_reduce(step_loss, op=torch.distributed.ReduceOp.AVG)
+        token_count_tensor = torch.tensor(float(token_count), device=step_loss.device)
+        torch.distributed.all_reduce(token_count_tensor, op=torch.distributed.ReduceOp.SUM)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - step_start
+        self._cumulative_train_time += elapsed
+        self._cumulative_tokens += int(token_count_tensor.item())
+        backward_calls = self._backward_calls - backward_start
+        metrics.update({
+            'eff/step_time_s': elapsed,
+            'eff/cumulative_train_time_s': self._cumulative_train_time,
+            'eff/tokens_step': int(token_count_tensor.item()),
+            'eff/cumulative_tokens': self._cumulative_tokens,
+            'eff/backward_calls_step': backward_calls,
+            'eff/cumulative_backward_calls': self._backward_calls,
+        })
         return {'train/loss': step_loss.detach().item(), 'train/lr(1e-3)': lr * 1e3, **metrics}
 
     def _gxpo_capture_grads(self, bufs):
@@ -464,16 +772,16 @@ class FSDPSFTTrainer(object):
             if p.grad is None:
                 buf.zero_()
             else:
-                buf.copy_(p.grad)
+                grad = p.grad.to_local() if hasattr(p.grad, "to_local") else p.grad
+                buf.copy_(grad)
 
     def _gxpo_training_step(self, batch: TensorDict):
-        """GXPO 3-pass update on a supervised (cross-entropy) objective.
+        """Transactional GXPO update on the supervised cross-entropy objective.
 
-        Same geometry as the RL version (`dp_actor._gxpo_minibatch_step`) but with no
-        importance ratio and no advantages: the identical CE loss is simply re-evaluated at
-        theta0, theta1 and theta_tilde. Probe g0 at theta0 -> step -> probe g1 at theta1 ->
-        step (theta2 is live) -> reposition to theta0 + alpha*scale*(theta2-theta0) -> slow
-        correction. Falls back to a single standard step once the shutoff gate trips.
+        Native optimizer steps generate the fast trajectory and g1. Those probe
+        mutations are then discarded, including optimizer-local state, before
+        the slow gradient is evaluated at theta_tilde. Exactly one optimizer
+        step survives this outer update.
         """
         state = self.gxpo_state
         step_idx = state.step_count
@@ -483,122 +791,203 @@ class FSDPSFTTrainer(object):
             step_loss, grad_norm = self._accumulate_and_clip(batch)
             self.optimizer.step()
             state.step_count = step_idx + 1
-            return step_loss, {'train/grad_norm': grad_norm.detach().item(), 'train/gxpo_enabled': 0.0}
+            return step_loss, {
+                'train/grad_norm': grad_norm.detach().item(),
+                'train/gxpo_enabled': 0.0,
+                'train/gxpo_budget_stop': float(state.budget_stop is True),
+            }
 
         if not state.is_enabled(step_idx):
             return standard_step()
 
         if self._gxpo_bufs is None:
             self._gxpo_params = [p for p in self.fsdp_model.parameters() if p.requires_grad]
-            self._gxpo_bufs = {n: [torch.empty_like(p) for p in self._gxpo_params] for n in ('theta0', 'g0', 'g1')}
+            self._gxpo_bufs = {
+                name: [torch.empty_like(p.to_local() if hasattr(p, 'to_local') else p)
+                       for p in self._gxpo_params]
+                for name in ('theta0', 'theta2', 'g0', 'g1')
+            }
         params = self._gxpo_params
-        theta0, g0_bufs, g1_bufs = (self._gxpo_bufs[k] for k in ('theta0', 'g0', 'g1'))
+        theta0, theta2, g0_bufs, g1_bufs = (
+            self._gxpo_bufs[name] for name in ('theta0', 'theta2', 'g0', 'g1')
+        )
+        optimizer_transaction = (
+            snapshot_optimizer_state(self.optimizer)
+            if self.gxpo_optimizer_state_mode == "transactional" else None
+        )
+        committed = False
 
-        with torch.no_grad():
-            for p, t0 in zip(params, theta0):
-                t0.copy_(p.data)
+        def copy_local(parameter):
+            return parameter.data.to_local() if hasattr(parameter.data, 'to_local') else parameter.data
 
-        def finite(x):
-            return x == x and abs(x) != float('inf')
+        def restore_theta0():
+            with torch.no_grad():
+                for parameter, t0 in zip(params, theta0):
+                    copy_local(parameter).copy_(t0)
 
         def fallback():
-            with torch.no_grad():
-                for p, t0 in zip(params, theta0):
-                    p.data.copy_(t0)
+            restore_theta0()
+            if optimizer_transaction is not None:
+                optimizer_transaction.restore()
             self.optimizer.zero_grad(set_to_none=True)
-            return standard_step()
+            result = standard_step()
+            if optimizer_transaction is not None:
+                optimizer_transaction.commit()
+            return result
 
-        # Pass 1: g0 at theta0 (capture raw grads pre-clip -- see _accumulate_and_clip)
-        _, gn0 = self._accumulate_and_clip(batch, capture_bufs=g0_bufs)
-        gn0 = gn0.detach().item()
-        if not finite(gn0) or gn0 <= 1e-8:
-            return fallback()
-        self.optimizer.step()
+        def finite(value):
+            return value == value and abs(value) != float('inf')
 
-        # Pass 2: g1 at theta_1
-        _, gn1 = self._accumulate_and_clip(batch, capture_bufs=g1_bufs)
-        gn1 = gn1.detach().item()
-        if not finite(gn1):
-            return fallback()
-        self.optimizer.step()
+        def finite_on_all_ranks(value, predicate=None):
+            valid = finite(value) if predicate is None else bool(predicate)
+            flag = torch.tensor(1 if valid else 0, dtype=torch.int32,
+                                device=torch.cuda.current_device())
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
+            return bool(flag.item())
 
-        # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
-        device = theta0[0].device
-        # stats: [g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq, n_total, scale_sum]
-        stats = torch.zeros(9, dtype=torch.float64, device=device)
-        with torch.no_grad():
-            for p, t0, g0b, g1b in zip(params, theta0, g0_bufs, g1_bufs):
-                stats[0] += g0b.double().pow(2).sum()
-                stats[1] += g1b.double().pow(2).sum()
-                stats[2] += (g0b.double() * g1b.double()).sum()
-                stats[7] += g0b.numel()
+        try:
+            with torch.no_grad():
+                for parameter, t0 in zip(params, theta0):
+                    t0.copy_(copy_local(parameter))
 
-                sgn = torch.where(g0b >= 0, 1.0, -1.0)
-                r = g1b / (g0b.abs().clamp(min=delta) * sgn)
-                r.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
-                stats[5] += r.double().sum()
-                stats[6] += r.double().pow(2).sum()
+            # Pass 1: native optimizer-generated g0 -> theta1.
+            _, gn0 = self._accumulate_and_clip(batch, capture_bufs=g0_bufs)
+            gn0 = gn0.detach().item()
+            if not finite_on_all_ranks(gn0, finite(gn0) and gn0 > 1e-8):
+                result = fallback()
+                committed = True
+                return result
+            self.optimizer.step()
 
-                one_minus_r = 1.0 - r
-                s_k = (1.0 - r.pow(K)) / (one_minus_r + delta)
-                s_2 = (1.0 - r * r) / (one_minus_r + delta)
-                scale = (s_k / (s_2 + delta)).clamp_(1.0, K / 2.0 + 1.0)
-                stats[8] += scale.double().sum()
+            # Pass 2: native optimizer-generated g1 at theta1 -> theta2.
+            _, gn1 = self._accumulate_and_clip(batch, capture_bufs=g1_bufs)
+            gn1 = gn1.detach().item()
+            if not finite_on_all_ranks(gn1):
+                result = fallback()
+                committed = True
+                return result
+            self.optimizer.step()
+            with torch.no_grad():
+                for parameter, t2 in zip(params, theta2):
+                    t2.copy_(copy_local(parameter))
 
-                disp2 = p.data - t0
-                stats[3] += disp2.double().pow(2).sum()
-                dispK = disp2.mul_(scale)  # disp2 buffer becomes dispK
-                stats[4] += dispK.double().pow(2).sum()
-                p.data.copy_(dispK.mul_(alpha).add_(t0))
+            # Compute the GXPO displacement from theta0 and theta2 before the
+            # transaction is restored. The actual reposition happens after the
+            # optimizer state and parameters have both returned to theta0.
+            local_stats = [0.0] * 9
+            with torch.no_grad():
+                for t0, t2, g0b, g1b in zip(theta0, theta2, g0_bufs, g1_bufs):
+                    g0d = g0b.float()
+                    g1d = g1b.float()
+                    local_stats[0] += float(g0d.pow(2).sum().item())
+                    local_stats[1] += float(g1d.pow(2).sum().item())
+                    local_stats[2] += float((g0d * g1d).sum().item())
+                    local_stats[7] += g0b.numel()
 
-        # Pass 3: slow correction at theta_tilde
-        step_loss, gn_slow = self._accumulate_and_clip(batch)
-        gn_slow = gn_slow.detach().item()
-        if not finite(gn_slow):
-            return fallback()
-        self.optimizer.step()
+                    sign = torch.where(g0b >= 0, 1.0, -1.0)
+                    ratio = g1b / (g0b.abs().clamp(min=delta) * sign)
+                    ratio.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
+                    local_stats[5] += float(ratio.float().sum().item())
+                    local_stats[6] += float(ratio.float().pow(2).sum().item())
 
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+                    one_minus_ratio = 1.0 - ratio
+                    s_k = (1.0 - ratio.pow(K)) / (one_minus_ratio + delta)
+                    s_2 = (1.0 - ratio * ratio) / (one_minus_ratio + delta)
+                    scale = (s_k / (s_2 + delta)).clamp_(1.0, K / 2.0 + 1.0)
+                    local_stats[8] += float(scale.float().sum().item())
 
-        (g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq, n_total,
-         scale_sum) = stats.tolist()
+                    displacement = t2 - t0
+                    local_stats[3] += float(displacement.float().pow(2).sum().item())
+                    displacement_k = displacement * scale
+                    local_stats[4] += float(displacement_k.float().pow(2).sum().item())
 
-        eps = 1e-12
-        # gn_slow is already the global pre-clip grad norm (clip_grad_norm_ reduces across
-        # FSDP shards); feed it to the shutoff gate rather than the clipped post-step grads,
-        # whose norm is pinned at ~1.0 and makes the z-score degenerate.
-        g0_norm, g1_norm, gslow_norm = g0_sq**0.5, g1_sq**0.5, gn_slow
-        r_mean = sum_r / max(n_total, 1.0)
-        r_var = max(sum_r_sq / max(n_total, 1.0) - r_mean**2, 0.0)
-        disp2_norm, dispK_norm = disp2_sq**0.5, dispK_sq**0.5
+            device = torch.device('cuda', torch.cuda.current_device())
+            stats = torch.tensor(local_stats, dtype=torch.float64, device=device)
+            if optimizer_transaction is not None:
+                restore_theta0()
+                optimizer_transaction.restore()
 
-        z_score, trigger_stat, triggered = state.update_trigger_state(step=step_idx,
-                                                                      g0_norm=g0_norm,
-                                                                      g_slow_norm=gslow_norm)
-        state.step_count = step_idx + 1
+            with torch.no_grad():
+                for parameter, t0, t2, g0b, g1b in zip(params, theta0, theta2, g0_bufs, g1_bufs):
+                    p_local = copy_local(parameter)
+                    sign = torch.where(g0b >= 0, 1.0, -1.0)
+                    ratio = g1b / (g0b.abs().clamp(min=delta) * sign)
+                    ratio.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
+                    one_minus_ratio = 1.0 - ratio
+                    s_k = (1.0 - ratio.pow(K)) / (one_minus_ratio + delta)
+                    s_2 = (1.0 - ratio * ratio) / (one_minus_ratio + delta)
+                    scale = (s_k / (s_2 + delta)).clamp_(1.0, K / 2.0 + 1.0)
+                    p_local.copy_(t0 + alpha * scale * (t2 - t0))
 
-        if triggered:
-            print(f'[GXPO-SFT] shutoff triggered at step {step_idx}: '
-                  f'|z|={abs(z_score):.3f} >= tau={state.tau} -> single-pass SFT from now on')
+            # Slow gradient is evaluated at theta_tilde with the restored
+            # optimizer state. Its single step is the committed update.
+            step_loss, gn_slow = self._accumulate_and_clip(batch)
+            local_slow = [0.0, 0.0]
+            with torch.no_grad():
+                for parameter, g0b in zip(params, g0_bufs):
+                    if parameter.grad is not None:
+                        grad = parameter.grad.to_local() if hasattr(parameter.grad, 'to_local') else parameter.grad
+                        gradd = grad.float()
+                        local_slow[0] += float((g0b.float() * gradd).sum().item())
+                        local_slow[1] += float(gradd.pow(2).sum().item())
+            slow_dot_stats = torch.tensor(local_slow, dtype=torch.float64, device=device)
+            gn_slow = gn_slow.detach().item()
+            if not finite_on_all_ranks(gn_slow):
+                result = fallback()
+                committed = True
+                return result
+            self.optimizer.step()
+            if optimizer_transaction is not None:
+                optimizer_transaction.commit()
+            committed = True
 
-        # metric names mirror the RL arm so the two runs can be plotted together
-        return step_loss, {
-            'train/grad_norm': float(gn_slow),
-            'train/gxpo_enabled': 1.0,
-            'train/gxpo_trigger_z': float(z_score),
-            'train/gxpo_trigger_stat': float(trigger_stat),
-            'train/gxpo_g0_norm': g0_norm,
-            'train/gxpo_g1_norm': g1_norm,
-            'train/gxpo_gslow_norm': gslow_norm,
-            'train/gxpo_r_mean': r_mean,
-            'train/gxpo_r_std': r_var**0.5,
-            'train/gxpo_scale_mean': scale_sum / max(n_total, 1.0),
-            'train/gxpo_disp2_norm': disp2_norm,
-            'train/gxpo_dispK_norm': dispK_norm,
-            'train/gxpo_dispK_over_disp2': dispK_norm / (disp2_norm + eps),
-            'train/gxpo_cos_g0_g1': dot01 / (g0_norm * g1_norm + eps),
-        }
+            if torch.distributed.is_initialized():
+                torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
+                torch.distributed.all_reduce(slow_dot_stats, op=torch.distributed.ReduceOp.SUM)
+
+            (g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq,
+             n_total, scale_sum) = stats.tolist()
+            dot0slow, slow_sq = slow_dot_stats.tolist()
+            eps = 1e-12
+            g0_norm, g1_norm, gslow_norm = g0_sq ** 0.5, g1_sq ** 0.5, gn_slow
+            r_mean = sum_r / max(n_total, 1.0)
+            r_var = max(sum_r_sq / max(n_total, 1.0) - r_mean ** 2, 0.0)
+            disp2_norm, dispK_norm = disp2_sq ** 0.5, dispK_sq ** 0.5
+            cosine_g0_gslow = dot0slow / (g0_norm * (slow_sq ** 0.5) + eps)
+            disagreement = 1.0 - abs(cosine_g0_gslow)
+            z_score, trigger_stat, triggered = state.update_trigger_state(
+                step=step_idx, g0_norm=g0_norm, g_slow_norm=gslow_norm,
+                stat_override=disagreement)
+            state.step_count = step_idx + 1
+
+            if triggered:
+                print(f'[GXPO-SFT] shutoff triggered at step {step_idx}: '
+                      f'z={z_score:.3f} >= tau={state.tau} -> single-pass SFT from now on')
+
+            return step_loss, {
+                'train/grad_norm': float(gn_slow),
+                'train/gxpo_enabled': 1.0,
+                'train/gxpo_trigger_z': float(z_score),
+                'train/gxpo_trigger_stat': float(trigger_stat),
+                'train/gxpo_disagreement': float(disagreement),
+                'train/gxpo_g0_norm': g0_norm,
+                'train/gxpo_g1_norm': g1_norm,
+                'train/gxpo_gslow_norm': gslow_norm,
+                'train/gxpo_r_mean': r_mean,
+                'train/gxpo_r_std': r_var ** 0.5,
+                'train/gxpo_scale_mean': scale_sum / max(n_total, 1.0),
+                'train/gxpo_disp2_norm': disp2_norm,
+                'train/gxpo_dispK_norm': dispK_norm,
+                'train/gxpo_dispK_over_disp2': dispK_norm / (disp2_norm + eps),
+                'train/gxpo_cos_g0_g1': dot01 / (g0_norm * g1_norm + eps),
+                'train/gxpo_cos_g0_gslow': float(cosine_g0_gslow),
+            }
+        finally:
+            if not committed:
+                if optimizer_transaction is not None:
+                    restore_theta0()
+                    optimizer_transaction.restore()
+                self.optimizer.zero_grad(set_to_none=True)
 
     def validation_step(self, batch: TensorDict):
         self.fsdp_model.eval()
@@ -607,12 +996,76 @@ class FSDPSFTTrainer(object):
             torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG)
         return loss
 
+    def _resume_step_from_path(self, path):
+        name = os.path.basename(os.path.abspath(path))
+        if not name.startswith('global_step_'):
+            raise ValueError(f'Resumable SFT checkpoint must be named global_step_N, got {path}')
+        try:
+            return int(name.removeprefix('global_step_'))
+        except ValueError as exc:
+            raise ValueError(f'Invalid resumable SFT checkpoint path: {path}') from exc
+
+    def save_resumable_checkpoint(self, step):
+        if self.checkpoint_manager is None:
+            raise RuntimeError('Resumable SFT checkpoints currently require FSDP1')
+        path = os.path.join(self.config.trainer.default_local_dir, 'resumable', f'global_step_{step}')
+        self.checkpoint_manager.save_checkpoint(
+            local_path=path, global_step=step, save_optimizer=True
+        )
+        if self.device_mesh.get_rank() == 0:
+            tracker = os.path.join(self.config.trainer.default_local_dir, 'resumable',
+                                   'latest_checkpointed_iteration.txt')
+            with open(tracker, 'w') as handle:
+                handle.write(str(step))
+            state_path = os.path.join(
+                self.config.trainer.default_local_dir, 'resumable', f'global_step_{step}',
+                'sft_state.pt'
+            )
+            torch.save({
+                'global_step': int(step),
+                'gxpo_state': (dict(self.gxpo_state.__dict__)
+                               if self.gxpo_state is not None else None),
+                'best_eval_score': float(self._best_eval_score),
+                'best_eval_step': self._best_eval_step,
+            }, state_path)
+        torch.distributed.barrier()
+
+    def load_resumable_checkpoint(self):
+        path = self.config.trainer.get('resume_path', None)
+        if not path:
+            return 0
+        if self.checkpoint_manager is None:
+            raise RuntimeError('Resuming SFT checkpoints currently requires FSDP1')
+        step = self._resume_step_from_path(path)
+        self.checkpoint_manager.load_checkpoint(path=os.path.abspath(path))
+        state_path = os.path.join(os.path.abspath(path), 'sft_state.pt')
+        if os.path.isfile(state_path):
+            state = torch.load(state_path, map_location='cpu', weights_only=False)
+            saved_gxpo = state.get('gxpo_state')
+            if self.gxpo_state is not None and saved_gxpo is not None:
+                for key, value in saved_gxpo.items():
+                    if hasattr(self.gxpo_state, key):
+                        setattr(self.gxpo_state, key, value)
+            self._best_eval_score = float(state.get('best_eval_score', self._best_eval_score))
+            self._best_eval_step = state.get('best_eval_step', self._best_eval_step)
+        print(f'Resumed FSDP SFT state from {path} at global step {step}', flush=True)
+        return step
+
     def save_checkpoint(self, step):
-        # save checkpoint
-        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
-            state_dict = self.fsdp_model.state_dict()
+        # Save a plain Hugging Face checkpoint for vLLM and downstream evaluation.
+        if self._is_fsdp2:
+            from torch.distributed.checkpoint.state_dict import (
+                StateDictOptions, get_model_state_dict,
+            )
+            state_dict = get_model_state_dict(
+                self.fsdp_model,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
+        else:
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.fsdp_model, StateDictType.FULL_STATE_DICT, cfg):
+                state_dict = self.fsdp_model.state_dict()
 
         path = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
         # save huggingface model
@@ -624,6 +1077,230 @@ class FSDPSFTTrainer(object):
                 hdfs_io.makedirs(self.config.trainer.default_hdfs_dir, exist_ok=True)
                 hdfs_io.copy(src=path, dst=self.config.trainer.default_hdfs_dir, dirs_exist_ok=True)
         torch.distributed.barrier()
+
+    def _run_greedy_eval(self, global_step, rank):
+        """Evaluate a saved SFT checkpoint through the repository vLLM evaluator.
+
+        Saving first is intentional: vLLM needs a plain Hugging Face checkpoint,
+        while the live trainer owns the FSDP model.  Rank zero launches the
+        single-GPU evaluator; all ranks participate in the surrounding
+        checkpoint/barrier calls so this remains safe for a future multi-rank
+        launch.
+        """
+        root = self.config.trainer.get('eval_benchmark_root', None)
+        if not root:
+            raise RuntimeError('eval_benchmark_root is required for greedy SFT evaluation')
+
+        run_dir = os.path.abspath(self.config.trainer.default_local_dir)
+        self.save_checkpoint(step=global_step)
+
+        # With legacy FSDP1, release model and optimizer CUDA storage while
+        # the synchronous vLLM evaluator owns this GPU. FSDP2 uses its native
+        # CPUOffloadPolicy when configured, so its runtime state is already
+        # offloaded between operations.
+        legacy_eval_offload = not self._is_fsdp2
+        if legacy_eval_offload:
+            offload_fsdp_model_to_cpu(self.fsdp_model)
+            offload_fsdp_optimizer(self.optimizer)
+            torch.cuda.empty_cache()
+        torch.distributed.barrier()
+
+        eval_kind = str(self.config.trainer.get('eval_kind', 'math'))
+        evaluator_name = (
+            'evaluate_knights_and_knaves_sft.py'
+            if eval_kind == 'knights_and_knaves'
+            else 'evaluate_code_distillation.py'
+            if eval_kind == 'code'
+            else 'evaluate_math_distillation.py'
+            if eval_kind == 'math_distill'
+            else 'evaluate_sft_terminal.py'
+        )
+        if eval_kind not in {'math', 'math_distill', 'knights_and_knaves', 'code'}:
+            raise RuntimeError(f'unsupported SFT eval_kind={eval_kind!r}')
+        evaluator = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', '..', 'tools', evaluator_name)
+        )
+        result_path = os.path.join(run_dir, 'final_sft_eval.json')
+        eval_command = [
+            sys.executable,
+            evaluator,
+            '--run-dir', run_dir,
+            '--step', str(global_step),
+            '--data-root', os.path.abspath(root),
+            '--seeds', '0',
+            '--n', '1',
+            '--temperature', '0.0',
+            '--top-p', '1.0',
+            '--max-tokens', str(self.config.trainer.get('eval_greedy_max_new_tokens', 3072)),
+            '--max-examples', str(self.config.trainer.get('eval_greedy_max_examples', 0)),
+            '--prompt-length', str(self.config.trainer.get('eval_greedy_prompt_max_length', 2048)),
+            '--gpu-memory-utilization',
+            str(self.config.trainer.get('eval_greedy_vllm_gpu_memory_utilization', 0.18)),
+            '--tensor-parallel-size', str(
+                self.config.trainer.get('eval_greedy_vllm_tensor_parallel_size', 1)
+            ),
+            '--data-parallel-size', str(
+                self.config.trainer.get('eval_greedy_vllm_data_parallel_size', 1)
+            ),
+            '--max-num-batched-tokens', str(
+                self.config.trainer.get('eval_greedy_vllm_max_num_batched_tokens', 32768)
+            ),
+            '--max-num-seqs', str(
+                self.config.trainer.get('eval_greedy_vllm_max_num_seqs', 256)
+            ),
+            '--verifier-workers', str(
+                self.config.trainer.get('eval_greedy_verifier_workers', 0)
+            ),
+        ]
+        try:
+            if rank == 0:
+                print('[SFT greedy] launching vLLM evaluator: ' + ' '.join(eval_command), flush=True)
+                # The evaluator is launched from inside torchrun. Do not let it
+                # inherit torchrun process-group coordinates: vLLM creates its
+                # own single-process engine and otherwise may attach to the
+                # trainer MASTER_ADDR/MASTER_PORT and wait indefinitely.
+                eval_env = os.environ.copy()
+                # vLLM is launched after the trainer has initialized CUDA. Force
+                # its child engine to spawn instead of forking that CUDA context.
+                eval_env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+                for key in (
+                    "MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE",
+                    "LOCAL_RANK", "LOCAL_WORLD_SIZE", "GROUP_RANK",
+                    "ROLE_RANK", "ROLE_WORLD_SIZE", "TORCHELASTIC_RUN_ID",
+                    "TORCHELASTIC_RESTART_COUNT", "TORCHELASTIC_MAX_RESTARTS",
+                    "TORCHELASTIC_ERROR_FILE",
+                    "GROUP_WORLD_SIZE", "ROLE_NAME", "TORCHELASTIC_USE_AGENT_STORE",
+                ):
+                    eval_env.pop(key, None)
+                timeout_s = int(self.config.trainer.get('eval_greedy_timeout_s', 900))
+                try:
+                    subprocess.run(
+                        eval_command, check=True, cwd=os.path.dirname(evaluator),
+                        env=eval_env, start_new_session=True, timeout=(timeout_s if timeout_s > 0 else None),
+                    )
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        f'SFT vLLM evaluation timed out after {timeout_s}s at step {global_step}; '
+                        f'checkpoint preserved at {run_dir}/global_step_{global_step}'
+                    ) from exc
+                except subprocess.CalledProcessError as exc:
+                    raise RuntimeError(
+                        f'SFT vLLM evaluation failed at step {global_step}; '
+                        f'checkpoint preserved at {run_dir}/global_step_{global_step}'
+                    ) from exc
+        finally:
+            if legacy_eval_offload:
+                load_fsdp_model_to_gpu(self.fsdp_model)
+                load_fsdp_optimizer(self.optimizer, torch.cuda.current_device())
+                torch.cuda.synchronize()
+        torch.distributed.barrier()
+
+        if rank != 0:
+            return {}
+
+        with open(result_path) as handle:
+            result = json.load(handle)
+        if eval_kind == 'knights_and_knaves':
+            benchmark_names = (
+                'iid_3ppl', 'iid_4ppl', 'iid_5ppl', 'iid_6ppl',
+                'ood_7ppl', 'ood_8ppl',
+            )
+        elif eval_kind == 'code':
+            benchmark_names = ('humanevalplus', 'mbppplus', 'livecodebench')
+        elif eval_kind == 'math_distill':
+            benchmark_names = ('math500', 'aime24', 'aime25')
+        else:
+            benchmark_names = ('math500', 'aime24', 'aime25', 'amc23', 'minerva', 'olympiadbench')
+        if eval_kind == 'math_distill':
+            metrics = {
+                f'eval/{name}/greedy_pass_at_1': float(
+                    result['benchmarks'][name]['greedy_pass_at_1']
+                )
+                for name in benchmark_names
+            }
+            metrics['eval/average_greedy_pass_at_1'] = float(
+                result['benchmarks']['average_greedy_pass_at_1']['mean']
+            )
+            # Keep the canonical best-checkpoint key unchanged.
+            metrics.update({
+                f'eval_greedy/{name}_pass1': metrics[f'eval/{name}/greedy_pass_at_1']
+                for name in benchmark_names
+            })
+            metrics['eval_greedy/avg_pass1'] = metrics['eval/average_greedy_pass_at_1']
+        else:
+            metrics = {
+                f'eval_greedy/{name}_pass1': float(
+                    result['benchmarks'][name]['mean']['pass_at_1']
+                )
+                for name in benchmark_names
+            }
+            metrics['eval_greedy/avg_pass1'] = float(
+                result['benchmarks']['avg_pass_at_1']['mean']
+            )
+        metrics['eval_greedy/benchmark_count'] = len(benchmark_names)
+        metrics['eval_greedy/global_step'] = int(global_step)
+        print(
+            f'[SFT greedy] step={global_step} '
+            f'avg_pass1={metrics["eval_greedy/avg_pass1"]:.6f}',
+            flush=True,
+        )
+        return metrics
+
+    def _maybe_save_best_checkpoint(self, metrics, global_step):
+        """Pin the checkpoint selected by W&B's canonical greedy pass@1 key."""
+        rank = self.device_mesh.get_rank()
+        score = float(metrics.get('eval_greedy/avg_pass1', float('-inf'))) if rank == 0 else float('-inf')
+        score_tensor = torch.tensor(
+            score, dtype=torch.float64, device=torch.cuda.current_device()
+        )
+        torch.distributed.broadcast(score_tensor, src=0)
+        score = float(score_tensor.item())
+        improved = math.isfinite(score) and score > self._best_eval_score
+        evaluated_path = os.path.join(
+            self.config.trainer.default_local_dir, f'global_step_{global_step}'
+        )
+        previous_best_step = self._best_eval_step
+        if not improved:
+            if rank == 0:
+                # Every evaluation first writes a checkpoint for vLLM.  Keep
+                # only the best evaluated checkpoint to avoid filling the
+                # filesystem when greedy_eval_freq is small.
+                if os.path.isdir(evaluated_path):
+                    shutil.rmtree(evaluated_path)
+                    print(
+                        f'[SFT] removed non-best evaluated checkpoint: '
+                        f'global_step_{global_step}',
+                        flush=True,
+                    )
+            torch.distributed.barrier()
+            return False
+
+        self._best_eval_score = score
+        self._best_eval_step = int(global_step)
+        # _run_greedy_eval already saved this exact evaluated checkpoint.
+        if rank == 0:
+            if previous_best_step is not None and previous_best_step != self._best_eval_step:
+                previous_path = os.path.join(
+                    self.config.trainer.default_local_dir,
+                    f'global_step_{previous_best_step}',
+                )
+                if os.path.isdir(previous_path):
+                    shutil.rmtree(previous_path)
+            best_path = os.path.join(self.config.trainer.default_local_dir, 'best_ckpt.json')
+            with open(best_path, 'w') as handle:
+                json.dump({
+                    'best_step': self._best_eval_step,
+                    'best_score': self._best_eval_score,
+                    'metric': 'eval_greedy/avg_pass1',
+                    'path': f'global_step_{self._best_eval_step}',
+                }, handle, indent=2)
+            print(
+                f'[SFT] new best checkpoint: step={self._best_eval_step} '
+                f'eval_greedy/avg_pass1={self._best_eval_score:.6f}',
+                flush=True,
+            )
+        torch.distributed.barrier()
+        return True
 
     def _run_validation(self, tracking, global_step, rank):
         """Mean val loss, logged as val/loss. `trainer.val_max_batches` caps the number of
@@ -644,21 +1321,18 @@ class FSDPSFTTrainer(object):
         rank = self.device_mesh.get_rank()
 
         # TODO: add a unified tracking
+        tracking = None
         if rank == 0:
             tracking = Tracking(project_name=self.config.trainer.project_name,
                                 experiment_name=self.config.trainer.experiment_name,
                                 default_backend=self.config.trainer.logger,
                                 config=OmegaConf.to_container(self.config, resolve=True))
 
-        global_step = 0
-        # compute the total training steps.
-        # the total training steps in SFT is mainly for early exit
-        total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
-
-        if self.config.trainer.total_training_steps is not None:
-            total_training_steps = self.config.trainer.total_training_steps
-
-        self.total_training_steps = total_training_steps
+        global_step = self.load_resumable_checkpoint()
+        batches_to_skip = global_step
+        # The scheduler was built with this exact horizon. Do not recompute it
+        # from the uncapped epoch budget here.
+        self.total_training_steps = self.total_steps
         print(f'Total training steps: {self.total_training_steps}')
 
         # TODO (zhangchi.usc1992) add back checkpoint manager. Currently, it blocks when uploading to hdfs. So very slow.
@@ -668,11 +1342,18 @@ class FSDPSFTTrainer(object):
             for data in tqdm(self.train_dataloader,
                              total=self.steps_per_epoch,
                              desc=f"Epoch {epoch+1}/{self.config.trainer.total_epochs}"):
+                if batches_to_skip > 0:
+                    batches_to_skip -= 1
+                    continue
                 global_step += 1
                 data = TensorDict(data, batch_size=self.config.data.train_batch_size).cuda()
                 metric = self.training_step(data)
                 if rank == 0:
                     tracking.log(data=metric, step=global_step)
+
+                resumable_freq = self.config.trainer.get('resumable_save_freq', 0)
+                if resumable_freq > 0 and global_step % resumable_freq == 0:
+                    self.save_resumable_checkpoint(global_step)
 
                 # periodic validation / checkpointing (the defaults keep the old
                 # validate-and-save-at-epoch-end-only behaviour)
@@ -680,23 +1361,39 @@ class FSDPSFTTrainer(object):
                 save_freq = self.config.trainer.get('save_freq', 0)
                 if test_freq > 0 and global_step % test_freq == 0 and global_step < self.total_training_steps:
                     self._run_validation(tracking, global_step, rank)
-                if save_freq > 0 and global_step % save_freq == 0 and global_step < self.total_training_steps:
+                greedy_freq = self.config.trainer.get('greedy_eval_freq', 0)
+                if greedy_freq > 0 and global_step % greedy_freq == 0 and global_step < self.total_training_steps:
+                    greedy_metrics = self._run_greedy_eval(global_step, rank)
+                    if rank == 0:
+                        tracking.log(data=greedy_metrics, step=global_step)
+                    self._maybe_save_best_checkpoint(greedy_metrics, global_step)
+                if (save_freq > 0 and global_step % save_freq == 0
+                        and global_step < self.total_training_steps
+                        and not (greedy_freq > 0 and global_step % greedy_freq == 0)
+                        and not self.config.trainer.get('keep_best_only', True)):
                     self.save_checkpoint(step=global_step)
 
                 # for early exit validation
                 if global_step >= self.total_training_steps:
+                    if self.checkpoint_manager is not None:
+                        self.save_resumable_checkpoint(global_step)
                     # Perform final validation
                     self._run_validation(tracking, global_step, rank)
 
-                    # Save final checkpoint
-                    self.save_checkpoint(step=global_step)
+                    greedy_metrics = self._run_greedy_eval(global_step, rank)
+                    if rank == 0:
+                        tracking.log(data=greedy_metrics, step=global_step)
+                    self._maybe_save_best_checkpoint(greedy_metrics, global_step)
+
+                    # The evaluated checkpoint is retained only when it is the
+                    # best pass@1 checkpoint; do not recreate a discarded final copy.
                     return
 
             # validation
             self._run_validation(tracking, global_step, rank)
 
-            # save checkpoint
-            self.save_checkpoint(step=global_step)
+            # Evaluation checkpoints are the only checkpoints retained by this
+            # audit; epoch-end saves would create unscored duplicates.
 
 
 from verl.trainer.fsdp_sft_trainer import FSDPSFTTrainer
