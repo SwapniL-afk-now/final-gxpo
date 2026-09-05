@@ -58,61 +58,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         super().__init__(model, optimizer, lr_scheduler, processing_class)
 
-    def _muon_metadata(self):
-        if self.optimizer is None or not hasattr(self.optimizer, 'muon_parameter_count'):
-            return None
-        return {
-            'optimizer_name': 'muon',
-            'backend': getattr(self.optimizer, 'backend', None),
-            'backend_version': getattr(self.optimizer, 'backend_version', 'gather_scatter_v1'),
-            'world_size': int(self.world_size),
-            'fsdp_size': int(getattr(self.optimizer, 'fsdp_size', 1)),
-            'muon_momentum': float(self.optimizer.defaults.get('momentum', 0.95)),
-            'muon_ns_steps': int(self.optimizer.defaults.get('ns_steps', 5)),
-            'muon_nesterov': bool(self.optimizer.defaults.get('nesterov', True)),
-            'muon_parameter_count': int(getattr(self.optimizer, 'muon_parameter_count', 0)),
-            'adamw_parameter_count': int(getattr(self.optimizer, 'adamw_parameter_count', 0)),
-            'parameter_signature': getattr(self.optimizer, 'parameter_signature', None),
-        }
-
-    def _uses_native_muon_checkpoint(self):
-        """Muon keeps optimizer state as rank-local native tensors.
-
-        PyTorch FSDP cannot reconstruct this gather/scatter state through its
-        standard optimizer serializer, so Muon checkpoints use the optimizer
-        native local state dict while AdamW and other optimizers keep the
-        standard FSDP path.
-        """
-        return getattr(self.optimizer, "backend", None) == "gather_scatter"
-
-    @staticmethod
-    def _cpu_copy_state(value):
-        if torch.is_tensor(value):
-            return value.detach().cpu()
-        if isinstance(value, dict):
-            return {key: FSDPCheckpointManager._cpu_copy_state(item)
-                    for key, item in value.items()}
-        if isinstance(value, list):
-            return [FSDPCheckpointManager._cpu_copy_state(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(FSDPCheckpointManager._cpu_copy_state(item) for item in value)
-        return value
-
-    def _validate_muon_metadata(self, metadata):
-        expected = self._muon_metadata()
-        if expected is None:
-            return
-        if not isinstance(metadata, dict):
-            raise ValueError('Muon checkpoint is missing optimizer compatibility metadata')
-        keys = ('optimizer_name', 'backend', 'backend_version', 'world_size', 'fsdp_size',
-                'muon_momentum', 'muon_ns_steps', 'muon_nesterov', 'parameter_signature')
-        mismatches = {
-            key: (metadata.get(key), expected.get(key))
-            for key in keys if metadata.get(key) != expected.get(key)
-        }
-        if mismatches:
-            raise ValueError(f'incompatible Muon checkpoint metadata: {mismatches}')
-
     def load_checkpoint(self, path=None, del_local_after_load=False, *args, **kwargs):
         if path is None:
             return
@@ -125,44 +70,46 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             f'[rank-{self.rank}]: Loading from {remote_model_path} and {remote_optim_path} and {remote_extra_state_path}'
         )
         local_model_path = copy_to_local(remote_model_path)
-        local_optim_path = copy_to_local(remote_optim_path) if os.path.exists(remote_optim_path) else None
-        local_extra_state_path = copy_to_local(remote_extra_state_path) if os.path.exists(remote_extra_state_path) else None
+        local_extra_state_path = copy_to_local(remote_extra_state_path)
+        # best_checkpoint is intentionally weights-only.  Resume checkpoints
+        # still carry the optimizer shard and follow the normal path below.
+        has_optimizer = os.path.exists(remote_optim_path)
+        local_optim_path = copy_to_local(remote_optim_path) if has_optimizer else None
 
         model_state_dict = torch.load(local_model_path)
-        optimizer_state_dict = torch.load(local_optim_path) if local_optim_path is not None else None
-        extra_state_dict = (torch.load(local_extra_state_path, weights_only=False)
-                            if local_extra_state_path is not None else {})
+        optimizer_state_dict = (torch.load(local_optim_path)
+                                 if local_optim_path is not None else None)
+        extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
 
         if del_local_after_load:
             try:
                 os.remove(local_model_path) if is_non_local(local_model_path) else None
-                os.remove(local_optim_path) if local_optim_path and is_non_local(local_optim_path) else None
-                os.remove(local_extra_state_path) if local_extra_state_path and is_non_local(local_extra_state_path) else None
+                if local_optim_path is not None:
+                    os.remove(local_optim_path) if is_non_local(local_optim_path) else None
+                os.remove(local_extra_state_path) if is_non_local(local_extra_state_path) else None
             except Exception as e:
                 print(
                     f'[rank-{self.rank}]: remove local resume ckpt file after loading failed, exception {e} will be ignored'
                 )
-        lr_scheduler_state_dict = extra_state_dict.get('lr_scheduler')
-        self._validate_muon_metadata(extra_state_dict.get('muon'))
+
+        lr_scheduler_state_dict = extra_state_dict['lr_scheduler']
 
         state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
         with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
             self.model.load_state_dict(model_state_dict)
             if self.optimizer is not None and optimizer_state_dict is not None:
-                if not self._uses_native_muon_checkpoint():
-                    optimizer_state_dict = FSDP.optim_state_dict_to_load(
-                        self.model, self.optimizer, optimizer_state_dict)
                 self.optimizer.load_state_dict(optimizer_state_dict)
         # recover random state
         if 'rng' in extra_state_dict:
             # 'rng' may not exist for backward compatibility
             self.load_rng_state(extra_state_dict['rng'])
 
-        if self.lr_scheduler is not None and lr_scheduler_state_dict is not None:
+        if self.lr_scheduler is not None:
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
 
-    def save_checkpoint(self, local_path: str, global_step: int, remove_previous_ckpt=False, save_optimizer=True, *args, **kwargs):
+    def save_checkpoint(self, local_path: str, global_step: int, remove_previous_ckpt=False,
+                        save_optimizer=True, *args, **kwargs):
         # record the previous global step
         self.previous_global_step = global_step
 
@@ -181,13 +128,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
                 model_state_dict = self.model.state_dict()
                 if save_optimizer and self.optimizer is not None:
-                    if self._uses_native_muon_checkpoint():
-                        optimizer_state_dict = self._cpu_copy_state(self.optimizer.state_dict())
-                    else:
-                        optimizer_state_dict = FSDP.optim_state_dict(self.model, self.optimizer)
+                    optimizer_state_dict = self.optimizer.state_dict()
                 else:
                     optimizer_state_dict = None
-                if save_optimizer and self.lr_scheduler is not None:
+                if self.lr_scheduler is not None:
                     lr_scheduler_state_dict = self.lr_scheduler.state_dict()
                 else:
                     lr_scheduler_state_dict = None
@@ -195,21 +139,22 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 extra_state_dict = {
                     'lr_scheduler': lr_scheduler_state_dict,
                     'rng': self.get_rng_state(),
-                    'muon': self._muon_metadata(),
-                } if save_optimizer else None
+                }
                 model_path = os.path.join(local_path, f'model_world_size_{self.world_size}_rank_{self.rank}.pt')
                 optim_path = os.path.join(local_path, f'optim_world_size_{self.world_size}_rank_{self.rank}.pt')
                 extra_path = os.path.join(local_path, f'extra_state_world_size_{self.world_size}_rank_{self.rank}.pt')
 
                 print(f'[rank-{self.rank}]: Saving model to {os.path.abspath(model_path)}')
                 print(f'[rank-{self.rank}]: Saving checkpoint to {os.path.abspath(model_path)}')
-                if save_optimizer:
-                    print(f'[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}')
+                print(f'[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}')
                 torch.save(model_state_dict, model_path)
                 if save_optimizer:
-                    torch.save(optimizer_state_dict, optim_path)  # TODO: address optimizer is None
-                if save_optimizer:
-                    torch.save(extra_state_dict, extra_path)
+                    torch.save(optimizer_state_dict, optim_path)
+                elif os.path.exists(optim_path):
+                    # A fixed best_checkpoint directory is overwritten.  Do
+                    # not leave an optimizer shard from an older best save.
+                    os.remove(optim_path)
+                torch.save(extra_state_dict, extra_path)
 
         # wait for everyone to dump to local
         torch.distributed.barrier()

@@ -186,7 +186,14 @@ def main_task(config):
     # Note that we always use function-based RM for validation
     val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
 
-    resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    configured_colocate = config.trainer.get('max_colocate_count', None)
+    if configured_colocate is None:
+        configured_colocate = 10 if bool(config.actor_rollout_ref.actor.get('use_kd', False)) else 1
+    resource_pool_manager = ResourcePoolManager(
+        resource_pool_spec=resource_pool_spec,
+        mapping=mapping,
+        max_colocate_count=int(configured_colocate),
+    )
 
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,

@@ -187,12 +187,12 @@ def compute_reward_metrics(batch, config):
         # Calculate all_correct ratio (value == 3)
         all_correct = torch.sum(reward_tensor == 1).float() / reward_tensor.numel()
         reward_metrics["reward/all_correct_ratio"] = all_correct.detach().item()
-        # Calculate format_error ratio (value == -1)
-        format_error = torch.sum(reward_tensor == 0).float() / reward_tensor.numel()
-        reward_metrics["reward/format_error_ratio"] = format_error.detach().item()
-        # Calculate wrong answer ratio (value == -1)
-        format_error = torch.sum(reward_tensor == 0.1).float() / reward_tensor.numel()
-        reward_metrics["reward/wrong_answer_ratio"] = format_error.detach().item()
+        # Math rewards are binary: malformed and incorrect answers both receive 0.
+        # Keep the legacy format key at zero and expose the actual zero-reward rate.
+        zero_reward = torch.sum(reward_tensor == 0).float() / reward_tensor.numel()
+        reward_metrics["reward/format_error_ratio"] = 0.0
+        reward_metrics["reward/wrong_answer_ratio"] = zero_reward.detach().item()
+        reward_metrics["reward/zero_reward_ratio"] = zero_reward.detach().item()
 
         prompt_num = reward_tensor.view(-1,8).size(0)
 
@@ -211,13 +211,17 @@ def compute_reward_metrics(batch, config):
             print('non_diverse_examples:', non_diverse_examples)
         reward_metrics["examples/non_diverse_examples_ratio"] = non_diverse_examples_ratio.detach().item()
 
-        format_example = torch.logical_and(reward_tensor.view(-1,8).max(-1)[0] == 0.1, reward_tensor.view(-1,8).min(-1)[0] == 0.1).sum()
-        format_example = format_example / prompt_num
+        # There is no separate 0.1 format reward under binary scoring.
+        all_zero_reward_example = torch.logical_and(reward_tensor.view(-1,8).max(-1)[0] == 0,
+                                                    reward_tensor.view(-1,8).min(-1)[0] == 0).sum()
+        all_zero_reward_example = all_zero_reward_example / prompt_num
+        format_example = torch.zeros((), device=reward_tensor.device)
 
         all_correct_example = torch.logical_and(reward_tensor.view(-1,8).max(-1)[0] == 1, reward_tensor.view(-1,8).min(-1)[0] == 1).sum()
         all_correct_example = all_correct_example / prompt_num
 
         reward_metrics["examples/format_example_ratio"] = format_example.detach().item()
+        reward_metrics["examples/all_zero_reward_example_ratio"] = all_zero_reward_example.detach().item()
         reward_metrics["examples/all_correct_example_ratio"] = all_correct_example.detach().item()
 
         easy_examples_ratio = (reward_tensor.view(-1,8).mean(-1) > 0.75).sum() / prompt_num

@@ -112,7 +112,10 @@ class vLLMRollout(BaseRollout):
             load_format=config.load_format,
             disable_log_stats=config.disable_log_stats,
             max_num_batched_tokens=max_num_batched_tokens,
+            max_num_seqs=int(self.config.get('max_num_seqs', 256)),
             enable_chunked_prefill=config.enable_chunked_prefill,
+            enable_prefix_caching=self.config.get('enable_prefix_caching', False),
+            **({'attention_backend': self.config.get('attention_backend')} if self.config.get('attention_backend', None) is not None else {}),
         )
 
         # Offload vllm model to reduce peak memory usage

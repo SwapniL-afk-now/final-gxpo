@@ -18,6 +18,7 @@ Single Process Actor
 import itertools
 import os
 import time
+import weakref
 from typing import Iterable, Tuple
 
 # Power-throttle chunk size for full-model diagnostic norm waves (see
@@ -32,9 +33,9 @@ from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.actor import BasePPOActor
 from verl.workers.actor.gxpo_state import GXPOState, compute_gxpo_retention_scale
-from verl.workers.actor.optimizer_transaction import snapshot_optimizer_state
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
+from verl.workers.actor.kd_loss import KD_TOPK_CHUNK_TOKENS, compute_forward_kl_topk_chunked
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
@@ -122,17 +123,9 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_power_guard_active_s = 0.0
         self._gxpo_power_guard_sleep_s = 0.0
         # Cache of the constant-per-outer-step reposition direction sum-of-squares
-        # consumed by _optimizer_state_metrics; keyed by the identity of the current pairs list.
+        # consumed by _optimizer_state_metrics; keyed by a weakref to the pairs list.
         self._reposition_dir_cache = None
         if self.config.get('use_gxpo', False) and actor_optimizer is not None:
-            self.gxpo_optimizer_state_mode = str(
-                self.config.get('gxpo_optimizer_state_mode', 'transactional')).lower()
-            if self.gxpo_optimizer_state_mode not in (
-                    'transactional', 'transactional_fast_state', 'legacy'):
-                raise ValueError(
-                    'gxpo_optimizer_state_mode must be transactional, '
-                    'transactional_fast_state, or legacy, '
-                    f'got {self.gxpo_optimizer_state_mode!r}')
             self.gxpo_state = GXPOState(
                 K=self.config.get('gxpo_k', 5),
                 alpha=self.config.get('gxpo_alpha', 0.5),
@@ -256,6 +249,40 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
+    def _forward_kd_micro_batch(self, micro_batch, temperature) -> torch.Tensor:
+        """Dense response-logits forward for offline KD (no rmpad).
+
+        Returns bf16/fp32 logits of shape (bsz, response_length, vocab). The
+        dense path is used deliberately: the offline teacher top-K cache is
+        stored dense per response position, while rmpad row order is
+        data-dependent and cannot be pre-aligned. Logits stay in autocast
+        dtype here; ``kd_loss`` upcasts in token chunks (see kd_loss.py), so
+        no full [tokens, vocab] FP32 copy ever exists.
+        """
+        response_length = micro_batch['responses'].size(-1)
+        multi_modal_inputs = {}
+        if 'multi_modal_inputs' in micro_batch:
+            for key in micro_batch['multi_modal_inputs'][0].keys():
+                multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch['multi_modal_inputs']],
+                                                    dim=0)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            input_ids = micro_batch['input_ids']
+            attention_mask = micro_batch['attention_mask']
+            position_ids = micro_batch['position_ids']
+            if position_ids.dim() == 3:  # qwen2vl mrope
+                position_ids = position_ids.transpose(0, 1)
+            output = self.actor_module(input_ids=input_ids,
+                                       attention_mask=attention_mask,
+                                       position_ids=position_ids,
+                                       **multi_modal_inputs,
+                                       use_cache=False)
+            logits = output.logits
+            logits.div_(temperature)
+            logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab)
+            # Clone out of the autocast graph inputs; the caller holds this
+            # only until the chunked KL below consumes it, then deletes it.
+            return logits
+
     def _clip_grads(self):
         assert self.config.grad_clip is not None
 
@@ -265,8 +292,114 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         return grad_norm
 
+    def _ensure_fsdp_gradient_sync(self):
+        """Ensure FSDP leaves a local reduced gradient for the optimizer.
+
+        FSDP's ``no_sync()`` intentionally leaves full unsharded gradients.
+        The hybrid-engine rollout path does not use gradient accumulation via
+        ``no_sync()``, but vLLM state/weight transitions can leave this private
+        flag disabled on Torch 2.9. Re-enable it at the update boundary so
+        sharded AdamW never sees a full gradient for a local flat parameter.
+        """
+        if not isinstance(self.actor_module, FSDP):
+            return
+        for module in self.actor_module.modules():
+            if isinstance(module, FSDP) and hasattr(module, '_sync_gradients'):
+                module._sync_gradients = True
+
+    def _reshard_full_fsdp_grads(self):
+        """Reduce-scatter any full flat gradients left by the FSDP runtime.
+
+        Torch 2.9 can leave an unsharded ``FlatParameter.grad`` after the
+        hybrid vLLM state transition even with the sync flag enabled. The
+        private reducer is the same implementation used by FSDP's backward
+        hook and handles flat-parameter padding and rank groups correctly.
+        """
+        if not isinstance(self.actor_module, FSDP):
+            return
+        # FSDP queues reduce-scatter on its post-backward CUDA stream. The
+        # custom remove-padding/FlashAttention path can return from backward
+        # before that stream has finalized ``.grad``; wait before inspecting
+        # shapes or clipping.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        modules = FSDP.fsdp_modules(self.actor_module)
+        candidates = []
+        local_flags = []
+        for module in modules:
+            handle = getattr(module, '_handle', None)
+            flat_param = getattr(handle, 'flat_param', None)
+            is_full = bool(
+                handle is not None and flat_param is not None and
+                handle.uses_sharded_strategy and flat_param.grad is not None and
+                flat_param.grad.numel() != flat_param.numel()
+            )
+            candidates.append((module, handle, flat_param))
+            local_flags.append(int(is_full))
+        if torch.distributed.is_initialized() and candidates:
+            flags = torch.tensor(local_flags, dtype=torch.int32,
+                                 device=torch.cuda.current_device())
+            torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.SUM)
+            world = torch.distributed.get_world_size()
+            if bool(((flags != 0) & (flags != world)).any().item()):
+                raise RuntimeError(
+                    'FSDP full-gradient mismatch is present on only a subset of ranks'
+                )
+            needs = [int(v) == world for v in flags.tolist()]
+        else:
+            needs = [bool(v) for v in local_flags]
+        if not any(needs):
+            return
+        from torch.distributed.fsdp import _runtime_utils as fsdp_runtime
+        from torch.distributed.fsdp._common_utils import TrainingState
+        for need, (module, handle, flat_param) in zip(needs, candidates):
+            if not need:
+                continue
+            if flat_param.grad is None:
+                raise RuntimeError('FSDP full-gradient repair requires a gradient on every rank')
+            # The normal hook already finalized the FSDP state by the time this
+            # repair runs. Temporarily enter its backward state so the official
+            # reducer/cast helpers accept the manually recovered full gradient.
+            old_training_state = module.training_state
+            had_post_backward_called = hasattr(flat_param, '_post_backward_called')
+            old_post_backward_called = getattr(flat_param, '_post_backward_called', False)
+            module.training_state = TrainingState.FORWARD_BACKWARD
+            flat_param._post_backward_called = True
+            try:
+                fsdp_runtime._reduce_grad(module, handle)
+                handle.prepare_gradient_for_optim()
+            finally:
+                module.training_state = old_training_state
+                if had_post_backward_called:
+                    flat_param._post_backward_called = old_post_backward_called
+                else:
+                    delattr(flat_param, '_post_backward_called')
+
+    def _cast_optimizer_grads_to_param_dtype(self):
+        """Normalize mixed-precision FSDP grads after clipping/reduction.
+
+        FSDP's ``clip_grad_norm_`` must run first: before it completes its
+        reduce-scatter, a flat parameter can temporarily expose the full
+        unsharded gradient while the parameter itself is a local shard.
+        """
+        for param in self.actor_module.parameters():
+            grad = param.grad
+            if grad is None or grad.dtype == param.dtype:
+                continue
+            if grad.shape != param.shape:
+                raise RuntimeError(
+                    f"FSDP gradient shape {tuple(grad.shape)} does not match "
+                    f"parameter shape {tuple(param.shape)} after clipping; "
+                    "gradient synchronization may be disabled"
+                )
+            # ``.data`` is intentional here. PyTorch's gradient assignment
+            # checks dtypes even though AdamW expects an FP32 master parameter
+            # with a reduced BF16 gradient.
+            param.grad.data = grad.to(dtype=param.dtype)
+
     def _optimizer_step(self):
         grad_norm = self._clip_grads()
+        self._cast_optimizer_grads_to_param_dtype()
         self.actor_optimizer.step()
         return grad_norm
 
@@ -295,34 +428,6 @@ class DataParallelPPOActor(BasePPOActor):
             time.sleep(sleep_s)
             self._gxpo_power_guard_sleep_s += sleep_s
 
-    @staticmethod
-    def _all_ranks_flag(value: bool, device, reduce_op=None) -> bool:
-        """Return a rank-consistent boolean without changing the caller's branch order."""
-        flag = torch.tensor(1 if value else 0, dtype=torch.int32, device=device)
-        if torch.distributed.is_initialized():
-            if reduce_op is None:
-                reduce_op = torch.distributed.ReduceOp.MIN
-            torch.distributed.all_reduce(flag, op=reduce_op)
-        return bool(flag.item())
-
-    def _global_format_error_ratio(self, data: DataProto):
-        """Compute the format-error ratio over the full distributed batch.
-
-        Actor data is sharded before this method runs, so a local ratio can differ
-        across FSDP ranks. The fallback decision must use global counts and then
-        be consumed identically by every rank.
-        """
-        scores = data.batch['token_level_scores']
-        local_zero_count = (scores.sum(dim=-1) == 0).sum().to(dtype=torch.float32)
-        local_sample_count = torch.tensor(float(scores.shape[0]),
-                                           dtype=torch.float32,
-                                           device=scores.device)
-        counts = torch.stack((local_zero_count, local_sample_count))
-        if torch.distributed.is_initialized():
-            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
-        ratio = counts[0] / counts[1].clamp_min(1.0)
-        return float(ratio.item()), int(counts[0].item()), int(counts[1].item())
-
     def _optimizer_state_metrics(self, reposition_pairs=None):
         """Return scalar AdamW-state diagnostics without changing optimizer state.
 
@@ -340,14 +445,14 @@ class DataParallelPPOActor(BasePPOActor):
         # The (post_reposition - pre_reposition) direction is constant across every
         # mini-batch of one SFPO slow phase (the caller builds one pairs list per
         # sfpo_update_actor and reuses it), so its sum-of-squares (stats[4]) is
-        # computed once per pairs list and cached. The cache holds the list identity and references existing buffers; it is replaced each outer step,
+        # computed once per pairs list and cached. The cache holds a weakref only,
         # so the caller's weight lists can still be freed. NOTE: stats[5] multiplies
         # the direction by the CURRENT exp_avg, which the optimizer updates on every
         # step, so it must be recomputed per call to stay bit-identical.
         cached_dir_sq = None
         if reposition_pairs is not None and self._reposition_dir_cache is not None:
-            pairs_obj, dir_sq = self._reposition_dir_cache
-            if pairs_obj is reposition_pairs:
+            pairs_ref, dir_sq = self._reposition_dir_cache
+            if pairs_ref() is reposition_pairs:
                 cached_dir_sq = dir_sq
 
         stats = None
@@ -386,7 +491,7 @@ class DataParallelPPOActor(BasePPOActor):
             if cached_dir_sq is not None:
                 stats[4] = cached_dir_sq
             else:
-                self._reposition_dir_cache = (reposition_pairs, stats[4].clone())
+                self._reposition_dir_cache = (weakref.ref(reposition_pairs), stats[4].clone())
         if torch.distributed.is_initialized():
             torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
         grad_norm = stats[0].sqrt().item()
@@ -525,6 +630,12 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        if self.config.get('use_kd', False):
+            # Offline KD teacher cache (dense per response position). Keys are
+            # appended only when present so non-KD batches keep working.
+            for kd_key in ('teacher_topk_log_probs', 'teacher_topk_ids'):
+                if kd_key in data.batch.keys() and kd_key not in select_keys:
+                    select_keys.append(kd_key)
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
@@ -546,21 +657,13 @@ class DataParallelPPOActor(BasePPOActor):
                             select_keys,
                             non_tensor_select_keys=None,
                             recompute_old_log_probs=False,
-                            collect_metrics=True,
-                            collect_gate_entropy=False):
+                            collect_metrics=True):
         """Zero grads and run one full forward/backward over a PPO mini-batch.
 
         Counts as exactly one backward pass (gradient accumulation over
         micro-batches). Does NOT clip or step the optimizer. When
         `recompute_old_log_probs`, old_log_probs are refreshed under no_grad at
         the current parameters (GXPO probe/correction passes).
-
-        `collect_gate_entropy` emits `actor/gxpo_gate_entropy` regardless of
-        `collect_metrics`. The shutoff gate needs entropy sampled at the SAME point in
-        every update -- the g0 probe, at theta0 -- because `actor/entropy_loss` is sourced
-        from pass 3 (at theta_tilde) on extrapolating steps and from the single pass (at
-        theta_prev) on fallback steps, which puts a level shift in the gate's own series
-        exactly when GXPO shuts off.
         """
         # split batch into micro_batches
         if has_multi_modal_inputs:
@@ -599,7 +702,17 @@ class DataParallelPPOActor(BasePPOActor):
             response_length = responses.size(1)
             attention_mask = data['attention_mask']
             response_mask = attention_mask[:, -response_length:]
-            if recompute_old_log_probs:
+            # Offline KD switch (loss-only delta; GXPO 3-pass math is untouched).
+            # Computed before the old_log_prob refresh so pure-KD probe passes
+            # can skip it (one forward saved per pass per micro-batch).
+            use_kd = (self.config.get('use_kd', False)
+                      and 'teacher_topk_log_probs' in data
+                      and 'teacher_topk_ids' in data)
+            pure_kd = use_kd and not self.config.get('kd_use_pg', False)
+            if recompute_old_log_probs and pure_kd:
+                # Pure KD never consumes old_log_probs.
+                old_log_prob = None
+            elif recompute_old_log_probs:
                 with torch.no_grad():
                     # Entropy is discarded on this probe pass; skip softmax+logsumexp.
                     _, old_log_prob = self._forward_micro_batch(micro_batch=data,
@@ -612,34 +725,117 @@ class DataParallelPPOActor(BasePPOActor):
             clip_ratio = self.config.clip_ratio
             entropy_coeff = self.config.entropy_coeff
 
+            kd_coef = float(self.config.get('kd_coef', 1.0))
+
             # Entropy is consumed only through the logged entropy_loss metric and the
-            # `- entropy_loss * entropy_coeff` term. When metrics are not collected
-            # and the coefficient is zero, skip the softmax+logsumexp entirely.
-            need_entropy = collect_metrics or collect_gate_entropy or entropy_coeff != 0
-
-            # all return: (bsz, response_length)
-            if need_entropy:
-                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+            # `- entropy_loss * entropy_coeff` term. Pure KD needs no entropy
+            # forward at all (saves one full forward per micro-batch per probe
+            # pass); the zero placeholder keeps metric keys stable.
+            if pure_kd:
+                need_entropy = entropy_coeff != 0
             else:
-                _, log_prob = self._forward_micro_batch(micro_batch=data,
-                                                        temperature=temperature,
-                                                        need_entropy=False)
+                need_entropy = collect_metrics or entropy_coeff != 0
 
-            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                          log_prob=log_prob,
-                                                                          advantages=advantages,
-                                                                          eos_mask=response_mask,
-                                                                          cliprange=clip_ratio)
-            # compute entropy loss from entropy. A skipped entropy implies
-            # entropy_coeff == 0, so the zero placeholder keeps policy_loss (and its
-            # gradients) bit-identical.
-            if need_entropy:
-                entropy_loss = verl_F.masked_mean(entropy, response_mask)
+            kd_loss = None
+            kd_student_mass = None
+            kd_teacher_mass = None
+            if pure_kd:
+                if need_entropy:
+                    entropy, _ = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                    entropy_loss = verl_F.masked_mean(entropy, response_mask)
+                    del entropy
+                else:
+                    entropy_loss = None
+                # Dense response-logits forward; consumed in token chunks below.
+                kd_logits = self._forward_kd_micro_batch(micro_batch=data, temperature=temperature)
+                flat_mask = response_mask.bool().reshape(-1)
+                if bool(flat_mask.any().item()):
+                    flat_logits = kd_logits.reshape(-1, kd_logits.size(-1))[flat_mask]
+                    t_logps = data['teacher_topk_log_probs']
+                    t_ids = data['teacher_topk_ids']
+                    if torch.is_tensor(t_logps) and t_logps.dim() == 3:
+                        t_logps = t_logps.reshape(-1, t_logps.size(-1))[flat_mask]
+                    if torch.is_tensor(t_ids) and t_ids.dim() == 3:
+                        t_ids = t_ids.reshape(-1, t_ids.size(-1))[flat_mask]
+                    kd_out = compute_forward_kl_topk_chunked(
+                        flat_logits,
+                        t_logps,
+                        t_ids.long(),
+                        log_prob_min_clamp=self.config.get('kd_log_prob_min_clamp', -10.0),
+                        loss_max_clamp=self.config.get('kd_loss_max_clamp', 10.0),
+                        chunk_tokens=int(self.config.get('kd_chunk_tokens',
+                                                          KD_TOPK_CHUNK_TOKENS)),
+                    )
+                    kd_loss = kd_out['distillation_losses'].mean()
+                    kd_student_mass = kd_out['student_mass'].mean().detach()
+                    kd_teacher_mass = kd_out['teacher_mass'].mean().detach()
+                    del kd_out, flat_logits, t_logps, t_ids
+                else:
+                    kd_loss = kd_logits.new_zeros(())
+                # Free the [tokens, vocab] logits before backward so the peak
+                # never stacks a logits copy on top of the chunked FP32 work.
+                del kd_logits, flat_mask
+                if entropy_loss is None:
+                    entropy_loss = kd_loss.new_zeros(())
+                # Metric-compat placeholders (ray_trainer merges these keys).
+                pg_loss = kd_loss.new_zeros(())
+                pg_clipfrac = kd_loss.new_zeros(())
+                ppo_kl = kd_loss.new_zeros(())
+                policy_loss = kd_coef * kd_loss
             else:
-                entropy_loss = pg_loss.new_zeros(())
+                # all return: (bsz, response_length)
+                if need_entropy:
+                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                else:
+                    _, log_prob = self._forward_micro_batch(micro_batch=data,
+                                                            temperature=temperature,
+                                                            need_entropy=False)
 
-            # compute policy loss
-            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
+                                                                              log_prob=log_prob,
+                                                                              advantages=advantages,
+                                                                              eos_mask=response_mask,
+                                                                              cliprange=clip_ratio)
+                # compute entropy loss from entropy. A skipped entropy implies
+                # entropy_coeff == 0, so the zero placeholder keeps policy_loss (and its
+                # gradients) bit-identical.
+                if need_entropy:
+                    entropy_loss = verl_F.masked_mean(entropy, response_mask)
+                else:
+                    entropy_loss = pg_loss.new_zeros(())
+
+                # compute policy loss
+                policy_loss = pg_loss - entropy_loss * entropy_coeff
+                if use_kd:
+                    # Auxiliary KD on top of the PG loss (kd_use_pg=True).
+                    kd_logits = self._forward_kd_micro_batch(micro_batch=data, temperature=temperature)
+                    flat_mask = response_mask.bool().reshape(-1)
+                    if bool(flat_mask.any().item()):
+                        flat_logits = kd_logits.reshape(-1, kd_logits.size(-1))[flat_mask]
+                        t_logps = data['teacher_topk_log_probs']
+                        t_ids = data['teacher_topk_ids']
+                        if torch.is_tensor(t_logps) and t_logps.dim() == 3:
+                            t_logps = t_logps.reshape(-1, t_logps.size(-1))[flat_mask]
+                        if torch.is_tensor(t_ids) and t_ids.dim() == 3:
+                            t_ids = t_ids.reshape(-1, t_ids.size(-1))[flat_mask]
+                        kd_out = compute_forward_kl_topk_chunked(
+                            flat_logits,
+                            t_logps,
+                            t_ids.long(),
+                            log_prob_min_clamp=self.config.get('kd_log_prob_min_clamp', -10.0),
+                            loss_max_clamp=self.config.get('kd_loss_max_clamp', 10.0),
+                            chunk_tokens=int(self.config.get('kd_chunk_tokens',
+                                                              KD_TOPK_CHUNK_TOKENS)),
+                        )
+                        kd_loss = kd_out['distillation_losses'].mean()
+                        kd_student_mass = kd_out['student_mass'].mean().detach()
+                        kd_teacher_mass = kd_out['teacher_mass'].mean().detach()
+                        del kd_out, flat_logits, t_logps, t_ids
+                    else:
+                        kd_loss = policy_loss.new_zeros(())
+                    del kd_logits, flat_mask
+                    policy_loss = policy_loss + kd_coef * kd_loss
+                del log_prob
 
             if self.config.use_kl_loss:
                 ref_log_prob = data['ref_log_prob']
@@ -667,9 +863,6 @@ class DataParallelPPOActor(BasePPOActor):
             self.raw_backward_calls += 1
             self._gxpo_power_guard(backward_start)
 
-            if collect_gate_entropy:
-                append_to_dict(metrics, {'actor/gxpo_gate_entropy': entropy_loss.detach()})
-
             if collect_metrics:
                 # GPU-scalar accumulation with a single deferred D2H sync per
                 # mini-batch below, instead of one .item() sync per micro-batch.
@@ -679,12 +872,23 @@ class DataParallelPPOActor(BasePPOActor):
                     'actor/pg_clipfrac': pg_clipfrac.detach(),
                     'actor/ppo_kl': ppo_kl.detach(),
                 }
+                if kd_loss is not None:
+                    micro_metrics['actor/kd_loss'] = kd_loss.detach()
+                    if kd_student_mass is not None:
+                        micro_metrics['actor/kd_student_mass'] = kd_student_mass
+                    if kd_teacher_mass is not None:
+                        micro_metrics['actor/kd_teacher_mass'] = kd_teacher_mass
                 append_to_dict(metrics, micro_metrics)
+
+        # FSDP 2.9 may leave a full flat gradient after the backward hooks in
+        # the vLLM hybrid transition. Repair it before GXPO captures or clips.
+        self._reshard_full_fsdp_grads()
 
         # Materialize deferred GPU scalars in one sync. Values are bit-identical to
         # the previous per-micro-batch .item() conversions; list lengths unchanged.
         for key in ('actor/entropy_loss', 'actor/pg_loss', 'actor/pg_clipfrac', 'actor/ppo_kl',
-                    'actor/kl_loss', 'actor/gxpo_gate_entropy'):
+                    'actor/kl_loss', 'actor/kd_loss', 'actor/kd_student_mass',
+                    'actor/kd_teacher_mass'):
             vals = metrics.get(key)
             if vals and isinstance(vals[0], torch.Tensor):
                 metrics[key] = torch.stack(vals).tolist()
@@ -695,6 +899,7 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto, reposition_pairs=None):
         # make sure we are in training mode
         self.actor_module.train()
+        self._ensure_fsdp_gradient_sync()
         bp_start = self.cumulative_bp
         raw_backward_start = self.raw_backward_calls
 
@@ -744,9 +949,6 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_cos_g0_gslow': 0.0,
             'actor/gxpo_inactive_frac': 0.0,
             'actor/gxpo_ratio_clip_frac': 0.0,
-            'actor/gxpo_clip_scale_g0': 0.0,
-            'actor/gxpo_clip_scale_g1': 0.0,
-            'actor/gxpo_relative_threshold_reject_frac': 0.0,
         }
 
     def _gxpo_init_buffers(self):
@@ -807,15 +1009,20 @@ class DataParallelPPOActor(BasePPOActor):
         warmup, GXPO still updates its rolling baseline but cannot trip the shutoff gate.
         """
         state = self.gxpo_state
+        force_all_steps = bool(self.config.get('gxpo_force_all_steps', False))
+        if force_all_steps:
+            # Force mode is an explicit ablation: never honor a statistical
+            # shutoff or the hard active-step budget during this run.
+            state.trigger_index = float('inf')
+            state.budget_stop = None
         step_idx = state.step_count
         K, alpha, delta = state.K, state.alpha, state.delta
-        device = torch.device('cuda', torch.cuda.current_device())
         recompute_old = self.config.get('gxpo_recompute_old_log_probs', False)
         skip_corrective = self.config.get('gxpo_skip_corrective', False)
 
         def standard_step(fallback_triggered=False):
             metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                               non_tensor_select_keys, collect_gate_entropy=True)
+                                               non_tensor_select_keys)
             step_start = time.perf_counter()
             grad_norm = self._optimizer_step()
             self._gxpo_power_guard(step_start)
@@ -839,77 +1046,43 @@ class DataParallelPPOActor(BasePPOActor):
         with torch.no_grad():
             self._gxpo_copy_parameters(theta0, [p.data for p in params])
 
-        optimizer_transaction = None
-        fast_optimizer_transaction = None
-        if self.gxpo_optimizer_state_mode in ('transactional', 'transactional_fast_state'):
-            optimizer_transaction = snapshot_optimizer_state(self.actor_optimizer)
-
-        def restore_probe_state():
-            self._gxpo_restore_theta0()
-            if optimizer_transaction is not None:
-                optimizer_transaction.restore()
-
-        def probe_optimizer_step():
-            try:
-                self.actor_optimizer.step()
-            except BaseException:
-                restore_probe_state()
-                raise
-
-        def probe_clip_grads():
-            try:
-                return self._clip_grads()
-            except BaseException:
-                restore_probe_state()
-                raise
-
         def fallback():
-            # A failed probe must not leak either its parameters or optimizer state.
-            restore_probe_state()
+            # ponytail: light fallback — restore theta0 only; probe-step optimizer-moment
+            # pollution is accepted (rare non-finite event), no optimizer-state deepcopy
+            self._gxpo_restore_theta0()
             self.actor_optimizer.zero_grad(set_to_none=True)
             return standard_step(fallback_triggered=True)
 
         # Pass 1: g0 at theta0. Keep its loss metrics (actor/entropy_loss etc.) — the skip-corrective
         # ablation has no Pass 3 to source them from, and ray_trainer reads actor/entropy_loss every step.
-        try:
-            probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                     non_tensor_select_keys, collect_metrics=skip_corrective,
-                                     collect_gate_entropy=True)
-        except BaseException:
-            restore_probe_state()
-            raise
+        probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                 non_tensor_select_keys, collect_metrics=skip_corrective)
         # Capture raw gradients for the retention ratio; clip only the optimizer step.
         self._gxpo_capture_grads(g0_bufs)
         step_start = time.perf_counter()
-        gn0 = probe_clip_grads().detach().item()
-        clip_scale_g0 = min(1.0, float(self.config.grad_clip) / (abs(gn0) + 1e-12))
+        gn0 = self._clip_grads().detach().item()
         valid_gn0 = (gn0 == gn0 and abs(gn0) != float('inf') and gn0 > 1e-8)
-        valid_gn0_global = self._all_ranks_flag(valid_gn0, device)
-        if valid_gn0_global:
-            probe_optimizer_step()
+        if valid_gn0:
+            self._cast_optimizer_grads_to_param_dtype()
+            self.actor_optimizer.step()
         self._gxpo_power_guard(step_start)
-        if not valid_gn0_global:
+        if not valid_gn0:
             return fallback()
 
         # Pass 2: g1 at theta_{t,1}
-        try:
-            self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                     non_tensor_select_keys, recompute_old_log_probs=recompute_old,
-                                     collect_metrics=False)
-        except BaseException:
-            restore_probe_state()
-            raise
+        self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                 non_tensor_select_keys, recompute_old_log_probs=recompute_old,
+                                 collect_metrics=False)
         # Capture raw gradients before clipping, matching g0.
         self._gxpo_capture_grads(g1_bufs)
         step_start = time.perf_counter()
-        gn1 = probe_clip_grads().detach().item()
-        clip_scale_g1 = min(1.0, float(self.config.grad_clip) / (abs(gn1) + 1e-12))
+        gn1 = self._clip_grads().detach().item()
         valid_gn1 = (gn1 == gn1 and abs(gn1) != float('inf'))
-        valid_gn1_global = self._all_ranks_flag(valid_gn1, device)
-        if valid_gn1_global:
-            probe_optimizer_step()
+        if valid_gn1:
+            self._cast_optimizer_grads_to_param_dtype()
+            self.actor_optimizer.step()
         self._gxpo_power_guard(step_start)
-        if not valid_gn1_global:
+        if not valid_gn1:
             return fallback()
 
         # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
@@ -945,15 +1118,13 @@ class DataParallelPPOActor(BasePPOActor):
                     torch.cuda.synchronize()
                 # ---- ALGORITHMIC PATH: retention scale + reposition write stay
                 # ---- op-for-op identical to the previous per-parameter loop.
-                r, scale, active, ratio_clipped = compute_gxpo_retention_scale(
-                    g0b, g1b, K, delta, clip_scale_g0=clip_scale_g0, clip_scale_g1=clip_scale_g1)
+                r, scale, active, ratio_clipped = compute_gxpo_retention_scale(g0b, g1b, K, delta)
                 stats[2] += (g0b * g1b).sum()
                 stats[7] += active.sum()
                 stats[8] += g0b.numel()
                 stats[14] += ratio_clipped.sum()
                 stats[9] += scale.float().sum()
-                if scale.numel():
-                    scale_max = torch.maximum(scale_max, scale.float().amax().reshape(1))
+                scale_max = torch.maximum(scale_max, scale.float().amax().reshape(1))
 
                 stats[5] += r.sum()
                 stats[6] += r.square().sum()
@@ -980,20 +1151,6 @@ class DataParallelPPOActor(BasePPOActor):
                 p.data.copy_(dispK.mul_(alpha).add_(t0))
         self._gxpo_power_guard(diagnostic_start)
 
-        # The fast trajectory was only a probe. Keep theta_tilde, but isolate
-        # every optimizer-state mutation caused by the probe steps. In the
-        # fast-state comparison mode, retain the native fast branch separately
-        # and select it explicitly for the final committed update.
-        if optimizer_transaction is not None:
-            if self.gxpo_optimizer_state_mode == 'transactional_fast_state':
-                fast_optimizer_transaction = snapshot_optimizer_state(self.actor_optimizer)
-            optimizer_transaction.restore()
-            if self.gxpo_optimizer_state_mode == 'transactional_fast_state':
-                # Match the useful legacy state trajectory without allowing
-                # probe mutations to leak into the main optimizer implicitly.
-                assert fast_optimizer_transaction is not None
-                fast_optimizer_transaction.restore()
-
         # Pass 3: slow correction at theta_tilde. Skipped for the no-corrective ablation, where the
         # reposition above IS the update (params already sit at theta_tilde, nothing more to do).
         if skip_corrective:
@@ -1001,13 +1158,9 @@ class DataParallelPPOActor(BasePPOActor):
             gn_slow = gn1  # report the last real probe norm; no corrective grad exists
             gslow_stats = torch.zeros(2, dtype=torch.float32, device=device)
         else:
-            try:
-                pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                                         non_tensor_select_keys, recompute_old_log_probs=recompute_old,
-                                                         collect_metrics=True)
-            except BaseException:
-                restore_probe_state()
-                raise
+            pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                                     non_tensor_select_keys, recompute_old_log_probs=recompute_old,
+                                                     collect_metrics=True)
             append_to_dict(pass3_metrics, self._optimizer_state_metrics())
             # Capture corrective-gradient diagnostics before clipping, matching g0/g1.
             # _clip_grads() returns the pre-clip norm but mutates p.grad in place.
@@ -1021,13 +1174,13 @@ class DataParallelPPOActor(BasePPOActor):
                     gslow_stats[0] += gradf.square().sum()
                     gslow_stats[1] += (gradf * g0f).sum()
             step_start = time.perf_counter()
-            gn_slow = probe_clip_grads().detach().item()
+            gn_slow = self._clip_grads().detach().item()
             valid_gn_slow = (gn_slow == gn_slow and abs(gn_slow) != float('inf'))
-            valid_gn_slow_global = self._all_ranks_flag(valid_gn_slow, device)
-            if valid_gn_slow_global:
-                probe_optimizer_step()
+            if valid_gn_slow:
+                self._cast_optimizer_grads_to_param_dtype()
+                self.actor_optimizer.step()
             self._gxpo_power_guard(step_start)
-            if not valid_gn_slow_global:
+            if not valid_gn_slow:
                 return fallback()
 
         # single global reduction so every rank takes the identical gate decision
@@ -1088,12 +1241,6 @@ class DataParallelPPOActor(BasePPOActor):
             self._gxpo_release_buffers()
 
         metrics = pass3_metrics
-        # probe_metrics is otherwise discarded whenever a corrective pass exists, but it
-        # carries the gate's entropy observation (sampled at theta0). Without this the
-        # gate would silently fall back to the pass-3 value measured at theta_tilde.
-        gate_entropy = probe_metrics.get('actor/gxpo_gate_entropy')
-        if gate_entropy is not None and 'actor/gxpo_gate_entropy' not in metrics:
-            metrics['actor/gxpo_gate_entropy'] = gate_entropy
         append_to_dict(metrics, {'actor/grad_norm': float(gn_slow)})
         append_to_dict(metrics, {
             'actor/gxpo_enabled': 1.0,
@@ -1114,10 +1261,6 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_cos_g0_gslow': dot0slow / (g0_norm * gslow_norm + eps),
             'actor/gxpo_inactive_frac': 1.0 - n_active / max(n_total, 1.0),
             'actor/gxpo_ratio_clip_frac': ratio_clipped / max(n_active, 1.0),
-            'actor/gxpo_clip_scale_g0': clip_scale_g0,
-            'actor/gxpo_clip_scale_g1': clip_scale_g1,
-            'actor/gxpo_relative_threshold_reject_frac':
-                1.0 - n_active / max(n_total, 1.0),
             'actor/gxpo_fallback_triggered': 0.0,
             'reposition/jump_norm': abs(alpha) * dispK_norm,
             'reposition/jump_relative_to_param_norm': abs(alpha) * dispK_norm / (param_norm + eps),
@@ -1142,41 +1285,30 @@ class DataParallelPPOActor(BasePPOActor):
         shutoff gate is open, single-pass GRPO afterwards."""
         assert self.gxpo_state is not None, 'update_policy_gxpo called without use_gxpo=True'
         self.actor_module.train()
+        self._ensure_fsdp_gradient_sync()
         bp_start = self.cumulative_bp
         raw_backward_start = self.raw_backward_calls
         self._gxpo_power_guard_active_s = 0.0
         self._gxpo_power_guard_sleep_s = 0.0
 
-        # The format-error guard is only an auxiliary safety check. It must not
-        # bypass GXPO's requested cold-start history: the first zscore_w outer
-        # batches are always GXPO observations. Actor data is sharded, so compute
-        # the ratio from global counts before making the branch decision.
-        format_error_ratio, format_error_count, format_sample_count = (
-            self._global_format_error_ratio(data))
-        # Under gxpo_trigger_signal=entropy the actor's GXPOState is bypassed entirely, so
-        # its trigger_history stays empty forever and this guard could never engage. The
-        # trainer owns that gate and already ships its readiness in meta_info; read it.
-        if str(self.config.get('gxpo_trigger_signal', 'entropy')).lower() == 'entropy':
-            history_ready = bool(data.meta_info.get('gxpo_entropy_window_ready', False))
-        else:
-            history_ready = len(self.gxpo_state.trigger_history) >= self.gxpo_state.zscore_w
-        history_ready = self._all_ranks_flag(
-            history_ready, data.batch['token_level_scores'].device,
-            reduce_op=torch.distributed.ReduceOp.MIN)
-        trigger_stop = self._all_ranks_flag(
-            bool(trigger_stop), data.batch['token_level_scores'].device,
-            reduce_op=torch.distributed.ReduceOp.MAX)
-        format_guard_violation = (
-            history_ready and
-            format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5))
-        force_standard = bool(trigger_stop or format_guard_violation)
-        # Keep the enabled-state branch rank-consistent even if a prior numerical
-        # event or hard active-step budget changed one rank's local state first.
-        state_enabled = self.gxpo_state.is_enabled(self.gxpo_state.step_count)
-        state_enabled = self._all_ranks_flag(
-            state_enabled, data.batch['token_level_scores'].device,
-            reduce_op=torch.distributed.ReduceOp.MIN)
-        force_standard = bool(force_standard or not state_enabled)
+        # Guard against degenerate batches (e.g. a format-parse collapse: most rollouts get
+        # reward 0 because they failed to parse, not because the problem was hard). Such a batch
+        # has near-uniform reward -> near-zero-magnitude probe gradients g0/g1 -> a spurious,
+        # huge z-score that permanently trips the shutoff gate on a fluke rather than a real
+        # divergence. Skip extrapolation for this step only; the gate's rolling baseline is left untouched
+        # since a degenerate batch was never a valid observation of the gate's trigger statistic.
+        # The on-policy math reward is binary: both malformed and incorrect
+        # responses are intentionally scored 0.  Therefore zero-reward mass
+        # cannot be used as a format-error detector; doing so would disable
+        # GXPO on nearly every batch.  Keep the legacy guard opt-in for tasks
+        # that still have a separate format reward.
+        reward_binary = bool(self.config.get('gxpo_binary_reward', False))
+        format_error_ratio = (data.batch['token_level_scores'].sum(-1) == 0).float().mean().item()
+        format_skip_enabled = bool(self.config.get('gxpo_format_error_skip_enabled', False)) and not reward_binary
+        force_standard = (
+            (format_skip_enabled and format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5))
+            or (trigger_stop and not force_all_steps)
+        )
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
         dataloader, has_multi_modal_inputs, select_keys, non_tensor_select_keys = self._make_minibatch_iterator(data)
@@ -1196,10 +1328,6 @@ class DataParallelPPOActor(BasePPOActor):
                 _merge_metrics(metrics, mb_metrics)
         if force_standard:
             metrics['actor/gxpo_format_skip'] = 1.0
-        metrics['actor/gxpo_format_error_ratio'] = format_error_ratio
-        metrics['actor/gxpo_format_error_count'] = float(format_error_count)
-        metrics['actor/gxpo_format_sample_count'] = float(format_sample_count)
-        metrics['actor/gxpo_history_ready'] = float(history_ready)
         if defer_trigger:
             # Match SFPO: reduce minibatch trigger statistics to exactly one
             # scalar for this outer batch, score it against the preceding

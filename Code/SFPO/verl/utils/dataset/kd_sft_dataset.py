@@ -12,13 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-SFT dataset
+Offline KD-SFT dataset
 - We assume user pass a single parquet file.
 - We load all the data into the memory.
 Each parquet file contains
 """
 
 from typing import List, Union
+import hashlib
+import json
 
 import pandas as pd
 
@@ -31,9 +33,24 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.utils import hf_tokenizer
 
 
-class SFTDataset(Dataset):
+def tokenizer_fingerprint(tokenizer) -> str:
+    """Stable identity for token IDs, special tokens, and chat formatting."""
+    payload = {
+        "vocab": sorted((str(k), int(v)) for k, v in tokenizer.get_vocab().items()),
+        "vocab_size": int(getattr(tokenizer, "vocab_size", 0)),
+        "length": int(len(tokenizer)),
+        "special_tokens_map": tokenizer.special_tokens_map,
+        "all_special_ids": [int(v) for v in tokenizer.all_special_ids],
+        "chat_template": getattr(tokenizer, "chat_template", None),
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class KDSFTDataset(Dataset):
     """
-    This is an in-memory SFTDataset
+    This is an in-memory offline KD-SFT dataset
     """
 
     def __init__(self,
@@ -44,9 +61,17 @@ class SFTDataset(Dataset):
                  response_key='response',
                  response_dict_keys=None,
                  max_length=1024,
-                 truncation='error'):
+                 truncation='error',
+                 teacher_topk_log_probs_key='teacher_topk_log_probs',
+                 teacher_topk_ids_key='teacher_topk_ids',
+                 teacher_topk=32,
+                 response_ids_key='response_ids'):
         assert truncation in ['error', 'left', 'right']
         self.truncation = truncation
+        self.teacher_topk_log_probs_key = teacher_topk_log_probs_key
+        self.teacher_topk_ids_key = teacher_topk_ids_key
+        self.teacher_topk = int(teacher_topk)
+        self.response_ids_key = response_ids_key
         if isinstance(parquet_files, str):
             parquet_files = [parquet_files]
         else:
@@ -109,6 +134,28 @@ class SFTDataset(Dataset):
         if isinstance(self.responses, pd.DataFrame):
             self.responses = self.responses.iloc[:, 0]
         self.responses = self.responses.tolist()
+
+        required_keys = (
+            self.teacher_topk_log_probs_key, self.teacher_topk_ids_key,
+            self.response_ids_key,
+            'kd_student_tokenizer_fingerprint',
+            'kd_teacher_tokenizer_fingerprint',
+        )
+        for key in required_keys:
+            if key not in self.dataframe.columns:
+                raise ValueError(
+                    f'KD cache key {key!r} not in {list(self.dataframe.columns)}; '
+                    'rebuild the cache with tools/kd_sft/build_teacher_topk.py')
+        expected_fp = tokenizer_fingerprint(self.tokenizer)
+        student_fps = set(self.dataframe['kd_student_tokenizer_fingerprint'].astype(str))
+        teacher_fps = set(self.dataframe['kd_teacher_tokenizer_fingerprint'].astype(str))
+        if student_fps != {expected_fp} or teacher_fps != {expected_fp}:
+            raise ValueError(
+                'KD cache tokenizer identity does not match the student tokenizer; '
+                'teacher and student vocab/merges/special tokens/chat template must be identical')
+        self.teacher_log_probs = self.dataframe[self.teacher_topk_log_probs_key].tolist()
+        self.teacher_ids = self.dataframe[self.teacher_topk_ids_key].tolist()
+        self.response_ids = self.dataframe[self.response_ids_key].tolist()
     def __len__(self):
         return len(self.prompts)
 
@@ -130,9 +177,11 @@ class SFTDataset(Dataset):
         prompt_ids = prompt_ids_output['input_ids'][0]
         prompt_attention_mask = prompt_ids_output['attention_mask'][0]
 
-        response_ids_output = tokenizer(response_chat_str, return_tensors='pt', add_special_tokens=False)
-        response_ids = response_ids_output['input_ids'][0]
-        response_attention_mask = response_ids_output['attention_mask'][0]
+        # Use the exact student-tokenizer IDs captured during cache generation.
+        # This prevents response text detokenize/retokenize drift.
+        import numpy as np
+        response_ids = torch.tensor(np.asarray(self.response_ids[item]).flatten(), dtype=torch.long)
+        response_attention_mask = torch.ones_like(response_ids)
 
         prompt_length = prompt_ids.shape[0]
         response_length = response_ids.shape[0]
@@ -177,4 +226,35 @@ class SFTDataset(Dataset):
             'position_ids': position_ids,
             'loss_mask': loss_mask
         }
+        # Canvas is aligned to input positions. The trainer shifts [:, 1:] in
+        # the same way as labels and consumes only response loss positions.
+        def _to_dense_topk(value, dtype):
+            arr = value if isinstance(value, np.ndarray) else np.asarray(value)
+            if arr.dtype == object:
+                arr = np.stack([np.asarray(row, dtype=dtype) for row in arr])
+            return np.asarray(arr, dtype=dtype)
+
+        t_lp = _to_dense_topk(self.teacher_log_probs[item], np.float32)
+        t_id = _to_dense_topk(self.teacher_ids[item], np.int64)
+        vocab_size = len(tokenizer)
+        if response_ids.numel() and (int(response_ids.min()) < 0 or int(response_ids.max()) >= vocab_size):
+            raise ValueError(f'KD cache response_ids row {item} contains IDs outside student vocab {vocab_size}')
+        if t_id.size and (int(t_id.min()) < 0 or int(t_id.max()) >= vocab_size):
+            raise ValueError(f'KD cache teacher_topk_ids row {item} contains IDs outside student vocab {vocab_size}')
+        if t_lp.ndim != 2 or t_lp.shape[1] != self.teacher_topk or t_lp.shape != t_id.shape:
+            raise ValueError(f'KD cache row {item} has shape {t_lp.shape}/{t_id.shape}; '
+                             f'expected [R, {self.teacher_topk}]')
+        if t_lp.shape[0] != response_length:
+            raise ValueError(f'KD cache row {item} has {t_lp.shape[0]} response tokens, '
+                             f'but exact response_ids has {response_length}')
+        canvas_lp = torch.zeros(self.max_length, self.teacher_topk, dtype=torch.float32)
+        canvas_id = torch.zeros(self.max_length, self.teacher_topk, dtype=torch.long)
+        start = min(prompt_length, self.max_length)
+        end = min(prompt_length + response_length, self.max_length)
+        take = max(0, end - start)
+        if take:
+            canvas_lp[start:end] = torch.from_numpy(t_lp[:take])
+            canvas_id[start:end] = torch.from_numpy(t_id[:take])
+        out['teacher_topk_log_probs'] = canvas_lp
+        out['teacher_topk_ids'] = canvas_id
         return out
