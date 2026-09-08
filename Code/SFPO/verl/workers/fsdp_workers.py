@@ -115,7 +115,10 @@ class ActorRolloutRefWorker(Worker):
         self.config = config
         import torch.distributed
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
+            local_rank = int(os.environ["LOCAL_RANK"])
+            torch.cuda.set_device(local_rank)
+            torch.distributed.init_process_group(
+                backend="nccl", device_id=torch.device("cuda", local_rank))
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -349,11 +352,14 @@ class ActorRolloutRefWorker(Worker):
         # Muon orthogonalizes 2-D weights, but FSDP's sharded parameter views are flattened
         # to 1-D (torch _flat_param.py:_use_sharded_views) -- which would put the entire
         # model in Muon's AdamW fallback branch and silently turn a "muon" run into AdamW.
-        # NO_SHARD + use_orig_params is the only combination that hands back original shapes.
+        # Single-GPU keeps NO_SHARD + use_orig_params (original shapes, dense backend).
+        # Multi-GPU keeps the mesh sharding strategy with use_orig_params=True and hands
+        # the wrapped model to build_muon, whose gather-scatter backend reconstructs each
+        # matrix before Newton-Schulz (see verl.workers.muon.build_fsdp_muon_registry).
         use_muon = (role == 'actor' and optim_config is not None and
                     str(optim_config.get('name', 'adamw')).lower() == 'muon')
-        if use_muon:
-            assert self.world_size == 1, 'muon path requires single-GPU (NO_SHARD + use_orig_params)'
+        muon_distributed = use_muon and self.world_size > 1
+        if use_muon and not muon_distributed:
             from torch.distributed.fsdp import ShardingStrategy
             sharding_strategy = ShardingStrategy.NO_SHARD
 
@@ -375,13 +381,22 @@ class ActorRolloutRefWorker(Worker):
             forward_prefetch=False)
 
         log_gpu_memory_usage('After Actor FSDP init', logger=logger)
+        if self.rank == 0:
+            try:
+                flat_dtype = next(actor_module_fsdp.parameters()).dtype
+            except StopIteration:
+                flat_dtype = 'n/a'
+            print(f'[actor-dtype] hf_torch_dtype={torch_dtype} '
+                  f'fsdp_flat_dtype={flat_dtype} mp_param_dtype={mixed_precision.param_dtype}')
 
         # TODO: add more optimizer args into config
         if role == 'actor' and optim_config is not None:
             from verl.utils.torch_functional import get_constant_schedule_with_warmup
             if use_muon:
                 from verl.workers.muon import build_muon
-                actor_optimizer = build_muon(actor_module_fsdp, optim_config)
+                actor_optimizer = build_muon(
+                    actor_module_fsdp, optim_config,
+                    fsdp_model=actor_module_fsdp if muon_distributed else None)
             else:
                 optimizer_param_dtype = next(actor_module_fsdp.parameters()).dtype
                 if optimizer_param_dtype != torch.float32:
@@ -401,6 +416,10 @@ class ActorRolloutRefWorker(Worker):
                     optimizer_kwargs['fused'] = True
                     if self.rank == 0:
                         print('Actor optimizer: fused AdamW')
+                if optim_config.get('foreach', None) is not None:
+                    optimizer_kwargs['foreach'] = bool(optim_config.get('foreach'))
+                    if self.rank == 0:
+                        print(f"Actor optimizer: foreach={optimizer_kwargs['foreach']}")
                 actor_optimizer = optim.AdamW(filter(lambda p: p.requires_grad, actor_module_fsdp.parameters()),
                                               **optimizer_kwargs)
 
@@ -908,7 +927,8 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, remove_previous_ckpt=False):
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0,
+                        remove_previous_ckpt=False, save_optimizer=True):
         # only support save and load ckpt for actor
         assert self._is_actor
         import torch
@@ -918,7 +938,8 @@ class ActorRolloutRefWorker(Worker):
         self.checkpoint_manager.save_checkpoint(local_path=local_path,
                                                 hdfs_path=hdfs_path,
                                                 global_step=global_step,
-                                                remove_previous_ckpt=remove_previous_ckpt)
+                                                remove_previous_ckpt=remove_previous_ckpt,
+                                                save_optimizer=save_optimizer)
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -944,7 +965,10 @@ class CriticWorker(Worker):
         super().__init__()
         import torch.distributed
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
+            local_rank = int(os.environ["LOCAL_RANK"])
+            torch.cuda.set_device(local_rank)
+            torch.distributed.init_process_group(
+                backend="nccl", device_id=torch.device("cuda", local_rank))
         self.config = config
 
         # build device mesh for Ulysses Sequence Parallel
@@ -1193,7 +1217,8 @@ class CriticWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, remove_previous_ckpt=False):
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0,
+                        remove_previous_ckpt=False, save_optimizer=True):
         import torch
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
@@ -1201,7 +1226,8 @@ class CriticWorker(Worker):
         self.checkpoint_manager.save_checkpoint(local_path=local_path,
                                                 hdfs_path=hdfs_path,
                                                 global_step=global_step,
-                                                remove_previous_ckpt=remove_previous_ckpt)
+                                                remove_previous_ckpt=remove_previous_ckpt,
+                                                save_optimizer=save_optimizer)
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -1233,7 +1259,10 @@ class RewardModelWorker(Worker):
         super().__init__()
         import torch.distributed
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
+            local_rank = int(os.environ["LOCAL_RANK"])
+            torch.cuda.set_device(local_rank)
+            torch.distributed.init_process_group(
+                backend="nccl", device_id=torch.device("cuda", local_rank))
         self.config = config
 
         # build device mesh for Ulysses Sequence Parallel

@@ -16,13 +16,16 @@ import os
 
 
 def initialize_global_process_group(timeout_second=36000):
+    import torch
     import torch.distributed
     from datetime import timedelta
-    torch.distributed.init_process_group('nccl', timeout=timedelta(seconds=timeout_second))
+    # Select the local device before NCCL initializes.  Otherwise NCCL guesses
+    # from the global rank, which is unsafe for Ray actors with isolated CVDs.
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-
-    if torch.distributed.is_initialized():
-        torch.cuda.set_device(local_rank)
+    torch.cuda.set_device(local_rank)
+    torch.distributed.init_process_group(
+        'nccl', timeout=timedelta(seconds=timeout_second),
+        device_id=torch.device('cuda', local_rank))
     return local_rank, rank, world_size

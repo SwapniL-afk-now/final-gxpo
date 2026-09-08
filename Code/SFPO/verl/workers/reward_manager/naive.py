@@ -52,6 +52,31 @@ class NaiveRewardManager:
             )
         return self._executor
 
+    def _safe_compute_score(self, kw):
+        """One example's score should never be able to take down the whole training
+        job. math_verify guards its own symbolic-equivalence check with a
+        signal.alarm-based timeout (math_verify/utils.py) and raises
+        TimeoutException when a pathological expression trips it -- that's a sane
+        safety net at the parser level, but left uncaught here it propagates out of
+        ray::main_task and kills every in-flight step. Malformed ground truth /
+        unicode edge cases can raise other exceptions from the same call for the
+        same reason. Score the example 0.0 (wrong) instead of crashing the run.
+
+        Catches BaseException, not Exception: math_verify.errors.TimeoutException
+        subclasses BaseException directly (like KeyboardInterrupt/SystemExit), a
+        deliberate choice on its part so a bare `except Exception` elsewhere
+        wouldn't accidentally swallow it -- which is exactly what let it escape
+        the first version of this fix. KeyboardInterrupt/SystemExit are re-raised
+        so process control still works.
+        """
+        try:
+            return self.compute_score(**kw)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException as e:
+            print(f"[NaiveRewardManager] scoring raised {e!r} for one example; scoring as 0.0.")
+            return 0.0
+
     def _score_all(self, args_list):
         """args_list: list of dicts of compute_score kwargs. Returns list of scores.
         Runs in parallel; falls back to serial if the pool can't be used (e.g. an
@@ -59,11 +84,20 @@ class NaiveRewardManager:
         try:
             pool = self._pool()
             futures = [pool.submit(self.compute_score, **kw) for kw in args_list]
-            return [f.result() for f in futures]
+            results = []
+            for kw, future in zip(args_list, futures):
+                try:
+                    results.append(future.result())
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as e:
+                    print(f"[NaiveRewardManager] scoring raised {e!r} for one example; scoring as 0.0.")
+                    results.append(0.0)
+            return results
         except Exception as e:
             print(f"[NaiveRewardManager] parallel scoring failed ({e}); falling back to serial.")
             self._executor = None
-            return [self.compute_score(**kw) for kw in args_list]
+            return [self._safe_compute_score(kw) for kw in args_list]
 
     def _decode(self, data):
         """Decode prompts/responses and collect compute_score kwargs + placement info."""

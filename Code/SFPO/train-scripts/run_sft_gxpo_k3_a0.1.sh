@@ -19,7 +19,24 @@ MODEL=/workspace/models/Qwen2.5-1.5B-Instruct
 TRAIN=/workspace/jepa-grpo-cache/data/math_l35_sft/train.parquet
 VAL=/workspace/jepa-grpo-cache/data/math_l35_sft/test.parquet
 
-EXP="sft_gxpo_k${K}_a${ALPHA}_tau${GXPO_TAU}_mathl35_seed${TRAIN_SEED}"
+# GXPO optimizer state across the two probe steps. Parameters are repositioned to
+# theta_tilde in both modes; only the AdamW state the slow correction starts from differs:
+#   transactional            -- snapshot the AdamW state before probe 1 and roll back to it
+#                               after repositioning, so the slow correction is taken from
+#                               the moments the batch started with (probes stay probes).
+#   transactional_fast_state -- no refresh: the probe steps' moments and step counter are
+#                               kept and the slow correction is taken from them, so AdamW's
+#                               step counter advances 3x per batch instead of 1x.
+# The mode is tagged into the run name so the two arms never share a run dir or wandb run;
+# transactional is left untagged because it is the established baseline.
+GXPO_OPTIMIZER_STATE_MODE="${GXPO_OPTIMIZER_STATE_MODE:-transactional}"
+case "$GXPO_OPTIMIZER_STATE_MODE" in
+  transactional)            OPT_STATE_TAG="" ;;
+  transactional_fast_state) OPT_STATE_TAG="_optkeep" ;;
+  *) echo "PREFLIGHT FAIL: GXPO_OPTIMIZER_STATE_MODE must be transactional or transactional_fast_state, got '$GXPO_OPTIMIZER_STATE_MODE'" >&2; exit 2 ;;
+esac
+
+EXP="sft_gxpo_k${K}_a${ALPHA}_tau${GXPO_TAU}_mathl35_seed${TRAIN_SEED}${OPT_STATE_TAG}"
 RUN_DIR="./runs/${EXP}"
 mkdir -p "$RUN_DIR"
 
@@ -51,6 +68,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=1 \
     +optim.gxpo_delta=1e-8 \
     +optim.gxpo_tau=$GXPO_TAU \
     +optim.gxpo_warmup=$GXPO_WARMUP \
+    +optim.gxpo_optimizer_state_mode="$GXPO_OPTIMIZER_STATE_MODE" \
     +optim.gxpo_omega=0.1 \
     +optim.gxpo_shutoff_mode=trajectory_aware \
     use_remove_padding=true \

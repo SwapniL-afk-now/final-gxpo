@@ -92,20 +92,30 @@ def download_grpo_actor(repo_id: str, step: int, destination: Path) -> Path:
     return actor
 
 
-def evaluate_model(model_dir: Path, tokenizer_dir: str, data_files: list[str], seeds: list[int], max_tokens: int, gpu_memory_utilization: float) -> dict:
+def evaluate_model(model_dir: Path, tokenizer_dir: str, data_files: list[str], seeds: list[int], max_tokens: int, gpu_memory_utilization: float, max_model_len: int | None = None, max_num_seqs: int | None = None) -> dict:
     import torch
     from transformers import AutoTokenizer
     from verl.utils.reward_score import _default_compute_score
     from vllm import LLM, SamplingParams
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
-    llm = LLM(
+    llm_kwargs = dict(
         model=str(model_dir),
         tokenizer=tokenizer_dir,
         tensor_parallel_size=1,
         gpu_memory_utilization=gpu_memory_utilization,
         dtype="bfloat16",
     )
+    # A short, explicit max_model_len (prompt + max_tokens headroom, not the
+    # model's full native context) lets vLLM size its KV cache for many more
+    # concurrent sequences -- the single biggest throughput lever once
+    # generations are capped at a few thousand tokens instead of the full
+    # context window.
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+    if max_num_seqs is not None:
+        llm_kwargs["max_num_seqs"] = max_num_seqs
+    llm = LLM(**llm_kwargs)
     per_seed: dict[str, dict[str, float]] = {}
     for seed in seeds:
         sampling = SamplingParams(

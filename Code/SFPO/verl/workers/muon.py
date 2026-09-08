@@ -3,15 +3,163 @@
 Adapted from https://github.com/MoonshotAI/Moonlight (examples/toy_train.py), which is
 itself a modified version of https://github.com/KellerJordan/Muon/blob/master/muon.py
 
-Requires 2-D parameters. Under FSDP that means the actor must be built with
-`use_orig_params=True` and `ShardingStrategy.NO_SHARD` -- sharded param views are
-flattened to 1-D (torch `_flat_param.py:_use_sharded_views`), which would silently route
-every parameter into the AdamW fallback branch below. See `build_muon`'s assertion and
-`fsdp_workers._build_model_optimizer`.
+Requires 2-D parameters. Under distributed FSDP1, the actor is built with
+`use_orig_params=True`; sharded local views are flattened to 1-D, so the gather-scatter
+backend reconstructs each original matrix before Newton–Schulz and writes back its local
+slice. See `build_fsdp_muon_registry` and `fsdp_workers._build_model_optimizer`.
 """
 import math
+import hashlib
+import json
+import time
+from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
+
+
+MUON_BACKEND_VERSION = 'gather_scatter_v1'
+
+
+@dataclass(frozen=True)
+class FSDPMuonParamInfo:
+    """Stable mapping from one original parameter to its FSDP local shard."""
+
+    param: torch.nn.Parameter
+    name: str
+    flat_param: object
+    shape: tuple
+    contiguous: bool
+    process_group: object
+    group_world_size: int
+    global_numel: int
+    global_offset: int
+    local_start: int
+    local_numel: int
+
+
+def _product(shape):
+    return math.prod(int(x) for x in shape)
+
+
+def _is_embedding_or_head(name):
+    """Return whether a parameter name denotes an embedding or output head."""
+    lowered = name.lower()
+    return any(token in lowered for token in (
+        "embed_tokens", "embedding", "word_embeddings", "tok_embeddings",
+        ".wte", "lm_head", "output_head", "output_projection", "output_layer"))
+
+
+def build_fsdp_muon_registry(fsdp_model):
+    """Build the original-parameter -> local-shard map used by distributed Muon.
+
+    FSDP1 exposes original parameters as flattened local views when sharded. The
+    owning FlatParameter retains the original shapes and the local intersection of
+    each parameter with the rank's shard. We keep access to that version-sensitive
+    metadata in this one function and validate it eagerly so a broken mapping cannot
+    silently become an AdamW run.
+    """
+    if not dist.is_initialized():
+        raise RuntimeError('distributed Muon requires an initialized process group')
+
+    handle_entries = []
+    seen_handles = set()
+    if hasattr(fsdp_model, "named_modules"):
+        module_entries = fsdp_model.named_modules()
+    else:
+        module_entries = [("", fsdp_model)]
+    for module_name, module in module_entries:
+        prefix = module_name.replace("_fsdp_wrapped_module.", "").strip(".")
+        handle = getattr(module, "_handle", None)
+        module_handles = [handle] if handle is not None else list(
+            getattr(module, "_all_handles", ()))
+        for candidate in module_handles:
+            handle_id = id(candidate)
+            if handle_id not in seen_handles:
+                seen_handles.add(handle_id)
+                handle_entries.append((candidate, prefix))
+    if not handle_entries:
+        raise RuntimeError("distributed Muon could not find any FSDP handles")
+
+    registry = {}
+    for handle, handle_prefix in handle_entries:
+        flat = getattr(handle, 'flat_param', None)
+        required = ('_params', '_fqns', '_shapes', '_contiguities',
+                    '_numels_with_padding', '_is_padding_mask', '_shard_param_infos')
+        if flat is None or any(not hasattr(flat, key) for key in required):
+            raise RuntimeError(
+                'distributed Muon requires FSDP1 original-parameter metadata '
+                f'({required})')
+
+        params = flat._params
+        if params is None:
+            raise RuntimeError(
+                'distributed Muon requires use_orig_params=True; FSDP returned no original parameters')
+        fqns = flat._fqns
+        shapes = flat._shapes
+        contiguities = flat._contiguities
+        shard_infos = flat._shard_param_infos
+        numels_with_padding = flat._numels_with_padding
+        is_padding_mask = flat._is_padding_mask
+        if len(numels_with_padding) != len(is_padding_mask):
+            raise RuntimeError(f'FSDP Muon padding metadata length mismatch for {flat!r}')
+        numels = []
+        global_offsets = []
+        flat_offset = 0
+        for numel, is_padding in zip(numels_with_padding, is_padding_mask):
+            numel = int(numel)
+            if not is_padding:
+                numels.append(numel)
+                global_offsets.append(flat_offset)
+            flat_offset += numel
+        count = len(params)
+        if not (len(numels) == len(fqns) == len(shapes) == len(contiguities) == len(shard_infos) == count):
+            raise RuntimeError(f'FSDP Muon metadata length mismatch for {flat!r}')
+
+        process_group = getattr(handle, 'process_group', None)
+        if process_group is None:
+            raise RuntimeError('FSDP Muon handle has no process group')
+        group_world_size = dist.get_world_size(process_group)
+
+        for index, (param, raw_name, shape, contiguous, shard_info) in enumerate(
+                zip(params, fqns, shapes, contiguities, shard_infos)):
+            name = str(raw_name).replace("_fsdp_wrapped_module.", "").strip(".")
+            if handle_prefix and not name.startswith(handle_prefix + "."):
+                name = f"{handle_prefix}.{name}"
+            global_numel = _product(shape)
+            padded_numel = numels[index]
+            if padded_numel < global_numel:
+                raise RuntimeError(f'invalid FSDP Muon metadata for {name}: padded numel is too small')
+
+            if shard_info.in_shard:
+                local_start = int(shard_info.intra_param_start_idx)
+                local_numel = int(shard_info.numel_in_shard)
+            else:
+                local_start = 0
+                local_numel = 0
+
+            if local_numel and local_start + local_numel > global_numel:
+                raise RuntimeError(f'invalid local shard range for FSDP Muon parameter {name}')
+            if param in registry:
+                raise RuntimeError(f'duplicate/shared FSDP Muon parameter is unsupported: {name}')
+
+            registry[param] = FSDPMuonParamInfo(
+                param=param,
+                name=name,
+                flat_param=flat,
+                shape=tuple(int(x) for x in shape),
+                contiguous=bool(contiguous),
+                process_group=process_group,
+                group_world_size=group_world_size,
+                global_numel=global_numel,
+                global_offset=global_offsets[index],
+                local_start=local_start,
+                local_numel=local_numel,
+            )
+
+    if not registry:
+        raise RuntimeError('distributed Muon found no original FSDP parameters')
+    return registry
 
 
 # ponytail: eager NS5 (upstream decorates this with @torch.compile). ~10 distinct 2-D
@@ -47,29 +195,12 @@ def zeropower_via_newtonschulz5(G, steps):
 
 
 class Muon(torch.optim.Optimizer):
-    """
-    Muon - MomentUm Orthogonalized by Newton-schulz
+    """Muon with an FSDP1 gather-compute-scatter backend.
 
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - We believe this optimizer is unlikely to work well for training with small batch size.
-    - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-
-    Arguments:
-        muon_params: The parameters to be optimized by Muon.
-        lr: The learning rate. The updates will have spectral norm of `lr`. (0.02 is a good default)
-        momentum: The momentum used by the internal SGD. (0.95 is a good default)
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
-        adamw_params: The parameters to be optimized by AdamW. Any parameters in `muon_params` which are
-        {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well.
-        adamw_betas: The betas for the internal AdamW.
-        adamw_eps: The epsilon for the internal AdamW.
-        wd: Weight decay, applied decoupled to both branches.
+    In the distributed path the optimizer sees FSDP's flattened local original-
+    parameter views.  It all-gathers each matrix's gradient and local momentum,
+    applies the dense Muon update to the reconstructed global matrix, then writes
+    only the rank-local slice back.  Optimizer state remains sharded locally.
     """
 
     def __init__(
@@ -83,8 +214,10 @@ class Muon(torch.optim.Optimizer):
         adamw_params=None,
         adamw_betas=(0.9, 0.95),
         adamw_eps=1e-8,
+        fsdp_model=None,
+        fsdp_registry=None,
+        parameter_signature=None,
     ):
-
         defaults = dict(
             lr=lr,
             wd=wd,
@@ -94,155 +227,412 @@ class Muon(torch.optim.Optimizer):
             adamw_betas=adamw_betas,
             adamw_eps=adamw_eps,
         )
-
-        params = list(muon_params)
-        adamw_params = list(adamw_params) if adamw_params is not None else []
-        params.extend(adamw_params)
+        muon_params = list(muon_params or [])
+        adamw_params = list(adamw_params or [])
+        params = muon_params + adamw_params
+        if len({id(p) for p in params}) != len(params):
+            raise ValueError('Muon optimizer received duplicate parameters')
         super().__init__(params, defaults)
-        # Sort parameters into those for which we will use Muon, and those for which we will not
+
+        self.fsdp_model = fsdp_model
+        self.fsdp_registry = fsdp_registry or {}
+        self.distributed = bool(self.fsdp_registry and dist.is_initialized() and dist.get_world_size() > 1)
+        self.backend = 'gather_scatter' if self.distributed else 'dense'
+        self.backend_version = MUON_BACKEND_VERSION
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        self.fsdp_size = max((info.group_world_size for info in self.fsdp_registry.values()), default=1)
+        self.muon_parameter_count = len(muon_params)
+        self.adamw_parameter_count = len(adamw_params)
+        self.muon_parameter_numel = sum(
+            self.fsdp_registry[p].global_numel if p in self.fsdp_registry else p.numel()
+            for p in muon_params)
+        self.adamw_parameter_numel = sum(
+            self.fsdp_registry[p].global_numel if p in self.fsdp_registry else p.numel()
+            for p in adamw_params)
+        self.last_diagnostics = {}
+        self.parameter_signature = parameter_signature
+
         for p in muon_params:
-            # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
-            assert p.ndim == 2, p.ndim
-            self.state[p]["use_muon"] = True
+            if not self.distributed and p.ndim != 2:
+                raise ValueError(f'dense Muon parameter must be 2-D, got {tuple(p.shape)}')
+            self.state[p]['use_muon'] = True
         for p in adamw_params:
-            # Do not use Muon for parameters in adamw_params
-            self.state[p]["use_muon"] = False
+            self.state[p]['use_muon'] = False
+
+        if self.distributed:
+            for p, info in self.fsdp_registry.items():
+                if p.requires_grad and info.group_world_size > 1:
+                    local_numel = info.local_numel
+                    if p.data.numel() != local_numel:
+                        raise RuntimeError(
+                            f'FSDP Muon local view mismatch for {info.name}: '
+                            f'parameter has {p.data.numel()} elements, registry has {local_numel}')
+                    if not info.contiguous:
+                        raise RuntimeError(f'FSDP Muon requires contiguous parameter {info.name}')
 
     def adjust_lr_for_muon(self, lr, param_shape):
         A, B = param_shape[:2]
-        # We adjust the learning rate and weight decay based on the size of the parameter matrix
-        # as describted in the paper
         adjusted_ratio = 0.2 * math.sqrt(max(A, B))
-        adjusted_lr = lr * adjusted_ratio
-        return adjusted_lr
+        return lr * adjusted_ratio
+
+    @staticmethod
+    def _is_present(parameter):
+        return parameter.grad is not None
+
+    def _local_tensor(self, tensor, info, dtype=None):
+        device = info.param.device
+        if tensor is None:
+            return torch.zeros(info.local_numel, device=device, dtype=dtype or info.param.dtype)
+        local = tensor.detach().reshape(-1)
+        if local.numel() != info.local_numel:
+            raise RuntimeError(
+                f'FSDP Muon local tensor mismatch for {info.name}: '
+                f'got {local.numel()}, expected {info.local_numel}')
+        if dtype is not None and local.dtype != dtype:
+            local = local.to(dtype)
+        return local.contiguous()
+
+    def _all_gather_full(self, values, info):
+        """Gather variable-length local slices and place them by intra-param offset."""
+        if info.group_world_size == 1:
+            return [v.reshape(info.shape) for v in values]
+
+        device = values[0].device
+        group = info.process_group
+        local_meta = torch.tensor(
+            [info.local_start, info.local_numel], device=device, dtype=torch.int64)
+        metas = [torch.empty_like(local_meta) for _ in range(info.group_world_size)]
+        dist.all_gather(metas, local_meta, group=group)
+        starts = [int(meta[0].item()) for meta in metas]
+        lengths = [int(meta[1].item()) for meta in metas]
+        max_len = max(lengths, default=0)
+        n_values = len(values)
+        payload = torch.zeros(n_values * max_len, device=device, dtype=values[0].dtype)
+        for index, value in enumerate(values):
+            if value.numel():
+                payload[index * max_len:index * max_len + value.numel()].copy_(value)
+        gathered = [torch.empty_like(payload) for _ in range(info.group_world_size)]
+        dist.all_gather(gathered, payload, group=group)
+
+        full_values = [torch.zeros(info.global_numel, device=device, dtype=values[0].dtype)
+                       for _ in range(n_values)]
+        for rank, payload_rank in enumerate(gathered):
+            start = starts[rank]
+            length = lengths[rank]
+            if length:
+                for index in range(n_values):
+                    source = payload_rank[index * max_len:index * max_len + length]
+                    full_values[index][start:start + length].copy_(source)
+        return [full.reshape(info.shape) for full in full_values]
+
+    def _ensure_distributed_state(self, parameter, info, use_muon):
+        state = self.state[parameter]
+        if info.local_numel == 0:
+            return
+        device = parameter.device
+        dtype = parameter.dtype
+        if use_muon:
+            current = state.get('momentum_buffer')
+            if current is None:
+                state['momentum_buffer'] = torch.zeros(info.local_numel, device=device, dtype=dtype)
+            elif current.device != device or current.numel() != info.local_numel:
+                if current.device.type == 'cpu':
+                    raise RuntimeError('distributed Muon does not support CPU optimizer offload')
+                state['momentum_buffer'] = current.to(device=device, dtype=dtype).reshape(-1)
+        else:
+            if state.get('step') is None:
+                state['step'] = 0
+            for key in ('moment1', 'moment2'):
+                current = state.get(key)
+                if current is None:
+                    state[key] = torch.zeros(info.local_numel, device=device, dtype=dtype)
+                elif current.device != device or current.numel() != info.local_numel:
+                    if current.device.type == 'cpu':
+                        raise RuntimeError('distributed Muon does not support CPU optimizer offload')
+                    state[key] = current.to(device=device, dtype=dtype).reshape(-1)
+
+    def _step_dense(self):
+        update_sq = None
+        momentum_sq = None
+        for group in self.param_groups:
+            lr = group['lr']
+            wd = group['wd']
+            momentum = group['momentum']
+            for p in group['params']:
+                state = self.state[p]
+                if p.grad is None:
+                    continue
+                g = p.grad
+                if state['use_muon']:
+                    if 'momentum_buffer' not in state:
+                        state['momentum_buffer'] = torch.zeros_like(g)
+                    buf = state['momentum_buffer']
+                    buf.mul_(momentum).add_(g)
+                    direction = g.add(buf, alpha=momentum) if group['nesterov'] else buf
+                    update = zeropower_via_newtonschulz5(direction, steps=group['ns_steps'])
+                    p.data.mul_(1 - lr * wd)
+                    p.data.add_(update, alpha=-self.adjust_lr_for_muon(lr, p.shape))
+                    if update_sq is None:
+                        update_sq = update.float().square().sum()
+                        momentum_sq = buf.float().square().sum()
+                    else:
+                        update_sq += update.float().square().sum()
+                        momentum_sq += buf.float().square().sum()
+                else:
+                    if 'step' not in state:
+                        state['step'] = 0
+                        state['moment1'] = torch.zeros_like(g)
+                        state['moment2'] = torch.zeros_like(g)
+                    state['step'] += 1
+                    step = state['step']
+                    beta1, beta2 = group['adamw_betas']
+                    buf1, buf2 = state['moment1'], state['moment2']
+                    buf1.lerp_(g, 1 - beta1)
+                    buf2.lerp_(g.square(), 1 - beta2)
+                    normalized = buf1 / (group['adamw_eps'] + buf2.sqrt())
+                    correction = (1 - beta1**step) / (1 - beta2**step)**0.5
+                    p.data.mul_(1 - lr * group['wd'])
+                    p.data.add_(normalized, alpha=-lr / correction)
+
+        if update_sq is None:
+            device = self.param_groups[0]['params'][0].device
+            update_sq = torch.zeros((), device=device, dtype=torch.float32)
+            momentum_sq = torch.zeros((), device=device, dtype=torch.float32)
+        self.last_diagnostics = {
+            'optimizer/muon_update_norm': float(update_sq.sqrt().item()),
+            'optimizer/muon_momentum_norm': float(momentum_sq.sqrt().item()),
+            'optimizer/muon_gather_time': 0.0,
+            'optimizer/muon_newton_schulz_time': 0.0,
+            'optimizer/muon_scatter_time': 0.0,
+            'optimizer/muon_collective_bytes': 0.0,
+        }
+
+    def _step_distributed(self):
+        gather_s = 0.0
+        ns_s = 0.0
+        scatter_s = 0.0
+        collective_bytes = 0
+        update_sq = None
+        momentum_sq = None
+
+        for group in self.param_groups:
+            lr = group['lr']
+            wd = group['wd']
+            momentum = group['momentum']
+            for parameter in group['params']:
+                info = self.fsdp_registry.get(parameter)
+                if info is None:
+                    raise RuntimeError('distributed Muon parameter is missing from the FSDP registry')
+                state = self.state[parameter]
+                use_muon = bool(state['use_muon'])
+                if use_muon:
+                    self._ensure_distributed_state(parameter, info, use_muon=True)
+                    present = torch.tensor(
+                        [1 if self._is_present(parameter) else 0],
+                        device=parameter.device, dtype=torch.int32)
+                    dist.all_reduce(present, op=dist.ReduceOp.MAX, group=info.process_group)
+                    if present.item() == 0:
+                        continue
+
+                    local_grad = self._local_tensor(parameter.grad, info, dtype=parameter.dtype)
+                    local_momentum = self._local_tensor(
+                        state.get('momentum_buffer'), info, dtype=parameter.dtype)
+                    gather_start = time.perf_counter()
+                    full_grad, full_momentum = self._all_gather_full(
+                        [local_grad, local_momentum], info)
+                    gather_s += time.perf_counter() - gather_start
+                    collective_bytes += info.group_world_size * (
+                        2 * max(info.local_numel, 1) * parameter.element_size()
+                        + 16)  # two int64 metadata values per gathered slice
+                    collective_bytes += info.group_world_size * 4  # presence all-reduce
+
+                    ns_start = time.perf_counter()
+                    full_momentum.mul_(momentum).add_(full_grad)
+                    direction = (full_grad.add(full_momentum, alpha=momentum)
+                                 if group['nesterov'] else full_momentum)
+                    update = zeropower_via_newtonschulz5(direction, steps=group['ns_steps'])
+                    ns_s += time.perf_counter() - ns_start
+
+                    local_data = parameter.data.reshape(-1)
+                    if local_data.numel() != info.local_numel:
+                        raise RuntimeError(f'FSDP Muon parameter storage changed for {info.name}')
+                    local_update = update.reshape(-1)[info.local_start:info.local_start + info.local_numel]
+                    local_momentum_new = full_momentum.reshape(-1)[
+                        info.local_start:info.local_start + info.local_numel]
+                    scatter_start = time.perf_counter()
+                    local_data.mul_(1 - lr * wd)
+                    local_data.add_(local_update, alpha=-self.adjust_lr_for_muon(lr, info.shape))
+                    state['momentum_buffer'] = local_momentum_new.detach().clone()
+                    scatter_s += time.perf_counter() - scatter_start
+
+                    if update_sq is None:
+                        update_sq = update.float().square().sum()
+                        momentum_sq = full_momentum.float().square().sum()
+                    else:
+                        update_sq += update.float().square().sum()
+                        momentum_sq += full_momentum.float().square().sum()
+                    del full_grad, full_momentum, direction, update, local_update, local_momentum_new
+                else:
+                    if parameter.grad is None:
+                        continue
+                    self._ensure_distributed_state(parameter, info, use_muon=False)
+                    grad = self._local_tensor(parameter.grad, info, dtype=parameter.dtype)
+                    state['step'] += 1
+                    step = state['step']
+                    beta1, beta2 = group['adamw_betas']
+                    buf1, buf2 = state['moment1'], state['moment2']
+                    buf1.lerp_(grad, 1 - beta1)
+                    buf2.lerp_(grad.square(), 1 - beta2)
+                    normalized = buf1 / (group['adamw_eps'] + buf2.sqrt())
+                    correction = (1 - beta1**step) / (1 - beta2**step)**0.5
+                    parameter.data.reshape(-1).mul_(1 - lr * wd)
+                    parameter.data.reshape(-1).add_(normalized, alpha=-lr / correction)
+
+        if update_sq is None:
+            device = next(iter(self.state)).device
+            update_sq = torch.zeros((), device=device, dtype=torch.float32)
+            momentum_sq = torch.zeros((), device=device, dtype=torch.float32)
+        self.last_diagnostics = {
+            'optimizer/muon_update_norm': float(update_sq.sqrt().item()),
+            'optimizer/muon_momentum_norm': float(momentum_sq.sqrt().item()),
+            'optimizer/muon_gather_time': gather_s,
+            'optimizer/muon_newton_schulz_time': ns_s,
+            'optimizer/muon_scatter_time': scatter_s,
+            'optimizer/muon_collective_bytes': float(collective_bytes),
+        }
 
     def step(self, closure=None):
-        """Perform a single optimization step.
-
-        Args:
-            closure (Callable, optional): A closure that reevaluates the model
-                and returns the loss.
-        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-
-        for group in self.param_groups:
-
-            ############################
-            #           Muon           #
-            ############################
-
-            params = [p for p in group["params"] if self.state[p]["use_muon"]]
-            lr = group["lr"]
-            wd = group["wd"]
-            momentum = group["momentum"]
-
-            # generate weight updates
-            for p in params:
-                # sanity check
-                g = p.grad
-                if g is None:
-                    continue
-                if g.ndim > 2:
-                    g = g.view(g.size(0), -1)
-                assert g is not None
-
-                # calc update
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                if group["nesterov"]:
-                    g = g.add(buf, alpha=momentum)
-                else:
-                    g = buf
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
-
-                # scale update
-                adjusted_lr = self.adjust_lr_for_muon(lr, p.shape)
-
-                # apply weight decay
-                p.data.mul_(1 - lr * wd)
-
-                # apply update
-                p.data.add_(u, alpha=-adjusted_lr)
-
-            ############################
-            #       AdamW backup       #
-            ############################
-
-            params = [p for p in group["params"] if not self.state[p]["use_muon"]]
-            lr = group['lr']
-            beta1, beta2 = group["adamw_betas"]
-            eps = group["adamw_eps"]
-            weight_decay = group["wd"]
-
-            for p in params:
-                g = p.grad
-                if g is None:
-                    continue
-                state = self.state[p]
-                if "step" not in state:
-                    state["step"] = 0
-                    state["moment1"] = torch.zeros_like(g)
-                    state["moment2"] = torch.zeros_like(g)
-                state["step"] += 1
-                step = state["step"]
-                buf1 = state["moment1"]
-                buf2 = state["moment2"]
-                buf1.lerp_(g, 1 - beta1)
-                buf2.lerp_(g.square(), 1 - beta2)
-
-                g = buf1 / (eps + buf2.sqrt())
-
-                bias_correction1 = 1 - beta1**step
-                bias_correction2 = 1 - beta2**step
-                scale = bias_correction1 / bias_correction2**0.5
-                p.data.mul_(1 - lr * weight_decay)
-                p.data.add_(g, alpha=-lr / scale)
-
+        if self.distributed:
+            self._step_distributed()
+        else:
+            self._step_dense()
         return loss
 
+    def diagnostics(self):
+        return {
+            'optimizer/muon_parameter_count': float(self.muon_parameter_count),
+            'optimizer/adamw_parameter_count': float(self.adamw_parameter_count),
+            'optimizer/muon_backend_active': float(self.distributed),
+            'optimizer/muon_fsdp_size': float(self.fsdp_size),
+            'optimizer/muon_world_size': float(self.world_size),
+            **self.last_diagnostics,
+        }
 
-def build_muon(module, optim_config):
-    """Split `module`'s trainable params into Muon (2-D weights) and AdamW (everything else).
 
-    Mirrors Moonlight's `get_optimizer`: >=2-D and not embed_tokens/lm_head goes to Muon.
-    The substring test survives FSDP's `_fsdp_wrapped_module.` name prefix.
+def build_muon(module, optim_config, fsdp_model=None):
+    """Build Muon and classify parameters using global FSDP metadata when needed."""
+    distributed = fsdp_model is not None and dist.is_initialized() and dist.get_world_size() > 1
+    backend = str(optim_config.get('muon_distributed_backend', 'gather_scatter')).lower()
+    if backend != 'gather_scatter':
+        raise ValueError(
+            'unsupported Muon distributed backend; expected gather_scatter, '
+            f'got {backend!r}')
+    registry = build_fsdp_muon_registry(fsdp_model) if distributed else {}
+    registry_by_name = {
+        info.name.replace("_fsdp_wrapped_module.", ""): info
+        for info in registry.values()
+    }
 
-    adamw_betas defaults to (0.9, 0.999) rather than Moonlight's (0.9, 0.95) so the 1-D
-    params move like the AdamW baseline and the only variable is Muon on the 2-D weights.
-    """
+    def storage_key(parameter):
+        if not distributed:
+            return None
+        try:
+            storage = parameter.untyped_storage()
+            return (storage.data_ptr(), parameter.numel(), tuple(parameter.shape))
+        except (AttributeError, RuntimeError):
+            return None
 
-    def is_muon(name, p):
-        return p.ndim >= 2 and 'embed_tokens' not in name and 'lm_head' not in name
+    registry_by_storage = {}
+    ambiguous_storage = set()
+    for info in registry.values():
+        key = storage_key(info.param)
+        if key is not None:
+            if key in registry_by_storage:
+                ambiguous_storage.add(key)
+                registry_by_storage.pop(key, None)
+            elif key not in ambiguous_storage:
+                registry_by_storage[key] = info
 
-    named = [(n, p) for n, p in module.named_parameters() if p.requires_grad]
-    muon_params = [p for n, p in named if is_muon(n, p)]
-    adamw_params = [p for n, p in named if not is_muon(n, p)]
+    named = [(name, parameter) for name, parameter in module.named_parameters()
+             if parameter.requires_grad]
 
-    # Under FSDP with use_orig_params=False (or any sharded strategy) every param arrives
-    # flattened to 1-D, which would put the whole model in the AdamW branch and silently
-    # turn a "muon" run into an AdamW run. Fail loudly instead.
-    assert muon_params, (
-        'build_muon: no 2-D parameters found. The module is almost certainly FSDP-wrapped '
-        'with flattened params -- Muon needs use_orig_params=True and ShardingStrategy.NO_SHARD.')
+    def resolve_info(name, parameter):
+        info = registry.get(parameter)
+        if info is None and distributed:
+            normalized = name.replace("_fsdp_wrapped_module.", "")
+            info = registry_by_name.get(normalized)
+        if info is None and distributed:
+            storage = storage_key(parameter)
+            info = None if storage in ambiguous_storage else registry_by_storage.get(storage)
+        return info
 
-    print(f'[muon] muon params: {len(muon_params)} / adamw params: {len(adamw_params)}')
+    resolved_registry = {}
+    muon_params = []
+    adamw_params = []
+    for name, parameter in named:
+        info = resolve_info(name, parameter)
+        if distributed and info is None:
+            normalized = name.replace("_fsdp_wrapped_module.", "")
+            registry_sample = list(registry_by_name)[:5]
+            raise RuntimeError(
+                f"FSDP Muon parameter {name} (normalized={normalized}) is missing "
+                f"from the validated registry; sample={registry_sample}; "
+                "refusing an incomplete distributed update")
+        if distributed:
+            resolved_registry[parameter] = info
+        shape = info.shape if info is not None else tuple(parameter.shape)
+        contiguous = info.contiguous if info is not None else parameter.is_contiguous()
+        is_muon = (
+            len(shape) == 2 and contiguous and
+            not _is_embedding_or_head(name))
+        if is_muon:
+            muon_params.append(parameter)
+        else:
+            adamw_params.append(parameter)
 
-    return Muon(
+    if not muon_params:
+        raise RuntimeError(
+            'build_muon: no valid 2-D Muon parameters found; refusing an all-AdamW run')
+
+    muon_param_ids = {id(parameter) for parameter in muon_params}
+    classification = []
+    for name, parameter in named:
+        info = resolve_info(name, parameter)
+        canonical_name = info.name if info is not None else name
+        canonical_shape = info.shape if info is not None else tuple(parameter.shape)
+        classification.append((canonical_name, tuple(int(x) for x in canonical_shape),
+                               'muon' if id(parameter) in muon_param_ids else 'adamw'))
+    parameter_signature = hashlib.sha256(
+        json.dumps(sorted(classification), separators=(',', ':')).encode('utf-8')).hexdigest()
+
+    optimizer = Muon(
         lr=optim_config.lr,
         wd=optim_config.get('weight_decay', 1e-2),
         muon_params=muon_params,
         momentum=optim_config.get('muon_momentum', 0.95),
+        nesterov=optim_config.get('muon_nesterov', True),
         ns_steps=optim_config.get('muon_ns_steps', 5),
         adamw_params=adamw_params,
         adamw_betas=tuple(optim_config.get('betas', (0.9, 0.999))),
+        fsdp_model=fsdp_model,
+        fsdp_registry=resolved_registry,
+        parameter_signature=parameter_signature,
     )
-
+    print(
+        f'[muon] backend={optimizer.backend} '
+        f'muon_params={optimizer.muon_parameter_count} '
+        f'adamw_params={optimizer.adamw_parameter_count}')
+    if distributed:
+        print(
+            f'[muon] fsdp_size={optimizer.fsdp_size} '
+            f'world_size={optimizer.world_size} '
+            f'sharded_parameter_registry=valid '
+            f'backend_version={MUON_BACKEND_VERSION}')
+    return optimizer
 
 def demo():
     """Self-check: NS5 orthogonalizes, and build_muon splits params the way we depend on."""
@@ -296,7 +686,7 @@ def demo():
     flat.flat_param = nn.Parameter(torch.randn(100))
     try:
         build_muon(flat, cfg)
-    except AssertionError:
+    except (AssertionError, RuntimeError):
         pass
     else:
         raise AssertionError('build_muon accepted an all-1-D module')

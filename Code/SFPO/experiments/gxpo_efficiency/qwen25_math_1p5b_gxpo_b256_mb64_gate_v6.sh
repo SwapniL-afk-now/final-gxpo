@@ -50,6 +50,7 @@ export REPOSITION_ALPHA=0.3
 # 'entropy' or common.sh warns and the trainer entropy gate keeps control.
 export GXPO_TRIGGER_SIGNAL="${GXPO_TRIGGER_SIGNAL:-grad}"
 export GXPO_SHUTOFF_MODE="${GXPO_SHUTOFF_MODE:-cosine}"
+export GXPO_OPTIMIZER_STATE_MODE="${GXPO_OPTIMIZER_STATE_MODE:-transactional}"
 # PRIMARY criterion (calibrated on 7 production runs, see .audit/gxpo_algorithm_findings.md):
 # trip when the rolling median of the last 10 disagreement observations stays >= 0.15
 # for 2 consecutive batches. Replay: healthy runs never trip; failing k10 trips @55;
@@ -111,6 +112,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   --- gate v2 ---
   trigger_signal     : $GXPO_TRIGGER_SIGNAL      (must not be 'entropy')
   shutoff_mode       : $GXPO_SHUTOFF_MODE        (disagreement = 1 - |cos(g0,g_slow)|)
+  optimizer_state    : ${GXPO_OPTIMIZER_STATE_MODE:-transactional}
   abs threshold      : $GXPO_TRIGGER_ABS_THRESHOLD (rolling median of last ${GXPO_TRIGGER_SUSTAIN_W:-10})
   tau / patience     : $GXPO_TAU / $GXPO_TRIGGER_PATIENCE (z-path backup when abs=0)
   robust statistic   : $GXPO_TRIGGER_ROBUST      (median/MAD, sigma floor 10%)

@@ -115,7 +115,7 @@ class vLLMRollout(BaseRollout):
             max_num_batched_tokens=max_num_batched_tokens,
             max_num_seqs=max_num_seqs,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
+            enable_prefix_caching=config.get('enable_prefix_caching', False),
             seed=0,
             **({'attention_backend': attention_backend} if attention_backend is not None else {}),
         )

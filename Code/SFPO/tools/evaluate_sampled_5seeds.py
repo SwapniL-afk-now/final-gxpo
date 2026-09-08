@@ -39,6 +39,8 @@ def evaluate_model(
     top_p: float,
     max_tokens: int,
     gpu_memory_utilization: float,
+    max_model_len: int | None = None,
+    max_num_seqs: int | None = None,
 ) -> dict:
     import pandas as pd
     import torch
@@ -47,13 +49,21 @@ def evaluate_model(
     from vllm import LLM, SamplingParams
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
-    llm = LLM(
+    llm_kwargs = dict(
         model=str(model_dir),
         tokenizer=tokenizer_dir,
         tensor_parallel_size=1,
         gpu_memory_utilization=gpu_memory_utilization,
         dtype="bfloat16",
     )
+    # See evaluate_greedy_5seeds.evaluate_model: a short explicit max_model_len
+    # (not the model's full native context) is the main throughput lever once
+    # generations are capped at a few thousand tokens.
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+    if max_num_seqs is not None:
+        llm_kwargs["max_num_seqs"] = max_num_seqs
+    llm = LLM(**llm_kwargs)
 
     per_seed: dict[str, dict[str, dict[str, float]]] = {}
     for seed in seeds:

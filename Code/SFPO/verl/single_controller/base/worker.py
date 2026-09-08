@@ -139,8 +139,21 @@ class Worker(WorkerHelper):
         master_addr = os.environ["MASTER_ADDR"]
         master_port = os.environ["MASTER_PORT"]
 
-        local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", "1"))
-        local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        if os.getenv("WG_BACKEND") == "ray":
+            local_world_size = int(os.getenv(
+                "RAY_LOCAL_WORLD_SIZE", os.getenv("LOCAL_WORLD_SIZE", "1")))
+            ray_local_rank = int(os.getenv(
+                "RAY_LOCAL_RANK", os.getenv("LOCAL_RANK", "0")))
+            # Ray may expose either the whole node (fractional GPU bundles)
+            # or one physical GPU per actor.  LOCAL_RANK is an index into the
+            # process's visible devices, not a physical GPU number.  Use the
+            # Ray rank only when all local devices are visible; with an
+            # isolated one-device CVD every worker must use local index 0.
+            visible_count = torch.cuda.device_count()
+            local_rank = ray_local_rank if visible_count > 1 else 0
+        else:
+            local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", "1"))
+            local_rank = int(os.getenv("LOCAL_RANK", "0"))
 
         ###
         # [SUPPORT AMD: torch]

@@ -47,9 +47,11 @@ class SFTDataset(Dataset):
                  truncation='error'):
         assert truncation in ['error', 'left', 'right']
         self.truncation = truncation
-
-        if not isinstance(parquet_files, List):
+        if isinstance(parquet_files, str):
             parquet_files = [parquet_files]
+        else:
+            # Accept list/tuple/hydra ListConfig alike.
+            parquet_files = list(parquet_files)
 
         self.parquet_files = parquet_files
         if isinstance(tokenizer, str):
@@ -80,8 +82,28 @@ class SFTDataset(Dataset):
 
         dataframes = []
         for parquet_file in self.parquet_files:
-            # read parquet files and cache
-            dataframe = pd.read_parquet(parquet_file)
+            # The DAPO OSS medium traces are supplied as JSONL. Read them
+            # directly so launchers can use the existing source file without
+            # creating a converted parquet copy. Keep only correct, non-empty
+            # teacher traces, matching the original SFT-data preparation rule.
+            if str(parquet_file).endswith(('.jsonl', '.json')):
+                import json
+                rows = []
+                with open(parquet_file) as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        if (row.get('reward') or 0) < 1.0:
+                            continue
+                        prompt = row.get('reasoning_prompt')
+                        response = row.get('gpt-oss-120b-response') or ''
+                        if prompt and response.strip():
+                            rows.append({'prompt': prompt, 'response': response})
+                dataframe = pd.DataFrame(rows)
+            else:
+                # read parquet files and cache
+                dataframe = pd.read_parquet(parquet_file)
             dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
         self.prompts = self.dataframe[self.prompt_key]
@@ -122,7 +144,12 @@ class SFTDataset(Dataset):
 
         # string
         prompt_chat_str = tokenizer.apply_chat_template(prompt_chat, add_generation_prompt=True, tokenize=False)
-        response_chat_str = response + tokenizer.eos_token
+        # Append exactly one EOS token: length-capped generations may already end
+        # with one, and duplicating it would train a spurious double-EOS.
+        if tokenizer.eos_token and response.endswith(tokenizer.eos_token):
+            response_chat_str = response
+        else:
+            response_chat_str = response + tokenizer.eos_token
 
         # tokenize
         prompt_ids_output = tokenizer(prompt_chat_str, return_tensors='pt', add_special_tokens=False)
@@ -170,9 +197,10 @@ class SFTDataset(Dataset):
         # mask out the last token in response
         loss_mask[min(prompt_length + response_length, loss_mask.size(0)) - 1] = 0
 
-        return {
+        out = {
             'input_ids': input_ids,
             'attention_mask': attention_mask,
             'position_ids': position_ids,
             'loss_mask': loss_mask
         }
+        return out

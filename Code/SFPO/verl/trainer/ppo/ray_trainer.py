@@ -47,6 +47,7 @@ from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_througho
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+from verl.utils.dataset.offpolicy_kd_dataset import OffPolicyKDDataset
 from verl.utils.tracking import ValidationGenerationsLogger
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -91,6 +92,10 @@ class ResourcePoolManager:
     """
     resource_pool_spec: dict[str, list[int]]
     mapping: dict[Role, str]
+    # Number of fractional Ray workers allowed per physical GPU bundle. The
+    # normal FSDP path keeps this at 1. KD adds CPU-parked HF teacher actors to
+    # the same bundles, so its entrypoint opts into a larger value.
+    max_colocate_count: int = 1
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
 
     def create_resource_pool(self):
@@ -100,7 +105,7 @@ class ResourcePoolManager:
             # For Megatron backend, we recommend using max_colocate_count>1 that can utilize different WorkerGroup for differnt models
             resource_pool = RayResourcePool(process_on_nodes=process_on_nodes,
                                             use_gpu=True,
-                                            max_colocate_count=1,
+                                            max_colocate_count=self.max_colocate_count,
                                             name_prefix=resource_pool_name)
             self.resource_pool_dict[resource_pool_name] = resource_pool
 
@@ -234,10 +239,12 @@ def compute_reward_metrics_grouped(reward_tensor: torch.Tensor, config) -> Dict:
     reward_metrics["reward/mean"] = torch.mean(reward_tensor).detach().item()
     all_correct = torch.sum(reward_tensor == 1).float() / reward_tensor.numel()
     reward_metrics["reward/all_correct_ratio"] = all_correct.detach().item()
-    format_error = torch.sum(reward_tensor == 0).float() / reward_tensor.numel()
-    reward_metrics["reward/format_error_ratio"] = format_error.detach().item()
-    format_error = torch.sum(reward_tensor == 0.1).float() / reward_tensor.numel()
-    reward_metrics["reward/wrong_answer_ratio"] = format_error.detach().item()
+    # Math rewards are binary: malformed and incorrect answers both receive 0.
+    # Keep the legacy format key at zero and expose the actual zero-reward rate.
+    zero_reward = torch.sum(reward_tensor == 0).float() / reward_tensor.numel()
+    reward_metrics["reward/format_error_ratio"] = 0.0
+    reward_metrics["reward/wrong_answer_ratio"] = zero_reward.detach().item()
+    reward_metrics["reward/zero_reward_ratio"] = zero_reward.detach().item()
 
     prompt_num = reward_tensor.view(-1, group_size).size(0)
 
@@ -253,13 +260,16 @@ def compute_reward_metrics_grouped(reward_tensor: torch.Tensor, config) -> Dict:
         print('non_diverse_examples:', non_diverse_examples)
     reward_metrics["examples/non_diverse_examples_ratio"] = (non_diverse_examples / prompt_num).detach().item()
 
-    format_example = torch.logical_and(reward_tensor.view(-1, group_size).max(-1)[0] == 0.1,
-                                       reward_tensor.view(-1, group_size).min(-1)[0] == 0.1).sum() / prompt_num
+    # There is no separate 0.1 format reward under binary scoring.
+    all_zero_reward_example = torch.logical_and(reward_tensor.view(-1, group_size).max(-1)[0] == 0,
+                                                reward_tensor.view(-1, group_size).min(-1)[0] == 0).sum() / prompt_num
+    format_example = torch.zeros((), device=reward_tensor.device)
 
     all_correct_example = torch.logical_and(reward_tensor.view(-1, group_size).max(-1)[0] == 1,
                                             reward_tensor.view(-1, group_size).min(-1)[0] == 1).sum() / prompt_num
 
     reward_metrics["examples/format_example_ratio"] = format_example.detach().item()
+    reward_metrics["examples/all_zero_reward_example_ratio"] = all_zero_reward_example.detach().item()
     reward_metrics["examples/all_correct_example_ratio"] = all_correct_example.detach().item()
 
     easy_examples_ratio = (reward_tensor.view(-1, group_size).mean(-1) > 0.75).sum() / prompt_num
@@ -418,6 +428,29 @@ class RayPPOTrainer(object):
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
         self.validation_generations_logger = ValidationGenerationsLogger()
+
+        # Per-step on-policy KD (Option B): a separate frozen-teacher Ray
+        # group, phased sleep/wake with the student rollout engine so the
+        # student vLLM engine and teacher are not GPU-resident together. The
+        # actor FSDP shards/Adam state remain resident, so logical Ray GPU
+        # fractions do not partition VRAM; the launcher must leave headroom.
+        # See teacher_kd.py.
+        self.use_kd = bool(config.actor_rollout_ref.actor.get('use_kd', False))
+        # Off-policy KD: fixed responses + cached teacher targets ride in the
+        # dataloader rows, so no teacher group is built and no vLLM generation
+        # runs. The rollout engine still initializes (idle, tiny KV reservation
+        # via VLLM_GPU_MEMORY_UTILIZATION) but generate_sequences is never called.
+        self.kd_teacher_cached = bool(config.actor_rollout_ref.actor.get('kd_teacher_cache', False))
+        if self.use_kd and self.kd_teacher_cached:
+            print('[KD] teacher targets come from the data cache; per-step scoring disabled')
+        if self.use_kd:
+            rollout_name = str(config.actor_rollout_ref.rollout.get('name', 'vllm')).lower()
+            if rollout_name != 'vllm':
+                raise ValueError(
+                    "Per-step on-policy KD currently requires actor_rollout_ref.rollout.name=vllm "
+                    f"(got {rollout_name!r})"
+                )
+        self.teacher_handles = None
         self.data_profiler = DataProfiler()
         self.start_epoch = 0
         self.current_epoch = 0
@@ -566,17 +599,28 @@ class RayPPOTrainer(object):
 
     def _create_dataloader(self):
         # TODO: we have to make sure the batch size is divisible by the dp size
-        self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
-                                         tokenizer=self.tokenizer,
-                                         processor=self.processor,
-                                         prompt_key=self.config.data.prompt_key,
-                                         image_key=self.config.data.get('image_key', 'images'),
-                                         max_prompt_length=self.config.data.max_prompt_length,
-                                         filter_prompts=True,
-                                         system_prompt=self.config.data.get('system_prompt', None),
-                                         return_raw_chat=self.config.data.get('return_raw_chat', False),
-                                         truncation='error',
-                                         filter_overlong_prompts=self.config.data.filter_overlong_prompts)
+        if self.config.data.get('off_policy_kd', False):
+            # Fixed prompt+response pairs with cached teacher targets; the
+            # rows already carry the full generate_sequences layout, so fit()
+            # never calls the rollout engine.
+            self.train_dataset = OffPolicyKDDataset(
+                parquet_files=self.config.data.train_files,
+                tokenizer=self.tokenizer,
+                max_prompt_length=self.config.data.max_prompt_length,
+                response_length=self.config.data.max_response_length,
+                teacher_topk=int(self.config.actor_rollout_ref.actor.get('kd_topk', 16)))
+        else:
+            self.train_dataset = RLHFDataset(parquet_files=self.config.data.train_files,
+                                             tokenizer=self.tokenizer,
+                                             processor=self.processor,
+                                             prompt_key=self.config.data.prompt_key,
+                                             image_key=self.config.data.get('image_key', 'images'),
+                                             max_prompt_length=self.config.data.max_prompt_length,
+                                             filter_prompts=True,
+                                             system_prompt=self.config.data.get('system_prompt', None),
+                                             return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                             truncation='error',
+                                             filter_overlong_prompts=self.config.data.filter_overlong_prompts)
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
             train_dataloader_generator = torch.Generator()
@@ -924,6 +968,17 @@ class RayPPOTrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
+        # Per-step on-policy KD: spawn the frozen teacher scoring group onto
+        # the same GPU placement group as actor_rollout, asleep by default.
+        # Skipped for cached off-policy KD (targets already in the batch).
+        if self.use_kd and not self.kd_teacher_cached:
+            from verl.trainer.ppo.teacher_kd import build_teacher_group
+            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            kd_teacher_cfg = self.config.actor_rollout_ref.actor.get('kd_teacher', {}) or {}
+            num_teacher_replicas = int(kd_teacher_cfg.get('num_replicas', 2))
+            self.teacher_handles = build_teacher_group(
+                self.config, teacher_resource_pool, num_replicas=num_teacher_replicas)
+
     def _best_ckpt_score(self, val_metrics):
         """Checkpoint-selection score: macro-mean val pass@1 across val sources (seed-mean).
 
@@ -933,104 +988,106 @@ class RayPPOTrainer(object):
                 if k.startswith('val/pass_at_1/') and '/seed' not in k and not k.endswith('/std')]
         return float(np.mean(vals)) if vals else float('-inf')
 
-    def _save_checkpoint(self):
-        # path: given_path + `/global_step_{global_steps}` + `/actor`
-        local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
-                                                f'global_step_{self.global_steps}')
-        actor_local_path = os.path.join(local_global_step_folder, 'actor')
+    def _save_checkpoint(self, checkpoint_name=None, save_optimizer=True, update_latest=True):
+        """Save one latest resumable checkpoint and/or the fixed best model.
+
+        The retention contract is deliberately strict: ``global_step_N`` is
+        the sole resumable checkpoint and ``best_checkpoint`` is the sole
+        weights-only best checkpoint.  The latter never updates the resume
+        tracker and contains no optimizer shards.
+        """
+        checkpoint_name = checkpoint_name or f'global_step_{self.global_steps}'
+        local_checkpoint_folder = os.path.join(
+            self.config.trainer.default_local_dir, checkpoint_name)
+        actor_local_path = os.path.join(local_checkpoint_folder, 'actor')
 
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
-            self.config.trainer.default_hdfs_dir, f'global_step_{self.global_steps}', 'actor')
-        self.actor_rollout_wg.save_checkpoint(actor_local_path,
-                                              actor_remote_path,
-                                              self.global_steps,
-                                              remove_previous_ckpt=self.config.trainer.remove_previous_ckpt_in_save)
+            self.config.trainer.default_hdfs_dir, checkpoint_name, 'actor')
+        self.actor_rollout_wg.save_checkpoint(
+            actor_local_path,
+            actor_remote_path,
+            self.global_steps,
+            remove_previous_ckpt=False,
+            save_optimizer=save_optimizer)
 
         if self.use_critic:
-            critic_local_path = os.path.join(local_global_step_folder, 'critic')
+            critic_local_path = os.path.join(local_checkpoint_folder, 'critic')
             critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
-                self.config.trainer.default_hdfs_dir, f'global_step_{self.global_steps}', 'critic')
-            self.critic_wg.save_checkpoint(critic_local_path,
-                                           critic_remote_path,
-                                           self.global_steps,
-                                           remove_previous_ckpt=self.config.trainer.remove_previous_ckpt_in_save)
+                self.config.trainer.default_hdfs_dir, checkpoint_name, 'critic')
+            self.critic_wg.save_checkpoint(
+                critic_local_path,
+                critic_remote_path,
+                self.global_steps,
+                remove_previous_ckpt=False,
+                save_optimizer=save_optimizer)
 
-        # save dataloader
-        dataloader_local_path = os.path.join(local_global_step_folder, 'data.pt')
-        dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
+        # The fixed best model is inference-only.  Do not write dataloader or
+        # resume metadata into it; only the latest global_step_N is resumable.
+        best_step = getattr(self, '_best_val_step', None)
+        if best_step is not None:
+            with open(os.path.join(self.config.trainer.default_local_dir,
+                                   'best_ckpt.json'), 'w') as f:
+                json.dump({
+                    'best_step': best_step,
+                    'best_score': getattr(self, '_best_val_score', None),
+                    'metric': 'macro-mean val/pass_at_1',
+                    'path': 'best_checkpoint',
+                }, f)
 
-        # save data profiler self.data_profiler
-        dataprofiler_local_path = os.path.join(local_global_step_folder, 'data_profiler.pt')
+        if not update_latest:
+            return
+
+        # Resume state belongs only to the latest global_step_N directory.
+        dataloader_local_path = os.path.join(local_checkpoint_folder, 'data.pt')
+        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+
+        dataprofiler_local_path = os.path.join(local_checkpoint_folder, 'data_profiler.pt')
         if self.data_profiler is not None:
             self.data_profiler.save(dataprofiler_local_path)
 
-        # latest checkpointed iteration tracker (for atomic usage)
-        local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
-                                                           'latest_checkpointed_iteration.txt')
+        local_latest_checkpointed_iteration = os.path.join(
+            self.config.trainer.default_local_dir, 'latest_checkpointed_iteration.txt')
         with open(local_latest_checkpointed_iteration, 'w') as f:
             f.write(str(self.global_steps))
 
-        # save the current epoch to the checkpoint
-        local_current_epoch = os.path.join(self.config.trainer.default_local_dir, 'current_epoch.txt')
+        local_current_epoch = os.path.join(
+            self.config.trainer.default_local_dir, 'current_epoch.txt')
         with open(local_current_epoch, 'w') as f:
             f.write(str(self.current_epoch))
 
         if self.config.data.get('dynamic_filtering_strategy', 'None') == 'all_linear_backoff':
-            ## save self.skip_easy and self.skip_hard
             filtering_dynamics = {
                 'strategy': 'all_linear_backoff',
                 'skip_easy': self.skip_easy,
-                'skip_hard': self.skip_hard
+                'skip_hard': self.skip_hard,
             }
-            filtering_dynamics_local_path = os.path.join(local_global_step_folder, 'filtering_dynamics.pt')
-            # save filtering_dynamics
-            torch.save(filtering_dynamics, filtering_dynamics_local_path)
+            torch.save(filtering_dynamics, os.path.join(
+                local_checkpoint_folder, 'filtering_dynamics.pt'))
 
         if self.config.data.get('dynamic_filtering_strategy', 'None') == 'all_probabilistic':
-            ## save self.p_easy and self.p_hard
             filtering_dynamics = {
                 'strategy': 'all_probabilistic',
                 'p_easy': self.p_easy,
-                'p_hard': self.p_hard
+                'p_hard': self.p_hard,
             }
-            filtering_dynamics_local_path = os.path.join(local_global_step_folder, 'filtering_dynamics.pt')
-            # save filtering_dynamics
-            torch.save(filtering_dynamics, filtering_dynamics_local_path)
+            torch.save(filtering_dynamics, os.path.join(
+                local_checkpoint_folder, 'filtering_dynamics.pt'))
 
-        # save self.sampling_num
-        local_sampling_num = os.path.join(self.config.trainer.default_local_dir, 'sampling_num.txt')
+        local_sampling_num = os.path.join(
+            self.config.trainer.default_local_dir, 'sampling_num.txt')
         with open(local_sampling_num, 'w') as f:
             f.write(str(self.sampling_num))
 
-        # Record which step is the best-pass@1 one so it can be found (and pinned) after the run.
-        best_step = getattr(self, '_best_val_step', None)
-        if best_step is not None:
-            with open(os.path.join(self.config.trainer.default_local_dir, 'best_ckpt.json'), 'w') as f:
-                json.dump({'best_step': best_step,
-                           'best_score': getattr(self, '_best_val_score', None),
-                           'metric': 'macro-mean val/pass_at_1',
-                           'path': f'global_step_{best_step}'}, f)
-
-        # Keep only the latest n checkpoints (for resume), plus the pinned best-pass@1 one.
-        # GXPO sets n=1, so this is at most one resumable checkpoint plus one best checkpoint.
-        n = max(int(self.config.trainer.get('keep_last_ckpts', 1)), 1)
-        if self.config.trainer.get('keep_all_ckpts', False):
-            return
-
-        checkpoint_dirs = [d for d in os.listdir(self.config.trainer.default_local_dir)
-                        if d.startswith('global_step_')]
-        steps = []
-        for d in checkpoint_dirs:
-            try:
-                step = int(d.split('_')[-1])
-                steps.append(step)
-            except ValueError:
-                continue  # Ignore malformed directories
-
-        for step in ckpt_steps_to_remove(steps, n, best_step):
-            dir_to_remove = os.path.join(self.config.trainer.default_local_dir, f'global_step_{step}')
-            print(f"Removing old checkpoint directory: {dir_to_remove}")
+        # Keep exactly one latest global_step_N directory.  best_checkpoint is
+        # separate and is intentionally not included in this deletion pass.
+        checkpoint_dirs = [
+            d for d in os.listdir(self.config.trainer.default_local_dir)
+            if d.startswith('global_step_') and d != checkpoint_name
+        ]
+        for directory in checkpoint_dirs:
+            dir_to_remove = os.path.join(
+                self.config.trainer.default_local_dir, directory)
+            print(f'Removing old checkpoint directory: {dir_to_remove}')
             shutil.rmtree(dir_to_remove, ignore_errors=True)
 
     def _load_checkpoint(self):
@@ -1534,6 +1591,14 @@ class RayPPOTrainer(object):
         easy_data_num = 0
         hard_data_num = 0
         total_num = 0
+        # Pre-generation dynamic_filtering skip counts (all_probabilistic strategy only --
+        # linear_backoff/keep_all don't return a skip_log). Distinct from easy_data_num/
+        # hard_data_num above, which are post-generation reward stats on the surviving
+        # batch: these count prompts the filter never even generated for. Flushed into
+        # examples_log and reset alongside the post-generation counters below.
+        filter_skipped_easy_num = 0
+        filter_skipped_hard_num = 0
+        filter_seen_num = 0
 
         if self.config.trainer.get('max_steps', -1) > 0:
             self.total_training_steps = self.config.trainer.max_steps
@@ -1571,6 +1636,9 @@ class RayPPOTrainer(object):
                     elif self.config.data.dynamic_filtering_strategy == 'all_probabilistic':
                         batch, skip_log = self.data_profiler.filter_examples_all_probabilistic(epoch, batch, self.p_easy, self.p_hard, return_log=True)
                         skip_log_list.append([epoch, skip_log])
+                        filter_skipped_easy_num += sum(1 for _, code in skip_log if code == 0)
+                        filter_skipped_hard_num += sum(1 for _, code in skip_log if code == 1)
+                        filter_seen_num += len(skip_log)
                     elif self.config.data.dynamic_filtering_strategy == 'keep_all':
                         pass
                     else:
@@ -1595,8 +1663,19 @@ class RayPPOTrainer(object):
                     else:
                         continue
 
+                # Off-policy KD: dataloader rows already carry fixed responses
+                # (+ cached teacher targets) in the generate_sequences layout,
+                # so there is nothing to pop and nothing to generate.
+                off_policy = bool(self.config.actor_rollout_ref.rollout.get('off_policy', False))
+                if off_policy:
+                    assert 'responses' in batch.batch and 'teacher_topk_log_probs' in batch.batch, \
+                        'off-policy rows must carry fixed responses + cached teacher targets'
+                    assert int(self.config.actor_rollout_ref.rollout.get('n', 1)) == 1, \
+                        'off-policy supports rollout.n == 1 only'
+                    gen_batch = None
+                    gen_batch_output = None
                 # pop those keys for generation
-                if 'multi_modal_inputs' in batch.non_tensor_batch.keys():
+                elif 'multi_modal_inputs' in batch.non_tensor_batch.keys():
                     gen_batch = batch.pop(
                         batch_keys=['input_ids', 'attention_mask', 'position_ids'],
                         non_tensor_batch_keys=['raw_prompt_ids', 'multi_modal_data', 'multi_modal_inputs'],
@@ -1612,9 +1691,10 @@ class RayPPOTrainer(object):
 
                 with _timer('step', timing_raw):
                     # generate a batch
-                    if os.environ.get('GXPO_CONCISE_LOGS') != '1': print('start generation...')
+                    if os.environ.get('GXPO_CONCISE_LOGS') != '1' and not off_policy: print('start generation...')
                     with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        if not off_policy:
+                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer('gen_max', timing_raw):
@@ -1634,12 +1714,17 @@ class RayPPOTrainer(object):
 
                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
                                                              dtype=object)
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    if off_policy:
+                        # fixed responses are already in the batch; no repeat
+                        # (n == 1 asserted above) and nothing to union.
+                        self.sampling_num += len(batch.batch)
+                    else:
+                        # repeat to align with repeated responses in rollout
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
-                    #generation accumulation
-                    self.sampling_num += len(batch)
+                        #generation accumulation
+                        self.sampling_num += len(batch)
 
                     # import pdb; pdb.set_trace()
                     if generation_accumulation is not None:
@@ -1760,7 +1845,14 @@ class RayPPOTrainer(object):
                     batch_num = len(batch)
 
                     easy_data_num += reward_metrics["examples/all_correct_example_ratio"] * batch_num
-                    hard_data_num += reward_metrics["examples/format_example_ratio"] * batch_num
+                    # Binary math rewards have no separate format-error bucket (that key is
+                    # hardcoded to 0.0 above); the correct "hard" signal is the group that got
+                    # zero reward from every sample, not a dead legacy field. Using the dead
+                    # field here meant hard_data_ratio was always 0 < self.targeted_hard, so
+                    # self.p_hard only ever drifted up toward max_p regardless of actual
+                    # difficulty -- the all_probabilistic filter's hard-example throttling
+                    # never engaged.
+                    hard_data_num += reward_metrics["examples/all_zero_reward_example_ratio"] * batch_num
                     total_num += batch_num
 
                     # collect metrics
@@ -1804,6 +1896,38 @@ class RayPPOTrainer(object):
                     # When we reach this point, we have finish the example generation and adv computation.
                     # It can involve many dataloader steps.
 
+                    # --- Per-step on-policy KD teacher scoring (Option B) ---
+                    # The student rollout engine is already asleep by this
+                    # point (FSDPVLLMShardingManager.__exit__ runs before
+                    # generate_sequences returns). Wake the HF teacher, score
+                    # the exact sequences the student produced, then park the
+                    # teacher before gxpo_update_actor runs. The student vLLM
+                    # engine and teacher are never GPU-resident together; the
+                    # actor's FSDP/Adam state remains available for this phase.
+                    if self.use_kd and self.teacher_handles is not None:
+                        with _timer('teacher_kd_score', timing_raw):
+                            from verl.trainer.ppo.teacher_kd import (
+                                score_batch_and_attach, sleep_teachers, wake_teachers,
+                            )
+                            actor_cfg = self.config.actor_rollout_ref.actor
+                            kd_topk = int(actor_cfg.get('kd_topk', 32))
+                            kd_teacher_cfg = actor_cfg.get('kd_teacher', {}) or {}
+                            pad_token_id = int(kd_teacher_cfg.get(
+                                'pad_token_id', self.tokenizer.pad_token_id or 0))
+                            try:
+                                print(f"[KD] step={self.global_steps} teacher_score_start replicas={len(self.teacher_handles)}")
+                                wake_teachers(self.teacher_handles)
+                                batch = score_batch_and_attach(
+                                    batch=batch,
+                                    handles=self.teacher_handles,
+                                    response_length=int(batch.batch['responses'].shape[-1]),
+                                    k=kd_topk,
+                                    pad_token_id=pad_token_id,
+                                )
+                                print(f"[KD] step={self.global_steps} teacher_score_done")
+                            finally:
+                                sleep_teachers(self.teacher_handles)
+
                     # Compute generation time
                     generation_time += time.time() - generation_start
                     refresh_generation_time_flag = True
@@ -1844,6 +1968,14 @@ class RayPPOTrainer(object):
                         examples_log['examples/p_easy'] = self.p_easy
                         examples_log['examples/p_hard'] = self.p_hard
                         if os.environ.get('GXPO_CONCISE_LOGS') != '1':                         print(f'p_easy: {self.p_easy}, p_hard: {self.p_hard}')
+                        # Pre-generation filter activity, distinct from too_easy/too_hard_ratio
+                        # above (those are post-generation reward stats on what survived).
+                        # This is how much was skipped before ever being generated for --
+                        # the actual source of the wall-clock savings.
+                        if filter_seen_num > 0:
+                            examples_log['examples/filter_skipped_easy_ratio'] = filter_skipped_easy_num / filter_seen_num
+                            examples_log['examples/filter_skipped_hard_ratio'] = filter_skipped_hard_num / filter_seen_num
+                        examples_log['examples/filter_seen_num'] = filter_seen_num
 
                     metrics.update(examples_log)
 
@@ -1851,6 +1983,9 @@ class RayPPOTrainer(object):
                     easy_data_num = 0
                     hard_data_num = 0
                     total_num = 0
+                    filter_skipped_easy_num = 0
+                    filter_skipped_hard_num = 0
+                    filter_seen_num = 0
 
                     # (seqlen balancing + old_log_prob moved above the reward /
                     # advantage driver work so rewards overlap the GPU forward)
@@ -1905,13 +2040,28 @@ class RayPPOTrainer(object):
                     gxpo_baseline_ready = False
                     gxpo_trigger_z = 0.0
                     gxpo_trigger_candidate = False
+                    # Keep the shared GXPO diagnostics path safe for KD-only/
+                    # plain-PPO runs, where the GXPO-specific branch below is
+                    # intentionally not entered.
+                    gxpo_zscore_w = 0
                     gxpo_trigger_stat = (
                         float(self.gxpo_entropy_container[-1])
                         if self.gxpo_entropy_container else 0.0
                     )
+                    gxpo_force_all_steps = bool(
+                        actor_cfg.get('gxpo_force_all_steps', False))
+                    gxpo_fallback_mode = str(
+                        actor_cfg.get('gxpo_fallback_mode', 'permanent')).lower()
+                    gxpo_fallback_window = max(
+                        1, int(actor_cfg.get('gxpo_fallback_window', 10)))
                     if actor_cfg.get('use_gxpo', False):
                         gxpo_warmup_steps = int(actor_cfg.get('gxpo_warmup_steps', 0))
-                        gxpo_trigger_enabled = self.global_steps > gxpo_warmup_steps
+                        # Explicit force mode is used for diagnostic/ablation
+                        # runs: extrapolation starts on step 1, regardless of
+                        # warmup or the entropy shutoff gate.
+                        gxpo_trigger_enabled = (
+                            gxpo_force_all_steps or
+                            self.global_steps > gxpo_warmup_steps)
                         gxpo_zscore_w = int(actor_cfg.get('gxpo_zscore_w', 30))
                         gxpo_reset_after_warmup = bool(
                             actor_cfg.get('gxpo_reset_entropy_after_warmup', True))
@@ -1924,15 +2074,12 @@ class RayPPOTrainer(object):
                             self.gxpo_trigger_streak = 0
                             gxpo_trigger_stat = 0.0
 
-                        gxpo_fallback_mode = str(
-                        actor_cfg.get('gxpo_fallback_mode', 'permanent')).lower()
-                    gxpo_fallback_window = max(
-                        1, int(actor_cfg.get('gxpo_fallback_window', 10)))
                     # The previous trainer path permanently set stop_GXPO after
                     # one trigger, bypassing GXPOState's temporary fallback mode.
                     # Re-arm only after the configured GRPO fallback window; keep
                     # the entropy history so the next gate uses the retained window.
-                    if (self.stop_GXPO and gxpo_fallback_mode == 'temporary' and
+                    if (not gxpo_force_all_steps and self.stop_GXPO and
+                            gxpo_fallback_mode == 'temporary' and
                             self.gxpo_trigger_step is not None and
                             self.global_steps >= self.gxpo_trigger_step + gxpo_fallback_window):
                         self.stop_GXPO = False
@@ -1943,34 +2090,45 @@ class RayPPOTrainer(object):
                             f'{self.global_steps}; re-arming GXPO')
 
                     gxpo_baseline_ready = (
-                        gxpo_zscore_w > 0 and
-                        len(self.gxpo_entropy_container) >= gxpo_zscore_w)
-                    if (gxpo_trigger_enabled and gxpo_baseline_ready and
-                            not self.stop_GXPO):
-                        # SFPO ordering: score the latest completed outer
-                        # batch against the preceding rolling window.
-                        u = float(np.mean(self.gxpo_entropy_container[-gxpo_zscore_w:]))
-                        std = float(np.std(self.gxpo_entropy_container[-gxpo_zscore_w:])) + 1e-9
-                        gxpo_trigger_z = (gxpo_trigger_stat - u) / std
-                        gxpo_trigger_candidate = gxpo_trigger_z >= float(
-                            actor_cfg.get('gxpo_tau', 3.0))
-                        if gxpo_trigger_candidate:
-                            self.gxpo_trigger_streak += 1
-                        else:
+                        gxpo_force_all_steps or
+                        (gxpo_zscore_w > 0 and
+                         len(self.gxpo_entropy_container) >= gxpo_zscore_w))
+                    if (gxpo_force_all_steps or
+                            (gxpo_trigger_enabled and gxpo_baseline_ready and
+                             not self.stop_GXPO)):
+                        if gxpo_force_all_steps:
+                            # Keep the gate diagnostics deterministic while
+                            # force mode owns the decision for every step.
+                            gxpo_trigger_z = 0.0
+                            gxpo_trigger_candidate = False
+                            self.stop_GXPO = False
+                            self.gxpo_trigger_step = None
                             self.gxpo_trigger_streak = 0
-                        gxpo_trigger_patience = max(
-                            1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
-                        if (self.gxpo_trigger_streak >= gxpo_trigger_patience and
-                                not self.stop_GXPO):
-                            self.stop_GXPO = True
-                            if self.gxpo_trigger_step is None:
-                                self.gxpo_trigger_step = int(self.global_steps)
-                            print(
-                                f'[GXPO] entropy shutoff triggered at outer batch '
-                                f'{self.global_steps}: z={gxpo_trigger_z:.3f} '
-                                f'>= tau={float(actor_cfg.get("gxpo_tau", 3.0)):.3f} '
-                                f'after {gxpo_trigger_patience} consecutive observations '
-                                f'-> {gxpo_fallback_mode} fallback')
+                        else:
+                            # SFPO ordering: score the latest completed outer
+                            # batch against the preceding rolling window.
+                            u = float(np.mean(self.gxpo_entropy_container[-gxpo_zscore_w:]))
+                            std = float(np.std(self.gxpo_entropy_container[-gxpo_zscore_w:])) + 1e-9
+                            gxpo_trigger_z = (gxpo_trigger_stat - u) / std
+                            gxpo_trigger_candidate = gxpo_trigger_z >= float(
+                                actor_cfg.get('gxpo_tau', 3.0))
+                            if gxpo_trigger_candidate:
+                                self.gxpo_trigger_streak += 1
+                            else:
+                                self.gxpo_trigger_streak = 0
+                            gxpo_trigger_patience = max(
+                                1, int(actor_cfg.get('gxpo_trigger_patience', 1)))
+                            if (self.gxpo_trigger_streak >= gxpo_trigger_patience and
+                                    not self.stop_GXPO):
+                                self.stop_GXPO = True
+                                if self.gxpo_trigger_step is None:
+                                    self.gxpo_trigger_step = int(self.global_steps)
+                                print(
+                                    f'[GXPO] entropy shutoff triggered at outer batch '
+                                    f'{self.global_steps}: z={gxpo_trigger_z:.3f} '
+                                    f'>= tau={float(actor_cfg.get("gxpo_tau", 3.0)):.3f} '
+                                    f'after {gxpo_trigger_patience} consecutive observations '
+                                    f'-> {gxpo_fallback_mode} fallback')
                     elif self.stop_GXPO:
                         # Do not accumulate trigger streaks while temporary GRPO
                         # fallback is active; the gate is re-armed only at the
@@ -2070,6 +2228,7 @@ class RayPPOTrainer(object):
 
                     # validate
                     did_validate = False
+                    best_improved = False
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
                         (is_last_step or  self.global_steps % self.config.trainer.test_freq == 0):
                         print('start validation...')
@@ -2080,11 +2239,11 @@ class RayPPOTrainer(object):
                         metrics.update(val_metrics)
                         did_validate = True
 
-                    # Two independent reasons to write a checkpoint: the periodic one that makes the
-                    # run resumable, and a new best-pass@1 one that the paper reports. Both write a
-                    # normal global_step_N dir; retention keeps the last few and pins the best.
-                    need_save = (self.config.trainer.save_freq > 0 and
-                                 (is_last_step or self.global_steps % self.config.trainer.save_freq == 0))
+                    # The latest resumable checkpoint and best inference
+                    # checkpoint are saved independently below.
+                    periodic_save = (self.config.trainer.save_freq > 0 and
+                                      (is_last_step or self.global_steps % self.config.trainer.save_freq == 0))
+                    need_save = periodic_save
 
                     if did_validate:
                         score = self._best_ckpt_score(val_metrics)
@@ -2094,16 +2253,25 @@ class RayPPOTrainer(object):
                                   f'(prev {getattr(self, "_best_val_score", float("-inf")):.4f}); saving')
                             self._best_val_score = score
                             self._best_val_step = self.global_steps
-                            need_save = True
+                            best_improved = True
                         else:
                             print(f'[best-ckpt] step {self.global_steps}: pass@1 {score:.4f} <= '
                                   f'best {self._best_val_score:.4f} (from step {self._best_val_step})')
                         metrics['val/best_ckpt_step'] = getattr(self, '_best_val_step', 0)
                         metrics['val/best_pass_at_1'] = getattr(self, '_best_val_score', float('-inf'))
 
-                    if need_save:
+                    if need_save or best_improved:
                         with _timer('save_checkpoint', timing_raw):
-                            self._save_checkpoint()
+                            if need_save:
+                                self._save_checkpoint(
+                                    checkpoint_name=f'global_step_{self.global_steps}',
+                                    save_optimizer=True,
+                                    update_latest=True)
+                            if best_improved:
+                                self._save_checkpoint(
+                                    checkpoint_name='best_checkpoint',
+                                    save_optimizer=False,
+                                    update_latest=False)
 
                     # reward_metrics = compute_reward_metrics(batch, self.config)
 

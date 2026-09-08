@@ -24,7 +24,8 @@ from typing import Optional, Tuple
 
 import torch
 
-__all__ = ['GXPOState', 'geometric_sum_horner', 'compute_gxpo_retention_scale']
+__all__ = ['GXPOState', 'geometric_sum_horner', 'compute_gxpo_retention_scale',
+           'compute_gxpo_update_retention_scale']
 
 
 def geometric_sum_horner(value: torch.Tensor, n: int) -> torch.Tensor:
@@ -38,26 +39,44 @@ def geometric_sum_horner(value: torch.Tensor, n: int) -> torch.Tensor:
 
 
 def compute_gxpo_retention_scale(g0: torch.Tensor, g1: torch.Tensor, K: int,
-                                 delta: float) -> Tuple[torch.Tensor, torch.Tensor,
-                                                         torch.Tensor, torch.Tensor]:
+                                 delta: float, *, clip_scale_g0: float = 1.0,
+                                 clip_scale_g1: float = 1.0,
+                                 g0_rms: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor,
+                                                                                torch.Tensor,
+                                                                                torch.Tensor,
+                                                                                torch.Tensor]:
     """Compute production GXPO ratio/scale and diagnostic masks.
 
-    Inactive coordinates retain the observed two-step displacement. Active
-    ratios are clipped to [-2, 3], non-finite ratios are replaced with one,
-    and the geometric scale is bounded to [1, K / 2 + 1].
+    The retention ratio uses the gradients that actually drove each clipped
+    probe update: ``(c1 * g1) / (c0 * g0)``. Activity is determined per
+    parameter tensor using a relative RMS threshold. Inactive coordinates
+    receive neutral retention. Active ratios are clipped to [-2, 3],
+    non-finite ratios are replaced with one, and the geometric scale is
+    bounded to [1, K / 2 + 1]. ``delta`` remains the S_2 denominator guard.
     """
     if K < 2:
         raise ValueError(f'GXPO K must be at least two, got {K}')
     if g0.shape != g1.shape:
         raise ValueError(f'g0 and g1 must have the same shape, got {g0.shape} and {g1.shape}')
 
-    one = torch.ones_like(g0)
-    active = g0.abs() > delta
-    # Branchless active-mask arithmetic avoids a CUDA scalar active.any()
-    # synchronization while retaining the old sign convention for g0 == 0.
-    sign_g0 = torch.where(g0 >= 0, one, -one)
-    denominator = g0.abs().clamp_min(delta) * sign_g0
-    candidate = g1 / denominator
+    # Retention is gradient-sensitive. Widen BF16/FP16 inputs before any
+    # division or Horner recurrence; callers using FP32/FP64 retain their dtype.
+    work_dtype = torch.float64 if torch.float64 in (g0.dtype, g1.dtype) else torch.float32
+    g0_work = g0.to(dtype=work_dtype)
+    g1_work = g1.to(dtype=work_dtype)
+    one = torch.ones_like(g0_work)
+    # When supplied by the FSDP actor, g0_rms is reduced across the sharding
+    # process group. This makes the activity mask invariant to FSDP_SIZE.
+    if g0_rms is None:
+        g0_rms = g0_work.square().mean().sqrt()
+    else:
+        g0_rms = g0_rms.to(device=g0.device, dtype=work_dtype)
+    threshold = g0_rms * 1e-3
+    active = g0_work.abs() > threshold
+    # Avoid invalid inactive-coordinate divisions without altering the active
+    # ratio. The input gradient buffers remain read-only.
+    denominator = torch.where(active, g0_work * clip_scale_g0, one)
+    candidate = (g1_work * clip_scale_g1) / denominator
     finite = torch.isfinite(candidate)
     ratio_clipped = active & ((~finite) | (candidate < -2.0) | (candidate > 3.0))
     candidate.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
@@ -70,6 +89,100 @@ def compute_gxpo_retention_scale(g0: torch.Tensor, g1: torch.Tensor, K: int,
     active_scale.clamp_(1.0, K / 2.0 + 1.0)
     scale = torch.where(active, active_scale, one)
     return ratio, scale, active, ratio_clipped
+
+
+def compute_gxpo_update_retention_scale(u0: Optional[torch.Tensor],
+                                        u1: Optional[torch.Tensor], K: int,
+                                        delta: float, *,
+                                        dots: Optional[torch.Tensor] = None
+                                        ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Retention measured in *displacement* space as a per-tensor scalar.
+
+    ``compute_gxpo_retention_scale`` reads retention off the raw gradients,
+    which is exact only when the optimizer's step is proportional to the
+    gradient (plain SGD). Muon breaks that premise: it normalizes the momentum
+    matrix to unit norm before the Newton-Schulz iterations
+    (``muon.py:zeropower_via_newtonschulz5``) and scales the write-back by a
+    function of parameter *shape* alone (``Muon.adjust_lr_for_muon``). Its step
+    size is therefore independent of gradient magnitude, and ``g1 / g0`` says
+    nothing about how its displacement evolves.
+
+    This estimator instead reads retention off the two real optimizer steps::
+
+        rho   = <u0, u1> / <u0, u0>        # scalar, per parameter tensor
+        scale = S_K(rho) / S_2(rho)
+
+    where ``u0 = theta1 - theta0`` and ``u1 = theta2 - theta1``. It is a strict
+    generalization, not a different algorithm: for SGD ``u_t = -lr * g_t``, so
+    ``rho`` reduces to the norm-weighted mean of the coordinatewise ``g1 / g0``.
+
+    Being a *scalar* is the essential half of the fix. Multiplying the two-step
+    displacement by a scalar preserves the direction the optimizer chose and
+    extrapolates only its magnitude; a per-entry scale would distort the very
+    geometry Newton-Schulz produced.
+
+    ``rho`` is clamped to [-1, 1]: for an orthogonalized update of near-constant
+    magnitude it is essentially the cosine of the inter-step rotation, and
+    values outside that band are noise. ``scale`` is bounded to [0, K / 2 + 1].
+    The floor is zero rather than the gradient-space path's one only so that the
+    bound states no more than it has to; it never binds, because on |rho| <= 1
+    the series ratio is ``S_K / S_2 -> 1 / (1 - rho**2) >= 1``. Contraction below
+    the two-step displacement is therefore expressed through ``alpha``, not here.
+
+    Args:
+        u0: first real optimizer step, ``theta1 - theta0``.
+        u1: second real optimizer step, ``theta2 - theta1``.
+        K: extrapolation horizon.
+        delta: S_2 denominator guard, as in the gradient-space path.
+        dots: precomputed ``[<u0, u1>, <u0, u0>]``, which supersedes ``u0``/``u1``
+            (both may then be None). Under FSDP each rank holds only a shard, so
+            the caller must sum both dot products across the sharding process
+            group and pass the reduced pair here; otherwise ``rho`` would be
+            computed from a shard rather than from the whole matrix.
+
+    Returns:
+        ``(rho, scale)``, both 0-dim tensors.
+    """
+    if K < 2:
+        raise ValueError(f'GXPO K must be at least two, got {K}')
+
+    if dots is not None:
+        work_dtype = torch.float64 if dots.dtype == torch.float64 else torch.float32
+        dots = dots.to(dtype=work_dtype)
+        cross, self_dot = dots[0], dots[1]
+    else:
+        if u0 is None or u1 is None:
+            raise ValueError('provide either u0 and u1, or precomputed dots')
+        if u0.shape != u1.shape:
+            raise ValueError(f'u0 and u1 must have the same shape, got {u0.shape} and {u1.shape}')
+        work_dtype = torch.float64 if torch.float64 in (u0.dtype, u1.dtype) else torch.float32
+        u0_work = u0.to(dtype=work_dtype)
+        u1_work = u1.to(dtype=work_dtype)
+        cross = (u0_work * u1_work).sum()
+        self_dot = u0_work.square().sum()
+
+    # A vanished first step carries no directional information: fall back to
+    # neutral retention rather than dividing by ~0 and amplifying noise.
+    #
+    # The guard is a *predicate*, not an additive epsilon. delta (1e-8) is sized
+    # for the S_2 denominator below, where the scale is O(1); self_dot here is
+    # ||u0||^2, and a real Muon step on a 1536x1536 matrix at lr 1e-6 gives
+    # self_dot ~ 1e-7. Adding delta to that silently deflated rho by 10% or more,
+    # worst on the smallest matrices -- which read as the estimator failing.
+    # The neutral fallback is rho = 0, which gives scale = 1 (no extrapolation) --
+    # not rho = 1, which would mean perfect retention and extrapolate by K / 2 on
+    # the strength of no information at all.
+    safe = self_dot > 0
+    one = torch.ones_like(self_dot)
+    rho = torch.where(safe, cross / torch.where(safe, self_dot, one), torch.zeros_like(self_dot))
+    rho = rho.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
+
+    s_k = geometric_sum_horner(rho, K)
+    s_2 = geometric_sum_horner(rho, 2)
+    one = torch.ones_like(rho)
+    scale = torch.where(s_2.abs() > delta, s_k / s_2, one)
+    scale = scale.nan_to_num(nan=1.0, posinf=1.0, neginf=1.0).clamp(0.0, K / 2.0 + 1.0)
+    return rho, scale
 
 
 class GXPOState:
@@ -96,6 +209,7 @@ class GXPOState:
         max_active_steps: int = 0,
         abs_threshold: float = 0.0,
         sustain_window: int = 10,
+        relative_threshold: float = 0.0,
     ):
         if shutoff_mode not in self.VALID_SHUTOFF_MODES:
             raise ValueError(f'Invalid GXPO shutoff mode: {shutoff_mode}. '
@@ -154,6 +268,28 @@ class GXPOState:
         if int(sustain_window) < 2:
             raise ValueError('GXPO sustain_window must be >= 2')
         self.sustain_window = int(sustain_window)
+        # Relative sustained-level criterion. `abs_threshold` compares the rolling median
+        # against a fixed number, which only works when the signal's scale is known ahead of
+        # time -- true for the cosine disagreement score (always in [0, 2]), false for
+        # entropy, which sits at 0.10-0.35 nats on the Qwen-Math runs and 4.2-4.7 on
+        # Llama-3.2-3B. `relative_threshold` instead compares the median against the frozen
+        # post-warmup baseline scaled by (1 + relative_threshold), so the same setting
+        # transfers across models. This is the criterion that catches a slow monotone drift:
+        # a windowed z-score structurally cannot, because the rolling mean follows the drift.
+        # 0 disables it (z-path only), which is the default for every pre-existing caller.
+        if float(relative_threshold) < 0:
+            raise ValueError('GXPO relative_threshold must be non-negative')
+        self.relative_threshold = float(relative_threshold)
+        # Frozen mean of the first full post-warmup window; the reference the relative
+        # criterion measures against. None until that window first fills.
+        self.baseline_level = None
+        self.level_streak = 0
+        # (mu, sigma) captured when a z-score streak opens. While a streak is open the
+        # observations are still appended to the rolling history, but they are scored
+        # against this frozen baseline -- otherwise each accepted violation raises the mean
+        # and inflates the std, so observations 2..N of a sustained excursion score lower
+        # than the first and `trigger_patience > 1` becomes self-defeating.
+        self._frozen_baseline = None
         # True when shutoff came from the hard budget rather than the gate.
         self.budget_stop = None
 
@@ -209,7 +345,13 @@ class GXPOState:
             self.trigger_history.append(float(H_s))
             return 0.0
 
-        if self.trigger_robust:
+        if self._frozen_baseline is not None:
+            # A candidate streak is open: score every observation of the excursion against
+            # the same baseline that scored its first violation, so `trigger_patience`
+            # means "N consecutive violations of a fixed baseline" rather than "N
+            # violations of a baseline that has already moved to accommodate them".
+            self.mu, self.sigma = self._frozen_baseline
+        elif self.trigger_robust:
             # Median/MAD location-scale: a single transient in the window moves the
             # baseline far less than mean/std, so one spike cannot both contaminate
             # the reference and hide the next one.
@@ -232,15 +374,31 @@ class GXPOState:
             self.sigma = variance ** 0.5
         z_score = (float(H_s) - self.mu) / (self.sigma + 1e-9)
         self.trigger_history.append(float(H_s))
-        if len(self.trigger_history) > self.zscore_w:
-            del self.trigger_history[:-self.zscore_w]
+        self._trim_history()
         return z_score
+
+    def _retained_history(self) -> int:
+        """How many observations the rolling history must keep.
+
+        The z-score baseline needs `zscore_w`; the sustained-level median needs
+        `sustain_window`. Keeping only `zscore_w` would silently truncate the level
+        window whenever it is configured longer than the z window.
+        """
+        return max(self.zscore_w, self.sustain_window)
+
+    def _trim_history(self):
+        retained = self._retained_history()
+        if len(self.trigger_history) > retained:
+            del self.trigger_history[:-retained]
 
     def reset_trigger_baseline(self):
         """Discard warmup observations before collecting the SFPO-style window."""
         self.trigger_history.clear()
         self.observation_count = 0
         self.trigger_streak = 0
+        self.level_streak = 0
+        self.baseline_level = None
+        self._frozen_baseline = None
         self.post_warmup_scored = 0
         self.mu = 1.0
         self.sigma = 1.0
@@ -262,28 +420,73 @@ class GXPOState:
                 '|cos(g0, g_slow)| via stat_override; it cannot be derived from norms')
         return float(g_slow_norm)
 
+    def _clear_zscore_streak(self):
+        self.trigger_streak = 0
+        self._frozen_baseline = None
+
     def check_trigger(self, Z_s: float, step: int) -> bool:
         if step < self.warmup_steps:
-            self.trigger_streak = 0
+            self._clear_zscore_streak()
             return False
         # Gate age floor (F3): every observed trip in production fired in the volatile
         # burst immediately after warmup. Require min_post_warmup_obs scored post-warmup
         # observations before any trip, and discard streaks accumulated before the age
         # threshold so reaching it does not instantly convert old streaks into a trip.
         if self.post_warmup_scored < self.min_post_warmup_obs:
-            self.trigger_streak = 0
+            self._clear_zscore_streak()
             return False
         # Algorithm 1 shuts off on an upward instability only.  A low-norm
         # observation is not evidence that extrapolation has become unsafe.
         if self.trigger_index != float('inf'):
             return False
         if Z_s >= self.tau:
+            if self.trigger_streak == 0:
+                # Opening a streak: pin the baseline that scored this first violation so
+                # the remaining `trigger_patience - 1` observations are measured against
+                # it rather than against a window that has absorbed the excursion.
+                self._frozen_baseline = (self.mu, self.sigma)
             self.trigger_streak += 1
             if self.trigger_streak >= self.trigger_patience:
                 self.trigger_index = step + 1
                 return True
         else:
-            self.trigger_streak = 0
+            self._clear_zscore_streak()
+        return False
+
+    def check_level_trigger(self, step: int) -> bool:
+        """Sustained-level criterion: has the signal settled at a higher level?
+
+        A windowed z-score cannot see a slow monotone drift -- the rolling mean tracks it,
+        so ``z`` stays near zero however far the signal travels. This compares the rolling
+        median of the last ``sustain_window`` observations against the frozen post-warmup
+        baseline scaled by ``(1 + relative_threshold)``, which is scale-free and therefore
+        transfers between signals of very different magnitude.
+
+        Streak / patience / warmup / age-floor semantics mirror ``check_trigger`` exactly,
+        against an independent streak counter so a quiet z-score cannot clear a level streak.
+        """
+        if self.relative_threshold <= 0 or self.baseline_level is None:
+            return False
+        # A non-positive baseline gives (1 + omega) * baseline no meaning as an upper
+        # bound, so the relative criterion stays disabled rather than firing spuriously.
+        if self.baseline_level <= 0:
+            return False
+        if step < self.warmup_steps or self.post_warmup_scored < self.min_post_warmup_obs:
+            self.level_streak = 0
+            return False
+        if self.trigger_index != float('inf'):
+            return False
+        window = self.trigger_history[-self.sustain_window:]
+        if len(window) < self.sustain_window:
+            self.level_streak = 0
+            return False
+        if statistics.median(window) >= self.baseline_level * (1.0 + self.relative_threshold):
+            self.level_streak += 1
+            if self.level_streak >= self.trigger_patience:
+                self.trigger_index = step + 1
+                return True
+        else:
+            self.level_streak = 0
         return False
 
     def update_trigger_state(self, *, step: int, g0_norm: float,
@@ -309,10 +512,10 @@ class GXPOState:
             # Keep warmup observations isolated; the first enabled observation
             # resets this history before the post-warmup rolling window starts.
             self.trigger_history.append(float(trigger_stat))
-            if len(self.trigger_history) > self.zscore_w:
-                del self.trigger_history[:-self.zscore_w]
+            self._trim_history()
             self.observation_count += 1
-            self.trigger_streak = 0
+            self._clear_zscore_streak()
+            self.level_streak = 0
             return 0.0, float(trigger_stat), False
         if not self._warmup_reset_done:
             self.reset_trigger_baseline()
@@ -328,6 +531,11 @@ class GXPOState:
         self.post_warmup_scored += 1
         if len(self.trigger_history) < self.zscore_w:
             return float(z_score), float(trigger_stat), False
+        if self.baseline_level is None:
+            # The first full post-warmup window defines "normal" for the relative
+            # sustained-level criterion. Frozen from here on: unlike the z-score baseline
+            # it must NOT follow the signal, or it could never detect a drift.
+            self.baseline_level = sum(self.trigger_history[-self.zscore_w:]) / self.zscore_w
         if self.shutoff_mode == 'cosine' and self.abs_threshold > 0:
             # Sustained-level criterion replaces the z-path for cosine mode when
             # enabled. The rolling median over `sustain_window` scored batches is
@@ -347,8 +555,25 @@ class GXPOState:
                 return float(z_score), float(trigger_stat), False
             self.trigger_streak = 0
             return float(z_score), float(trigger_stat), False
+        # The two criteria are complementary and both run: the z-path catches a fast spike
+        # against a rolling baseline, the level path catches a slow drift the rolling
+        # baseline has already absorbed. Either one tripping closes the gate.
         triggered = self.check_trigger(z_score, step)
+        if not triggered:
+            triggered = self.check_level_trigger(step)
         return float(z_score), float(trigger_stat), bool(triggered)
+
+    def level_ratio(self) -> float:
+        """Current sustained level as a multiple of the frozen baseline (1.0 = at baseline).
+
+        Diagnostic only -- returns 0.0 until the baseline and level window are both ready.
+        """
+        if not self.baseline_level or self.baseline_level <= 0:
+            return 0.0
+        window = self.trigger_history[-self.sustain_window:]
+        if len(window) < self.sustain_window:
+            return 0.0
+        return float(statistics.median(window) / self.baseline_level)
 
 
 if __name__ == '__main__':
@@ -381,3 +606,56 @@ if __name__ == '__main__':
     assert st.mu > 10.0, f'temporary should keep the learned rolling baseline, got mu={st.mu}'
     print(f'OK: permanent off for all steps after {trip_p}; '
           f'temporary re-enables at step {trip_t + 1 + 5} (mu kept {st.mu:.1f})')
+
+    # --- sustained-level criterion (relative): a slow drift the z-path cannot see ---
+    def level_run(series, *, relative_threshold, tau=2.0, w=10, sustain=5, patience=2):
+        s = GXPOState(tau=tau, zscore_w=w, warmup_steps=0, sustain_window=sustain,
+                      trigger_patience=patience, relative_threshold=relative_threshold)
+        z_max = 0.0
+        for step, value in enumerate(series):
+            if not s.is_enabled(step):
+                continue
+            z, _, fired = s.update_trigger_state(step=step, g0_norm=value, g_slow_norm=value)
+            z_max = max(z_max, z)
+            if fired:
+                return step, z_max, s
+        return None, z_max, s
+
+    # A linear ramp: +30% over 60 steps. The rolling mean follows it, so z never approaches
+    # tau -- this is precisely the failure mode a windowed z-score is blind to.
+    ramp = [1.0 + 0.30 * i / 59 for i in range(60)]
+    trip_z_only, z_max, _ = level_run(ramp, relative_threshold=0.0)
+    assert trip_z_only is None, f'z-only gate should stay blind to a slow ramp, tripped at {trip_z_only}'
+    assert z_max < 2.0, f'ramp should never produce a large z, got {z_max:.2f}'
+    trip_level, _, s_ramp = level_run(ramp, relative_threshold=0.10)
+    assert trip_level is not None, 'relative level criterion must catch a sustained +30% drift'
+    assert s_ramp.baseline_level is not None and s_ramp.baseline_level < 1.1
+
+    # A healthy run that drifts DOWN must not trip either criterion.
+    decay = [0.30 * (0.995 ** i) for i in range(200)]
+    trip_decay, _, _ = level_run(decay, relative_threshold=0.10)
+    assert trip_decay is None, f'a decaying signal must never trip, tripped at {trip_decay}'
+
+    # Scale-freeness: the same relative_threshold behaves identically 40x higher up.
+    trip_scaled, _, _ = level_run([v * 40.0 for v in ramp], relative_threshold=0.10)
+    assert trip_scaled == trip_level, (
+        f'relative criterion must be scale-free: {trip_scaled} vs {trip_level}')
+
+    # --- frozen baseline keeps trigger_patience > 1 meaningful ---
+    # A sustained step change: with a self-absorbing baseline, observations 2..N of the
+    # excursion score far below the first and patience>1 can never be satisfied.
+    step_series = [1.0] * 12 + [1.6] * 6
+    s_frozen = GXPOState(tau=2.0, zscore_w=10, warmup_steps=0, trigger_patience=3,
+                         sustain_window=5)
+    trip_frozen = None
+    zs = []
+    for step, value in enumerate(step_series):
+        if not s_frozen.is_enabled(step):
+            continue
+        z, _, fired = s_frozen.update_trigger_state(step=step, g0_norm=value, g_slow_norm=value)
+        zs.append(z)
+        if fired and trip_frozen is None:
+            trip_frozen = step
+    assert trip_frozen is not None, f'patience=3 must be satisfiable on a sustained step, z={zs}'
+    print(f'OK: z-only blind to ramp (max z {z_max:.2f}); relative criterion trips at '
+          f'{trip_level}; decay never trips; patience=3 satisfied at step {trip_frozen}')

@@ -32,9 +32,12 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.actor import BasePPOActor
-from verl.workers.actor.gxpo_state import GXPOState, compute_gxpo_retention_scale
+from verl.workers.actor.gxpo_state import (GXPOState, compute_gxpo_retention_scale,
+                                          compute_gxpo_update_retention_scale)
+from verl.workers.actor.optimizer_transaction import snapshot_optimizer_state
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
+from verl.workers.actor.kd_loss import KD_TOPK_CHUNK_TOKENS, compute_forward_kl_topk_chunked, compute_reverse_kl_topk_chunked
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
@@ -111,6 +114,11 @@ class DataParallelPPOActor(BasePPOActor):
         # GXPO: shutoff-gate state + lazily allocated per-parameter buffers
         self.gxpo_state = None
         self._gxpo_bufs = None
+        self._gxpo_update_space_cache = None
+        self._gxpo_precision_validated = False
+        self._gxpo_strict_precision = bool(self.config.get('gxpo_strict_precision', True))
+        self._gxpo_fsdp_invariant_threshold = bool(
+            self.config.get('gxpo_fsdp_invariant_threshold', True))
         # Optional duty-cycle guard for the high-power GXPO actor path. This
         # is scheduling only: it never changes the loss, gradients, clipping,
         # optimizer, or GXPO reposition math.
@@ -125,6 +133,25 @@ class DataParallelPPOActor(BasePPOActor):
         # consumed by _optimizer_state_metrics; keyed by a weakref to the pairs list.
         self._reposition_dir_cache = None
         if self.config.get('use_gxpo', False) and actor_optimizer is not None:
+            self.gxpo_optimizer_state_mode = str(
+                self.config.get('gxpo_optimizer_state_mode', 'transactional')).lower()
+            if self.gxpo_optimizer_state_mode not in (
+                    'transactional', 'transactional_fast_state'):
+                raise ValueError(
+                    'gxpo_optimizer_state_mode must be transactional or '
+                    'transactional_fast_state (the moment-polluting legacy '
+                    'mode was removed), '
+                    f'got {self.gxpo_optimizer_state_mode!r}')
+            # Mirrors the SFT arm's contraction guard. theta_tilde = theta0 +
+            # alpha*scale*(theta2-theta0): alpha*scale below 1 lands SHORT of theta2, so the
+            # 3-pass update contracts instead of extrapolating. 0.0 = warn only; 1.0 floors
+            # the per-coordinate multiplier so the reposition can never land short.
+            min_eff = float(self.config.get('gxpo_min_effective_multiplier', 0.0))
+            if min_eff < 0.0:
+                raise ValueError('gxpo_min_effective_multiplier must be non-negative, '
+                                 f'got {min_eff}')
+            self.gxpo_min_effective_multiplier = min_eff
+            self._gxpo_contraction_warned = False
             self.gxpo_state = GXPOState(
                 K=self.config.get('gxpo_k', 5),
                 alpha=self.config.get('gxpo_alpha', 0.5),
@@ -141,6 +168,7 @@ class DataParallelPPOActor(BasePPOActor):
                 max_active_steps=int(self.config.get('gxpo_max_active_steps', 0)),
                 abs_threshold=float(self.config.get('gxpo_trigger_abs_threshold', 0.0)),
                 sustain_window=int(self.config.get("gxpo_trigger_sustain_w", 10)),
+                relative_threshold=float(self.config.get('gxpo_relative_threshold', 0.0)),
             )
             self._gxpo_diag_freq = int(self.config.get('gxpo_diag_freq', 10))
 
@@ -248,6 +276,178 @@ class DataParallelPPOActor(BasePPOActor):
 
             return entropy, log_probs
 
+    def _forward_kd_micro_batch(self, micro_batch, temperature) -> torch.Tensor:
+        """Dense response-logits forward for offline KD (no rmpad).
+
+        Returns bf16/fp32 logits of shape (bsz, response_length, vocab). The
+        dense path is used deliberately: the offline teacher top-K cache is
+        stored dense per response position, while rmpad row order is
+        data-dependent and cannot be pre-aligned. Logits stay in autocast
+        dtype here; ``kd_loss`` upcasts in token chunks (see kd_loss.py), so
+        no full [tokens, vocab] FP32 copy ever exists.
+        """
+        response_length = micro_batch['responses'].size(-1)
+        multi_modal_inputs = {}
+        if 'multi_modal_inputs' in micro_batch:
+            for key in micro_batch['multi_modal_inputs'][0].keys():
+                multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch['multi_modal_inputs']],
+                                                    dim=0)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            input_ids = micro_batch['input_ids']
+            attention_mask = micro_batch['attention_mask']
+            position_ids = micro_batch['position_ids']
+            if position_ids.dim() == 3:  # qwen2vl mrope
+                position_ids = position_ids.transpose(0, 1)
+            output = self.actor_module(input_ids=input_ids,
+                                       attention_mask=attention_mask,
+                                       position_ids=position_ids,
+                                       **multi_modal_inputs,
+                                       use_cache=False)
+            logits = output.logits
+            logits.div_(temperature)
+            logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab)
+            # Clone out of the autocast graph inputs; the caller holds this
+            # only until the chunked KL below consumes it, then deletes it.
+            return logits
+
+    def _forward_kd_flat(self, micro_batch, temperature, response_mask, has_multi_modal_inputs):
+        """Response-filtered flat student logits with aligned teacher rows.
+
+        The default dense path materializes full-sequence [B, S, V] logits
+        including every pad token, then masks. With remove-padding enabled
+        this runs the forward on unpadded tokens and returns only real
+        response rows ([N, V], N excludes all padding), gathering the teacher
+        top-K rows in the same rmpad order -- so the [N, V] peak and the fp32
+        chunk work skip prompt tails and response tails entirely.
+
+        Falls back to the dense path whenever rmpad is inapplicable (no
+        remove-padding, multimodal, sequence-parallel, 3D position ids, or
+        non-[B, R, K] teacher tensors). The first call cross-checks rmpad
+        against dense and pins the safe path loudly instead of risking silent
+        corruption. Disable via +actor_rollout_ref.actor.kd_rmpad=False.
+        Returns (flat_logits, t_logps, t_ids) or None when there are no real
+        response tokens.
+        """
+        use_kd_tensors = ('teacher_topk_log_probs' in micro_batch and 'teacher_topk_ids' in micro_batch)
+        t_logps_raw = micro_batch['teacher_topk_log_probs'] if use_kd_tensors else None
+        t_ids_raw = micro_batch['teacher_topk_ids'] if use_kd_tensors else None
+        teacher_ok = (torch.is_tensor(t_logps_raw) and torch.is_tensor(t_ids_raw)
+                      and t_logps_raw.dim() == 3 and t_ids_raw.dim() == 3
+                      and t_logps_raw.shape == t_ids_raw.shape)
+        want_rmpad = (self.use_remove_padding
+                      and not has_multi_modal_inputs
+                      and self.ulysses_sequence_parallel_size == 1
+                      and bool(self.config.get('kd_rmpad', True))
+                      and teacher_ok)
+        if want_rmpad and not getattr(self, '_kd_rmpad_checked', False):
+            return self._forward_kd_flat_checked(micro_batch, temperature, response_mask,
+                                                 t_logps_raw, t_ids_raw)
+        if want_rmpad and getattr(self, '_kd_rmpad_ok', False):
+            out = self._forward_kd_flat_rmpad(micro_batch, temperature, response_mask,
+                                              t_logps_raw, t_ids_raw)
+            if out is not None:
+                return out[:3]
+            return None
+        return self._forward_kd_flat_dense(micro_batch, temperature, response_mask)
+
+    def _forward_kd_flat_dense(self, micro_batch, temperature, response_mask):
+        """Legacy dense path: full-sequence logits, then response mask."""
+        kd_logits = self._forward_kd_micro_batch(micro_batch=micro_batch, temperature=temperature)
+        flat_mask = response_mask.bool().reshape(-1)
+        if not bool(flat_mask.any().item()):
+            del kd_logits
+            return None
+        flat_logits = kd_logits.reshape(-1, kd_logits.size(-1))[flat_mask]
+        t_logps = micro_batch['teacher_topk_log_probs']
+        t_ids = micro_batch['teacher_topk_ids']
+        if torch.is_tensor(t_logps) and t_logps.dim() == 3:
+            t_logps = t_logps.reshape(-1, t_logps.size(-1))[flat_mask]
+        if torch.is_tensor(t_ids) and t_ids.dim() == 3:
+            t_ids = t_ids.reshape(-1, t_ids.size(-1))[flat_mask]
+        del kd_logits
+        return flat_logits, t_logps, t_ids
+
+    def _forward_kd_flat_rmpad(self, micro_batch, temperature, response_mask, t_logps_raw, t_ids_raw):
+        """Rmpad KD forward. Returns (flat_logits, t_logps, t_ids, b_sel, j_sel) or None."""
+        input_ids = micro_batch['input_ids']
+        attention_mask = micro_batch['attention_mask']
+        position_ids = micro_batch['position_ids']
+        responses = micro_batch['responses']
+        B, S = input_ids.shape
+        R = responses.size(1)
+        if position_ids.dim() == 3:
+            return None
+        input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)
+        input_ids_rmpad = input_ids_rmpad.transpose(0, 1)
+        position_ids_rmpad = index_first_axis(
+            rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            output = self.actor_module(input_ids=input_ids_rmpad,
+                                       attention_mask=None,
+                                       position_ids=position_ids_rmpad,
+                                       use_cache=False)
+            logits_rmpad = output.logits.squeeze(0)
+            logits_rmpad.div_(temperature)
+        # Span convention must match the dense path: labels are rolled by -1, so
+        # the logit at position S-R-1+j predicts response token j, i.e. the
+        # response span is [S-R-1, S-1) -- NOT the last R positions. (An early
+        # version used [S-R, S); the one-time check caught it: row count
+        # matched but maxdiff was ~41.)
+        resp_start = S - R - 1
+        flat = indices  # [nnz] flat positions into [B, S]
+        bb = flat // S
+        ss = flat % S
+        in_span = (ss >= resp_start) & (ss < (S - 1))
+        jj = (ss - resp_start).clamp(0, R - 1)
+        real = in_span & response_mask.bool()[bb, jj]
+        if not bool(real.any().item()):
+            del logits_rmpad
+            return None
+        sel = torch.nonzero(real, as_tuple=False).squeeze(-1)
+        flat_logits = logits_rmpad[sel]
+        b_sel = bb[sel]
+        j_sel = (ss[sel] - resp_start).clamp(0, R - 1).long()
+        t_logps = t_logps_raw[b_sel, j_sel]
+        t_ids = t_ids_raw[b_sel, j_sel]
+        del logits_rmpad
+        return flat_logits, t_logps, t_ids, b_sel, j_sel
+
+    def _forward_kd_flat_checked(self, micro_batch, temperature, response_mask, t_logps_raw, t_ids_raw):
+        """One-time rmpad-vs-dense cross-check; pins the safe path loudly."""
+        self._kd_rmpad_checked = True
+        rmpad_out = self._forward_kd_flat_rmpad(micro_batch, temperature, response_mask,
+                                                t_logps_raw, t_ids_raw)
+        if rmpad_out is None:
+            dense_out = self._forward_kd_flat_dense(micro_batch, temperature, response_mask)
+            agree = dense_out is None
+            self._kd_rmpad_ok = agree
+            print(f'[KD-RMPAD] cross-check vs dense: {"PASS" if agree else "FAIL"} '
+                  f'(both-empty={agree}); using dense KD forward henceforth.', flush=True)
+            return dense_out
+        flat_logits, _, _, b_sel, j_sel = rmpad_out
+        N = flat_logits.size(0)
+        R = micro_batch['responses'].size(1)
+        expect = int(response_mask.bool().sum().item())
+        detail, ok = f'count-mismatch rmpad={N} mask={expect}', False
+        if N == expect:
+            kd_logits = self._forward_kd_micro_batch(micro_batch=micro_batch, temperature=temperature)
+            grid = kd_logits.reshape(-1, kd_logits.size(-1))
+            ref_idx = b_sel * R + j_sel
+            maxdiff = 0.0
+            for s in range(0, N, 4096):
+                e = min(s + 4096, N)
+                d = (flat_logits[s:e].float() - grid[ref_idx[s:e]].float()).abs().max().item()
+                maxdiff = max(maxdiff, d)
+            del kd_logits, grid, ref_idx
+            ok = maxdiff < 2e-2
+            detail = f'N={N} maxdiff={maxdiff:.2e}'
+        self._kd_rmpad_ok = bool(ok)
+        print(f'[KD-RMPAD] cross-check vs dense: {"PASS" if ok else "FAIL"} ({detail}); '
+              f'using {"rmpad" if ok else "dense"} KD forward henceforth.', flush=True)
+        if ok:
+            return rmpad_out[:3]
+        return self._forward_kd_flat_dense(micro_batch, temperature, response_mask)
+
     def _clip_grads(self):
         assert self.config.grad_clip is not None
 
@@ -257,8 +457,114 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         return grad_norm
 
+    def _ensure_fsdp_gradient_sync(self):
+        """Ensure FSDP leaves a local reduced gradient for the optimizer.
+
+        FSDP's ``no_sync()`` intentionally leaves full unsharded gradients.
+        The hybrid-engine rollout path does not use gradient accumulation via
+        ``no_sync()``, but vLLM state/weight transitions can leave this private
+        flag disabled on Torch 2.9. Re-enable it at the update boundary so
+        sharded AdamW never sees a full gradient for a local flat parameter.
+        """
+        if not isinstance(self.actor_module, FSDP):
+            return
+        for module in self.actor_module.modules():
+            if isinstance(module, FSDP) and hasattr(module, '_sync_gradients'):
+                module._sync_gradients = True
+
+    def _reshard_full_fsdp_grads(self):
+        """Reduce-scatter any full flat gradients left by the FSDP runtime.
+
+        Torch 2.9 can leave an unsharded ``FlatParameter.grad`` after the
+        hybrid vLLM state transition even with the sync flag enabled. The
+        private reducer is the same implementation used by FSDP's backward
+        hook and handles flat-parameter padding and rank groups correctly.
+        """
+        if not isinstance(self.actor_module, FSDP):
+            return
+        # FSDP queues reduce-scatter on its post-backward CUDA stream. The
+        # custom remove-padding/FlashAttention path can return from backward
+        # before that stream has finalized ``.grad``; wait before inspecting
+        # shapes or clipping.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        modules = FSDP.fsdp_modules(self.actor_module)
+        candidates = []
+        local_flags = []
+        for module in modules:
+            handle = getattr(module, '_handle', None)
+            flat_param = getattr(handle, 'flat_param', None)
+            is_full = bool(
+                handle is not None and flat_param is not None and
+                handle.uses_sharded_strategy and flat_param.grad is not None and
+                flat_param.grad.numel() != flat_param.numel()
+            )
+            candidates.append((module, handle, flat_param))
+            local_flags.append(int(is_full))
+        if torch.distributed.is_initialized() and candidates:
+            flags = torch.tensor(local_flags, dtype=torch.int32,
+                                 device=torch.cuda.current_device())
+            torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.SUM)
+            world = torch.distributed.get_world_size()
+            if bool(((flags != 0) & (flags != world)).any().item()):
+                raise RuntimeError(
+                    'FSDP full-gradient mismatch is present on only a subset of ranks'
+                )
+            needs = [int(v) == world for v in flags.tolist()]
+        else:
+            needs = [bool(v) for v in local_flags]
+        if not any(needs):
+            return
+        from torch.distributed.fsdp import _runtime_utils as fsdp_runtime
+        from torch.distributed.fsdp._common_utils import TrainingState
+        for need, (module, handle, flat_param) in zip(needs, candidates):
+            if not need:
+                continue
+            if flat_param.grad is None:
+                raise RuntimeError('FSDP full-gradient repair requires a gradient on every rank')
+            # The normal hook already finalized the FSDP state by the time this
+            # repair runs. Temporarily enter its backward state so the official
+            # reducer/cast helpers accept the manually recovered full gradient.
+            old_training_state = module.training_state
+            had_post_backward_called = hasattr(flat_param, '_post_backward_called')
+            old_post_backward_called = getattr(flat_param, '_post_backward_called', False)
+            module.training_state = TrainingState.FORWARD_BACKWARD
+            flat_param._post_backward_called = True
+            try:
+                fsdp_runtime._reduce_grad(module, handle)
+                handle.prepare_gradient_for_optim()
+            finally:
+                module.training_state = old_training_state
+                if had_post_backward_called:
+                    flat_param._post_backward_called = old_post_backward_called
+                else:
+                    delattr(flat_param, '_post_backward_called')
+
+    def _cast_optimizer_grads_to_param_dtype(self):
+        """Normalize mixed-precision FSDP grads after clipping/reduction.
+
+        FSDP's ``clip_grad_norm_`` must run first: before it completes its
+        reduce-scatter, a flat parameter can temporarily expose the full
+        unsharded gradient while the parameter itself is a local shard.
+        """
+        for param in self.actor_module.parameters():
+            grad = param.grad
+            if grad is None or grad.dtype == param.dtype:
+                continue
+            if grad.shape != param.shape:
+                raise RuntimeError(
+                    f"FSDP gradient shape {tuple(grad.shape)} does not match "
+                    f"parameter shape {tuple(param.shape)} after clipping; "
+                    "gradient synchronization may be disabled"
+                )
+            # ``.data`` is intentional here. PyTorch's gradient assignment
+            # checks dtypes even though AdamW expects an FP32 master parameter
+            # with a reduced BF16 gradient.
+            param.grad.data = grad.to(dtype=param.dtype)
+
     def _optimizer_step(self):
         grad_norm = self._clip_grads()
+        self._cast_optimizer_grads_to_param_dtype()
         self.actor_optimizer.step()
         return grad_norm
 
@@ -489,6 +795,12 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        if self.config.get('use_kd', False):
+            # Offline KD teacher cache (dense per response position). Keys are
+            # appended only when present so non-KD batches keep working.
+            for kd_key in ('teacher_topk_log_probs', 'teacher_topk_ids'):
+                if kd_key in data.batch.keys() and kd_key not in select_keys:
+                    select_keys.append(kd_key)
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
@@ -555,7 +867,17 @@ class DataParallelPPOActor(BasePPOActor):
             response_length = responses.size(1)
             attention_mask = data['attention_mask']
             response_mask = attention_mask[:, -response_length:]
-            if recompute_old_log_probs:
+            # Offline KD switch (loss-only delta; GXPO 3-pass math is untouched).
+            # Computed before the old_log_prob refresh so pure-KD probe passes
+            # can skip it (one forward saved per pass per micro-batch).
+            use_kd = (self.config.get('use_kd', False)
+                      and 'teacher_topk_log_probs' in data
+                      and 'teacher_topk_ids' in data)
+            pure_kd = use_kd and not self.config.get('kd_use_pg', False)
+            if recompute_old_log_probs and pure_kd:
+                # Pure KD never consumes old_log_probs.
+                old_log_prob = None
+            elif recompute_old_log_probs:
                 with torch.no_grad():
                     # Entropy is discarded on this probe pass; skip softmax+logsumexp.
                     _, old_log_prob = self._forward_micro_batch(micro_batch=data,
@@ -568,34 +890,124 @@ class DataParallelPPOActor(BasePPOActor):
             clip_ratio = self.config.clip_ratio
             entropy_coeff = self.config.entropy_coeff
 
+            kd_coef = float(self.config.get('kd_coef', 1.0))
+
             # Entropy is consumed only through the logged entropy_loss metric and the
-            # `- entropy_loss * entropy_coeff` term. When metrics are not collected
-            # and the coefficient is zero, skip the softmax+logsumexp entirely.
-            need_entropy = collect_metrics or entropy_coeff != 0
-
-            # all return: (bsz, response_length)
-            if need_entropy:
-                entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+            # `- entropy_loss * entropy_coeff` term. Pure KD needs no entropy
+            # forward at all (saves one full forward per micro-batch per probe
+            # pass); the zero placeholder keeps metric keys stable.
+            if pure_kd:
+                # Pure-KD loss never subtracts the entropy term (policy_loss is
+                # kd_coef * kd_loss), so entropy is metrics/trigger only. Compute
+                # it on metric passes and skip the duplicate full forward on
+                # silent probe passes (GXPO pass 2): one forward saved per
+                # micro-batch per pass. With entropy_coeff=0 all passes skip.
+                need_entropy = collect_metrics or entropy_coeff != 0
             else:
-                _, log_prob = self._forward_micro_batch(micro_batch=data,
-                                                        temperature=temperature,
-                                                        need_entropy=False)
+                need_entropy = collect_metrics or entropy_coeff != 0
 
-            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                          log_prob=log_prob,
-                                                                          advantages=advantages,
-                                                                          eos_mask=response_mask,
-                                                                          cliprange=clip_ratio)
-            # compute entropy loss from entropy. A skipped entropy implies
-            # entropy_coeff == 0, so the zero placeholder keeps policy_loss (and its
-            # gradients) bit-identical.
-            if need_entropy:
-                entropy_loss = verl_F.masked_mean(entropy, response_mask)
+            kd_loss = None
+            kd_student_mass = None
+            kd_teacher_mass = None
+            if pure_kd:
+                if need_entropy:
+                    entropy, _ = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                    entropy_loss = verl_F.masked_mean(entropy, response_mask)
+                    del entropy
+                else:
+                    entropy_loss = None
+                # Response-filtered flat logits (+ aligned teacher rows); the
+                # rmpad path skips every pad token, the dense fallback masks
+                # them as before. Consumed in token chunks below.
+                kd_flat = self._forward_kd_flat(micro_batch=data, temperature=temperature,
+                                                response_mask=response_mask,
+                                                has_multi_modal_inputs=has_multi_modal_inputs)
+                if kd_flat is not None:
+                    flat_logits, t_logps, t_ids = kd_flat
+                    # On-policy runs set kd_reverse_kl=True: reverse KL is
+                    # mode-seeking and will not pump entropy on the student's
+                    # own uncertain prefixes the way forward KL does.
+                    kd_fn = (compute_reverse_kl_topk_chunked
+                             if self.config.get('kd_reverse_kl', False)
+                             else compute_forward_kl_topk_chunked)
+                    kd_out = kd_fn(
+                        flat_logits,
+                        t_logps,
+                        t_ids.long(),
+                        log_prob_min_clamp=self.config.get('kd_log_prob_min_clamp', -10.0),
+                        loss_max_clamp=self.config.get('kd_loss_max_clamp', 10.0),
+                        chunk_tokens=int(self.config.get('kd_chunk_tokens',
+                                                          KD_TOPK_CHUNK_TOKENS)),
+                    )
+                    kd_loss = kd_out['distillation_losses'].mean()
+                    kd_student_mass = kd_out['student_mass'].mean().detach()
+                    kd_teacher_mass = kd_out['teacher_mass'].mean().detach()
+                    del kd_out, flat_logits, t_logps, t_ids
+                else:
+                    kd_loss = torch.zeros((), device=response_mask.device)
+                # The helper frees the [tokens, vocab] logits before returning
+                # so the peak never stacks a logits copy on top of the chunked
+                # FP32 work.
+                del kd_flat
+                if entropy_loss is None:
+                    entropy_loss = kd_loss.new_zeros(())
+                # Metric-compat placeholders (ray_trainer merges these keys).
+                pg_loss = kd_loss.new_zeros(())
+                pg_clipfrac = kd_loss.new_zeros(())
+                ppo_kl = kd_loss.new_zeros(())
+                policy_loss = kd_coef * kd_loss
             else:
-                entropy_loss = pg_loss.new_zeros(())
+                # all return: (bsz, response_length)
+                if need_entropy:
+                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                else:
+                    _, log_prob = self._forward_micro_batch(micro_batch=data,
+                                                            temperature=temperature,
+                                                            need_entropy=False)
 
-            # compute policy loss
-            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
+                                                                              log_prob=log_prob,
+                                                                              advantages=advantages,
+                                                                              eos_mask=response_mask,
+                                                                              cliprange=clip_ratio)
+                # compute entropy loss from entropy. A skipped entropy implies
+                # entropy_coeff == 0, so the zero placeholder keeps policy_loss (and its
+                # gradients) bit-identical.
+                if need_entropy:
+                    entropy_loss = verl_F.masked_mean(entropy, response_mask)
+                else:
+                    entropy_loss = pg_loss.new_zeros(())
+
+                # compute policy loss
+                policy_loss = pg_loss - entropy_loss * entropy_coeff
+                if use_kd:
+                    # Auxiliary KD on top of the PG loss (kd_use_pg=True).
+                    kd_flat = self._forward_kd_flat(micro_batch=data, temperature=temperature,
+                                                    response_mask=response_mask,
+                                                    has_multi_modal_inputs=has_multi_modal_inputs)
+                    if kd_flat is not None:
+                        flat_logits, t_logps, t_ids = kd_flat
+                        kd_fn = (compute_reverse_kl_topk_chunked
+                                 if self.config.get('kd_reverse_kl', False)
+                                 else compute_forward_kl_topk_chunked)
+                        kd_out = kd_fn(
+                            flat_logits,
+                            t_logps,
+                            t_ids.long(),
+                            log_prob_min_clamp=self.config.get('kd_log_prob_min_clamp', -10.0),
+                            loss_max_clamp=self.config.get('kd_loss_max_clamp', 10.0),
+                            chunk_tokens=int(self.config.get('kd_chunk_tokens',
+                                                              KD_TOPK_CHUNK_TOKENS)),
+                        )
+                        kd_loss = kd_out['distillation_losses'].mean()
+                        kd_student_mass = kd_out['student_mass'].mean().detach()
+                        kd_teacher_mass = kd_out['teacher_mass'].mean().detach()
+                        del kd_out, flat_logits, t_logps, t_ids
+                    else:
+                        kd_loss = policy_loss.new_zeros(())
+                    del kd_flat
+                    policy_loss = policy_loss + kd_coef * kd_loss
+                del log_prob
 
             if self.config.use_kl_loss:
                 ref_log_prob = data['ref_log_prob']
@@ -632,12 +1044,23 @@ class DataParallelPPOActor(BasePPOActor):
                     'actor/pg_clipfrac': pg_clipfrac.detach(),
                     'actor/ppo_kl': ppo_kl.detach(),
                 }
+                if kd_loss is not None:
+                    micro_metrics['actor/kd_loss'] = kd_loss.detach()
+                    if kd_student_mass is not None:
+                        micro_metrics['actor/kd_student_mass'] = kd_student_mass
+                    if kd_teacher_mass is not None:
+                        micro_metrics['actor/kd_teacher_mass'] = kd_teacher_mass
                 append_to_dict(metrics, micro_metrics)
+
+        # FSDP 2.9 may leave a full flat gradient after the backward hooks in
+        # the vLLM hybrid transition. Repair it before GXPO captures or clips.
+        self._reshard_full_fsdp_grads()
 
         # Materialize deferred GPU scalars in one sync. Values are bit-identical to
         # the previous per-micro-batch .item() conversions; list lengths unchanged.
         for key in ('actor/entropy_loss', 'actor/pg_loss', 'actor/pg_clipfrac', 'actor/ppo_kl',
-                    'actor/kl_loss'):
+                    'actor/kl_loss', 'actor/kd_loss', 'actor/kd_student_mass',
+                    'actor/kd_teacher_mass'):
             vals = metrics.get(key)
             if vals and isinstance(vals[0], torch.Tensor):
                 metrics[key] = torch.stack(vals).tolist()
@@ -648,6 +1071,7 @@ class DataParallelPPOActor(BasePPOActor):
     def update_policy(self, data: DataProto, reposition_pairs=None):
         # make sure we are in training mode
         self.actor_module.train()
+        self._ensure_fsdp_gradient_sync()
         bp_start = self.cumulative_bp
         raw_backward_start = self.raw_backward_calls
 
@@ -697,18 +1121,159 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_cos_g0_gslow': 0.0,
             'actor/gxpo_inactive_frac': 0.0,
             'actor/gxpo_ratio_clip_frac': 0.0,
+            'actor/gxpo_clip_scale_g0': 0.0,
+            'actor/gxpo_clip_scale_g1': 0.0,
+            'actor/gxpo_relative_threshold_reject_frac': 0.0,
+            'actor/gxpo_update_space_params': 0.0,
+            'actor/gxpo_retention_rho_mean': 0.0,
+            'actor/gxpo_update_scale_mean': 0.0,
+            'actor/gxpo_retention_rho_negative_frac': 0.0,
         }
 
     def _gxpo_init_buffers(self):
         if self._gxpo_bufs is not None:
             return
         self._gxpo_params = [p for p in self.actor_module.parameters() if p.requires_grad]
+        # Three buffers, never four. The update-space estimator needs u0 =
+        # theta1 - theta0, but it does not need a buffer of its own: for a
+        # Muon-owned parameter the g1 slot is dead weight. g1 exists only to
+        # form the coordinatewise ratio r = g1/g0 and its moment diagnostics,
+        # and that ratio is precisely the quantity this fix showed carries no
+        # information about Muon's displacement. So Muon-owned parameters store
+        # u0 in their g1 slot instead, and never capture g1 at all. The shutoff
+        # gate is unaffected -- it reads g0 and the corrective gradient, never g1.
         self._gxpo_bufs = {
-            name: [torch.empty_like(p) for p in self._gxpo_params] for name in ('theta0', 'g0', 'g1')
+            name: [torch.empty_like(p) for p in self._gxpo_params]
+            for name in ('theta0', 'g0', 'g1')
         }
 
+    def _gxpo_update_space_mask(self):
+        """Per-parameter mask selecting the update-space retention estimator.
+
+        Returns None when every parameter should keep the gradient-space path,
+        None means every parameter keeps the gradient-space path.
+
+        ``gxpo_retention_space``:
+          ``auto``   -- update-space for Muon-owned parameters, gradient-space
+                        for the rest. Under a plain AdamW optimizer no parameter
+                        carries ``use_muon``, so this is a no-op and existing
+                        AdamW baselines stay bit-identical.
+          ``grad``   -- force today's behavior everywhere (clean A/B control).
+          ``update`` -- force update-space everywhere.
+        """
+        if self._gxpo_update_space_cache is not None:
+            return self._gxpo_update_space_cache[0]
+
+        space = str(self.config.get('gxpo_retention_space', 'auto')).lower()
+        if space not in ('auto', 'grad', 'update'):
+            raise ValueError(
+                f"gxpo_retention_space must be one of auto|grad|update, got '{space}'")
+
+        if space == 'grad':
+            mask = None
+        elif space == 'update':
+            mask = [True] * len(self._gxpo_params)
+        else:
+            # Muon tags every parameter it owns at construction time
+            # (verl/workers/muon.py, `self.state[p]['use_muon'] = ...`). Absent
+            # for any other optimizer, hence the False default.
+            state = getattr(self.actor_optimizer, 'state', {})
+            mask = [bool(state.get(p, {}).get('use_muon', False)) for p in self._gxpo_params]
+            if not any(mask):
+                mask = None
+
+        self._gxpo_update_space_cache = (mask,)
+        return mask
+
+    @staticmethod
+    def _all_ranks_flag(value: bool, device, reduce_op=None) -> bool:
+        """Return a rank-consistent boolean without changing the caller's branch order."""
+        flag = torch.tensor(1 if value else 0, dtype=torch.int32, device=device)
+        if torch.distributed.is_initialized():
+            if reduce_op is None:
+                reduce_op = torch.distributed.ReduceOp.MIN
+            torch.distributed.all_reduce(flag, op=reduce_op)
+        return bool(flag.item())
+
+    def _gxpo_global_g0_rms(self, gradients):
+        """Return per-flat-parameter RMS values invariant to FSDP shard size."""
+        if not gradients:
+            return []
+        norms = torch.stack([torch.linalg.vector_norm(gradient.float()) for gradient in gradients])
+        counts = torch.tensor([gradient.numel() for gradient in gradients],
+                              dtype=torch.float32, device=norms.device)
+        stats = torch.stack((norms.square(), counts))
+        if torch.distributed.is_initialized() and isinstance(self.actor_module, FSDP):
+            # FSDP.process_group is the sharding group for both FULL_SHARD and
+            # HYBRID_SHARD. Do not reduce over the replica dimension a second
+            # time: those ranks contain duplicate synchronized gradients.
+            torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM,
+                                         group=self.actor_module.process_group)
+        return (stats[0] / stats[1].clamp_min(1.0)).sqrt().unbind()
+
+    def _gxpo_update_space_dots(self, params, theta0, u0_bufs, update_space):
+        """Return per-parameter ``[<u0, u1>, <u0, u0>]``, summed across FSDP shards.
+
+        Retention in update space is a property of the *whole* parameter matrix,
+        but under FSDP each rank holds only a slice of it. Both dot products are
+        therefore reduced over the sharding process group before the ratio is
+        formed -- reducing only one of them, or neither, would make rho a
+        function of FSDP_SIZE. One collective covers every parameter.
+
+        Returns None when nothing uses the update-space path.
+        """
+        selected = [i for i, use in enumerate(update_space) if use]
+        if not selected:
+            return None
+        rows = []
+        for i in selected:
+            u0 = u0_bufs[i].float()
+            # disp2 = theta2 - theta0, and u1 = disp2 - u0, so
+            # <u0,u1> = <u0,disp2> - <u0,u0>. disp2 is materialized rather than
+            # differencing <u0,theta2> - <u0,theta0>: those two dots are large
+            # and nearly equal (weights ~1e-2, steps ~1e-7), so subtracting them
+            # would cancel away every significant digit.
+            disp2 = params[i].data.float() - theta0[i].float()
+            self_dot = u0.square().sum()
+            rows.append(torch.stack(((u0 * disp2).sum() - self_dot, self_dot)))
+        dots = torch.stack(rows)
+        if torch.distributed.is_initialized() and isinstance(self.actor_module, FSDP):
+            # Same group and same reasoning as _gxpo_global_g0_rms: shard
+            # dimension only, never the replica dimension.
+            torch.distributed.all_reduce(dots, op=torch.distributed.ReduceOp.SUM,
+                                         group=self.actor_module.process_group)
+        return dict(zip(selected, dots.unbind()))
+
+    def _gxpo_validate_precision_contract(self):
+        """Fail on every rank if AdamW/GXPO state has fallen out of FP32."""
+        if self._gxpo_precision_validated or not self._gxpo_strict_precision:
+            return
+        errors = []
+        for index, parameter in enumerate(self._gxpo_params):
+            if parameter.dtype != torch.float32:
+                errors.append(f'param[{index}]={parameter.dtype}')
+            if parameter.grad is not None and parameter.grad.dtype != torch.float32:
+                errors.append(f'grad[{index}]={parameter.grad.dtype}')
+            for name, buffers in self._gxpo_bufs.items():
+                if buffers[index].dtype != torch.float32:
+                    errors.append(f'{name}[{index}]={buffers[index].dtype}')
+            for state_name, value in self.actor_optimizer.state.get(parameter, {}).items():
+                if torch.is_tensor(value) and (value.is_floating_point() or value.is_complex()):
+                    if value.dtype != torch.float32:
+                        errors.append(f'optimizer.{state_name}[{index}]={value.dtype}')
+        device = self._gxpo_params[0].device
+        valid_everywhere = self._all_ranks_flag(not errors, device)
+        if not valid_everywhere:
+            detail = ', '.join(errors[:8]) if errors else 'another rank reported a mismatch'
+            raise RuntimeError(
+                'GXPO precision contract violated: expected FP32 master parameters, retained '
+                f'gradients, AdamW state, and GXPO buffers; {detail}')
+        self._gxpo_precision_validated = True
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            print('[precision] GXPO master/grads/AdamW-state/theta0/g0/g1 verified fp32')
+
     def _gxpo_release_buffers(self):
-        """Free the theta0/g0/g1 caches (~3 model-shard fp32 buffers of dead VRAM).
+        """Free the theta0/g0/g1 caches (3 model-shard param-dtype buffers of dead VRAM).
 
         Only called once the shutoff gate has tripped permanently: `is_enabled`
         then returns False forever, `_gxpo_init_buffers` is never reached again,
@@ -716,9 +1281,22 @@ class DataParallelPPOActor(BasePPOActor):
         """
         self._gxpo_bufs = None
         self._gxpo_params = []
+        # Keyed on the released parameter objects; must not outlive them.
+        self._gxpo_update_space_cache = None
 
-    def _gxpo_capture_grads(self, bufs):
-        grads = [p.grad for p in self._gxpo_params]
+    def _gxpo_capture_grads(self, bufs, skip=None):
+        """Copy p.grad into bufs. ``skip`` marks slots holding something else."""
+        params = self._gxpo_params
+        if skip is not None:
+            for i, (p, buf) in enumerate(zip(params, bufs)):
+                if skip[i]:
+                    continue           # slot holds u0 for the update-space path
+                if p.grad is None:
+                    buf.zero_()
+                else:
+                    buf.copy_(p.grad)
+            return
+        grads = [p.grad for p in params]
         if all(grad is not None for grad in grads):
             torch._foreach_copy_(bufs, grads)
             return
@@ -757,8 +1335,15 @@ class DataParallelPPOActor(BasePPOActor):
         warmup, GXPO still updates its rolling baseline but cannot trip the shutoff gate.
         """
         state = self.gxpo_state
+        force_all_steps = bool(self.config.get('gxpo_force_all_steps', False))
+        if force_all_steps:
+            # Force mode is an explicit ablation: never honor a statistical
+            # shutoff or the hard active-step budget during this run.
+            state.trigger_index = float('inf')
+            state.budget_stop = None
         step_idx = state.step_count
         K, alpha, delta = state.K, state.alpha, state.delta
+        min_eff = self.gxpo_min_effective_multiplier
         recompute_old = self.config.get('gxpo_recompute_old_log_probs', False)
         skip_corrective = self.config.get('gxpo_skip_corrective', False)
 
@@ -784,56 +1369,114 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_init_buffers()
         params = self._gxpo_params
         theta0, g0_bufs, g1_bufs = (self._gxpo_bufs[k] for k in ('theta0', 'g0', 'g1'))
+        update_space = self._gxpo_update_space_mask()
 
         with torch.no_grad():
             self._gxpo_copy_parameters(theta0, [p.data for p in params])
 
-        def fallback():
-            # ponytail: light fallback — restore theta0 only; probe-step optimizer-moment
-            # pollution is accepted (rare non-finite event), no optimizer-state deepcopy
+        flag_device = torch.device('cuda', torch.cuda.current_device())
+        optimizer_transaction = snapshot_optimizer_state(self.actor_optimizer)
+
+        def restore_probe_state():
             self._gxpo_restore_theta0()
+            optimizer_transaction.restore()
+
+        def probe_optimizer_step():
+            try:
+                self.actor_optimizer.step()
+            except BaseException:
+                restore_probe_state()
+                raise
+
+        def probe_clip_grads():
+            try:
+                return self._clip_grads()
+            except BaseException:
+                restore_probe_state()
+                raise
+
+        def fallback():
+            # A failed probe must not leak either its parameters or optimizer state.
+            restore_probe_state()
             self.actor_optimizer.zero_grad(set_to_none=True)
             return standard_step(fallback_triggered=True)
 
         # Pass 1: g0 at theta0. Keep its loss metrics (actor/entropy_loss etc.) — the skip-corrective
         # ablation has no Pass 3 to source them from, and ray_trainer reads actor/entropy_loss every step.
-        probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                 non_tensor_select_keys, collect_metrics=skip_corrective)
+        try:
+            probe_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                     non_tensor_select_keys, collect_metrics=skip_corrective)
+        except BaseException:
+            restore_probe_state()
+            raise
         # Capture raw gradients for the retention ratio; clip only the optimizer step.
         self._gxpo_capture_grads(g0_bufs)
         step_start = time.perf_counter()
-        gn0 = self._clip_grads().detach().item()
+        gn0 = probe_clip_grads().detach().item()
+        clip_scale_g0 = min(1.0, float(self.config.get('grad_clip', 1.0)) / (abs(gn0) + 1e-12))
         valid_gn0 = (gn0 == gn0 and abs(gn0) != float('inf') and gn0 > 1e-8)
-        if valid_gn0:
-            self.actor_optimizer.step()
+        valid_gn0_global = self._all_ranks_flag(valid_gn0, flag_device)
+        if valid_gn0_global:
+            self._cast_optimizer_grads_to_param_dtype()
+            probe_optimizer_step()
+            self._gxpo_validate_precision_contract()
         self._gxpo_power_guard(step_start)
-        if not valid_gn0:
+        if not valid_gn0_global:
             return fallback()
 
+        # u0 = theta1 - theta0, the first real optimizer step, written into the
+        # g1 slot of each Muon-owned parameter (see _gxpo_init_buffers). Done in
+        # place via copy-then-subtract so no full-size temporary is materialized.
+        if update_space is not None:
+            with torch.no_grad():
+                for i, use in enumerate(update_space):
+                    if use:
+                        g1_bufs[i].copy_(params[i].data)
+                        g1_bufs[i].sub_(theta0[i])
+
         # Pass 2: g1 at theta_{t,1}
-        self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                 non_tensor_select_keys, recompute_old_log_probs=recompute_old,
-                                 collect_metrics=False)
+        try:
+            self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                     non_tensor_select_keys, recompute_old_log_probs=recompute_old,
+                                     collect_metrics=False)
+        except BaseException:
+            restore_probe_state()
+            raise
         # Capture raw gradients before clipping, matching g0.
-        self._gxpo_capture_grads(g1_bufs)
+        self._gxpo_capture_grads(g1_bufs, skip=update_space)
         step_start = time.perf_counter()
-        gn1 = self._clip_grads().detach().item()
+        gn1 = probe_clip_grads().detach().item()
+        clip_scale_g1 = min(1.0, float(self.config.get('grad_clip', 1.0)) / (abs(gn1) + 1e-12))
         valid_gn1 = (gn1 == gn1 and abs(gn1) != float('inf'))
-        if valid_gn1:
-            self.actor_optimizer.step()
+        valid_gn1_global = self._all_ranks_flag(valid_gn1, flag_device)
+        if valid_gn1_global:
+            self._cast_optimizer_grads_to_param_dtype()
+            probe_optimizer_step()
         self._gxpo_power_guard(step_start)
-        if not valid_gn1:
+        if not valid_gn1_global:
             return fallback()
 
         # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
         device = theta0[0].device
         # stats layout: [g0_sq, g1_sq, dot_g0_g1, disp2_sq, dispK_sq, sum_r, sum_r_sq,
-        #                n_active, n_total, scale_sum, errK_sq, dot_ce, closed_sq, explicit_sq, ratio_clipped]
+        #                n_active, n_total, scale_sum, errK_sq, dot_ce, closed_sq, explicit_sq,
+        #                ratio_clipped, eff_sum, n_grad_coords, g0_sq_grad_only]
+        # n_total (index 8) counts every coordinate and is the denominator for the
+        # scale/effective-multiplier means. The r-ratio diagnostics (sum_r, n_active,
+        # ratio_clipped, dot_g0_g1) exist only for parameters that actually took the
+        # gradient-space path, so they are normalized by n_grad_coords (index 16)
+        # and paired with g0_sq_grad_only (index 17) instead. Muon-owned parameters
+        # have no g1 -- their slot holds u0 -- and no meaningful g1/g0 ratio.
         # These values are diagnostics only. FP64 widening of every model-sized gradient
         # buffer made each GXPO step perform several extra full-model reads and reductions.
         # FP32 accumulation is sufficient for the reported metrics and does not feed the
         # retention scale, reposition, optimizer, or shutoff decision.
-        stats = torch.zeros(15, dtype=torch.float32, device=device)
+        stats = torch.zeros(18, dtype=torch.float32, device=device)
+        # Update-space aggregates are reported separately from the coordinatewise
+        # ones: folding a per-matrix scalar into retention_mean/scale_mean would
+        # silently make runs on the two paths incomparable.
+        upd_stats = torch.zeros(3, dtype=torch.float32, device=device)  # [rho_sum, scale_sum, n_neg]
+        n_update_space = 0
         scale_max = torch.zeros(1, dtype=torch.float32, device=device)
         param_sq = torch.zeros(1, dtype=torch.float32, device=device)
         do_diag = self._gxpo_diag_freq > 0 and (step_idx % self._gxpo_diag_freq == 0)
@@ -848,32 +1491,93 @@ class DataParallelPPOActor(BasePPOActor):
                 for i in range(0, len(g0_bufs), _GXPO_NORM_CHUNK):
                     j = i + _GXPO_NORM_CHUNK
                     stats[0] += torch.stack(torch._foreach_norm(g0_bufs[i:j])).square().sum()
-                    stats[1] += torch.stack(torch._foreach_norm(g1_bufs[i:j])).square().sum()
+                    # stats[1] (g1_sq) is NOT batched here any more: a Muon-owned
+                    # parameter's g1 slot holds u0, a displacement, and folding
+                    # that into a gradient norm would be meaningless. It is
+                    # accumulated in the gradient-space branch of the loop below.
                     param_sq += torch.stack(torch._foreach_norm(theta0[i:j])).square().sum()
                     torch.cuda.synchronize()
 
+            global_g0_rms = (
+                self._gxpo_global_g0_rms(g0_bufs)
+                if self._gxpo_fsdp_invariant_threshold else [None] * len(g0_bufs)
+            )
+            # Collective for the update-space path: must be reached by every rank
+            # unconditionally, so it sits outside the per-parameter loop.
+            update_dots = (
+                self._gxpo_update_space_dots(params, theta0, g1_bufs, update_space)
+                if update_space is not None else None
+            )
             _p2_sync_every = max(1, _GXPO_NORM_CHUNK)
-            for _p2_i, (p, t0, g0b, g1b) in enumerate(zip(params, theta0, g0_bufs, g1_bufs)):
+            for _p2_i, (p, t0, g0b, g1b, g0_rms) in enumerate(
+                    zip(params, theta0, g0_bufs, g1_bufs, global_g0_rms)):
                 if _p2_i and _p2_i % _p2_sync_every == 0:
                     torch.cuda.synchronize()
-                # ---- ALGORITHMIC PATH: retention scale + reposition write stay
-                # ---- op-for-op identical to the previous per-parameter loop.
-                r, scale, active, ratio_clipped = compute_gxpo_retention_scale(g0b, g1b, K, delta)
-                stats[2] += (g0b * g1b).sum()
-                stats[7] += active.sum()
+                # ---- ALGORITHMIC PATH: retention scale + reposition write.
+                # ---- Grad-level precision: g0/g1 buffers inherit param dtype
+                # ---- via empty_like. The r = g1/g0 ratio, K-step Horner sums,
+                # ---- and displacement math run transiently in FP32 (required
+                # ---- resolution at grad magnitudes ~1e-4..1e-2 with a 1e-8
+                # ---- activity gate); the write-back casts to param dtype.
+                # ---- Under FP32 params these float() calls are no-ops.
+                is_update_space = update_dots is not None and _p2_i in update_dots
+                if is_update_space:
+                    # Muon-owned matrix: gradient ratios say nothing about its
+                    # displacement (its step size is gradient-magnitude
+                    # invariant), so read retention off the two real optimizer
+                    # steps instead, as a scalar that leaves disp2's direction --
+                    # the orthogonalized direction Muon chose -- intact.
+                    #
+                    # compute_gxpo_retention_scale is deliberately NOT called
+                    # here. Its result was previously computed and thrown away,
+                    # which cost a dozen full-size FP32 temporaries per matrix
+                    # for a ratio we proved carries no signal for Muon. g1b holds
+                    # u0 for these parameters, so calling it would be wrong now
+                    # as well as wasteful.
+                    rho_u, scale = compute_gxpo_update_retention_scale(
+                        None, None, K, delta, dots=update_dots[_p2_i])
+                    upd_stats[0] += rho_u
+                    upd_stats[1] += scale
+                    upd_stats[2] += (rho_u < 0).float()
+                    n_update_space += 1
+                else:
+                    # ---- Grad-level precision: g0/g1 buffers inherit param dtype
+                    # ---- via empty_like. The r = g1/g0 ratio, K-step Horner sums,
+                    # ---- and displacement math run transiently in FP32 (required
+                    # ---- resolution at grad magnitudes ~1e-4..1e-2 with a 1e-8
+                    # ---- activity gate); the write-back casts to param dtype.
+                    # ---- Under FP32 params these float() calls are no-ops.
+                    g0f = g0b.float()
+                    g1f = g1b.float()
+                    r, scale, active, ratio_clipped = compute_gxpo_retention_scale(
+                        g0f, g1f, K, delta, clip_scale_g0=clip_scale_g0,
+                        clip_scale_g1=clip_scale_g1, g0_rms=g0_rms)
+                    stats[1] += g1f.square().sum()
+                    stats[2] += (g0f * g1f).sum()
+                    stats[5] += r.sum()
+                    stats[6] += r.square().sum()
+                    stats[7] += active.sum()
+                    stats[14] += ratio_clipped.sum()
+                    stats[16] += g0b.numel()
+                    stats[17] += g0f.square().sum()
                 stats[8] += g0b.numel()
-                stats[14] += ratio_clipped.sum()
-                stats[9] += scale.float().sum()
-                scale_max = torch.maximum(scale_max, scale.float().amax().reshape(1))
+                # scale_mean/effective_multiplier are coordinate-weighted means
+                # (they divide by stats[8], a coordinate count). The update-space
+                # path produces ONE scalar for the whole matrix, so it must be
+                # weighted by numel here or it contributes 1/numel of its due and
+                # drags the reported mean far below the true multiplier.
+                scale_weight = g0b.numel() if scale.numel() == 1 else 1
+                stats[9] += scale.float().sum() * scale_weight
+                if scale.numel():
+                    scale_max = torch.maximum(scale_max, scale.float().amax().reshape(1))
 
-                stats[5] += r.sum()
-                stats[6] += r.square().sum()
-
-                disp2 = p.data - t0
+                disp2 = p.data.float() - t0.float()
                 stats[3] += disp2.square().sum()
 
-                if do_diag:
-                    # Table 6: closed-form S_K/S_2 vs explicit Horner sums
+                if do_diag and not is_update_space:
+                    # Table 6: closed-form S_K/S_2 vs explicit Horner sums.
+                    # Gradient-space only: this compares two ways of evaluating
+                    # S_K(r)/S_2(r), and the update-space path has no r.
                     s_expl = torch.ones_like(r)
                     for _ in range(K - 1):
                         s_expl.mul_(r).add_(1.0)
@@ -886,21 +1590,47 @@ class DataParallelPPOActor(BasePPOActor):
                     stats[12] += d_closed.square().sum()
                     stats[13] += d_expl.square().sum()
 
-                dispK = disp2.mul_(scale)  # disp2 buffer becomes dispK
+                dispK = disp2 * scale  # out-of-place: keeps the FP32 chain exact
                 stats[4] += dispK.square().sum()
-                p.data.copy_(dispK.mul_(alpha).add_(t0))
+                # alpha*scale is the multiplier actually applied to (theta2-theta0).
+                # Out-of-place so the diagnostic scale above stays untouched.
+                eff = scale * alpha
+                if min_eff > 0.0:
+                    eff.clamp_(min=min_eff)
+                stats[15] += eff.sum() * scale_weight
+                # Write-back casts FP32 -> param dtype. t0 is widened first:
+                # in-place add_ rejects a mixed-dtype tensor argument.
+                p.data.copy_(disp2.mul_(eff).add_(t0.float()))
         self._gxpo_power_guard(diagnostic_start)
 
         # Pass 3: slow correction at theta_tilde. Skipped for the no-corrective ablation, where the
         # reposition above IS the update (params already sit at theta_tilde, nothing more to do).
+        # Optimizer state across the two probe steps. Either way theta_tilde stands:
+        #   'transactional'            -- the fast trajectory was only a probe, so every
+        #                                 probe-driven optimizer mutation is rolled back and
+        #                                 the slow correction is taken from the moments (and
+        #                                 step counter) the minibatch started with.
+        #   'transactional_fast_state' -- no refresh: the two probe steps' moments and step
+        #                                 counter are kept, and the slow correction is taken
+        #                                 from them. Adam's step counter therefore advances
+        #                                 3x per minibatch here, not 1x.
+        # The snapshot taken before probe 1 stays live in both modes: it is the failure-path
+        # rollback used by restore_probe_state() when a pass goes non-finite.
+        if self.gxpo_optimizer_state_mode == 'transactional':
+            optimizer_transaction.restore()
+
         if skip_corrective:
             pass3_metrics = probe_metrics  # reuse g0-probe loss metrics; no Pass 3 exists here
             gn_slow = gn1  # report the last real probe norm; no corrective grad exists
             gslow_stats = torch.zeros(2, dtype=torch.float32, device=device)
         else:
-            pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
-                                                     non_tensor_select_keys, recompute_old_log_probs=recompute_old,
-                                                     collect_metrics=True)
+            try:
+                pass3_metrics = self._backward_minibatch(mini_batch, temperature, has_multi_modal_inputs, select_keys,
+                                                         non_tensor_select_keys, recompute_old_log_probs=recompute_old,
+                                                         collect_metrics=True)
+            except BaseException:
+                restore_probe_state()
+                raise
             append_to_dict(pass3_metrics, self._optimizer_state_metrics())
             # Capture corrective-gradient diagnostics before clipping, matching g0/g1.
             # _clip_grads() returns the pre-clip norm but mutates p.grad in place.
@@ -914,12 +1644,14 @@ class DataParallelPPOActor(BasePPOActor):
                     gslow_stats[0] += gradf.square().sum()
                     gslow_stats[1] += (gradf * g0f).sum()
             step_start = time.perf_counter()
-            gn_slow = self._clip_grads().detach().item()
+            gn_slow = probe_clip_grads().detach().item()
             valid_gn_slow = (gn_slow == gn_slow and abs(gn_slow) != float('inf'))
-            if valid_gn_slow:
-                self.actor_optimizer.step()
+            valid_gn_slow_global = self._all_ranks_flag(valid_gn_slow, flag_device)
+            if valid_gn_slow_global:
+                self._cast_optimizer_grads_to_param_dtype()
+                probe_optimizer_step()
             self._gxpo_power_guard(step_start)
-            if not valid_gn_slow:
+            if not valid_gn_slow_global:
                 return fallback()
 
         # single global reduction so every rank takes the identical gate decision
@@ -928,18 +1660,45 @@ class DataParallelPPOActor(BasePPOActor):
             torch.distributed.all_reduce(full, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(scale_max, op=torch.distributed.ReduceOp.MAX)
             torch.distributed.all_reduce(param_sq, op=torch.distributed.ReduceOp.SUM)
-            stats, gslow_stats = full[:15], full[15:]
+            stats, gslow_stats = full[:stats.numel()], full[stats.numel():]
         param_norm = float(param_sq.sqrt().item())
+
+        upd_rho_sum, upd_scale_sum, upd_n_neg = upd_stats.tolist()
+        _upd_denom = max(n_update_space, 1)
+        upd_rho_mean = upd_rho_sum / _upd_denom
+        upd_scale_mean = upd_scale_sum / _upd_denom
+        upd_neg_frac = upd_n_neg / _upd_denom
 
         vals = torch.cat([stats, gslow_stats, scale_max]).tolist()
         (g0_sq, g1_sq, dot01, disp2_sq, dispK_sq, sum_r, sum_r_sq, n_active, n_total, scale_sum,
-         errK_sq, dot_ce, closed_sq, explicit_sq, ratio_clipped, gslow_sq, dot0slow, scale_mx) = vals
+         errK_sq, dot_ce, closed_sq, explicit_sq, ratio_clipped, eff_sum, n_grad_coords,
+         g0_sq_grad_only, gslow_sq, dot0slow, scale_mx) = vals
 
         eps = 1e-12
         g0_norm, g1_norm, gslow_norm = g0_sq**0.5, g1_sq**0.5, gslow_sq**0.5
-        r_mean = sum_r / max(n_total, 1.0)
-        r_var = max(sum_r_sq / max(n_total, 1.0) - r_mean**2, 0.0)
+        # The r-ratio family is normalized over the coordinates that actually
+        # took the gradient-space path. Under Muon with retention_space=auto that
+        # is the AdamW-owned parameters only; n_grad_coords == n_total whenever no
+        # parameter uses the update-space path, so pure-AdamW runs are unchanged.
+        grad_coords = max(n_grad_coords, 1.0)
+        r_mean = sum_r / grad_coords
+        r_var = max(sum_r_sq / grad_coords - r_mean**2, 0.0)
         disp2_norm, dispK_norm = disp2_sq**0.5, dispK_sq**0.5
+
+        # Contraction guard: alpha*scale < 1 means theta_tilde landed between theta0 and
+        # theta2, so the 3-pass update made less progress than the two probe steps it paid
+        # for. Warn once rather than let it pass silently.
+        eff_mean = eff_sum / max(n_total, 1.0)
+        if eff_mean < 1.0 and not self._gxpo_contraction_warned:
+            self._gxpo_contraction_warned = True
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                print(f'[GXPO] WARNING: effective displacement multiplier '
+                      f'alpha*scale={eff_mean:.4f} < 1 (alpha={alpha}, '
+                      f'scale_mean={scale_sum / max(n_total, 1.0):.4f}, K={K}, '
+                      f'r_mean={r_mean:.4f}). theta_tilde lands SHORT of theta2: the '
+                      f'3-pass update is contracting, not extrapolating. Raise gxpo_alpha '
+                      f'or lower gxpo_k; set gxpo_min_effective_multiplier=1.0 to clamp.',
+                      flush=True)
 
         # Cosine gate mode (F1): the observation is |cos(g0, gslow)| computed from the
         # PRE-clip probe/corrective gradients -- a direct measurement of whether the
@@ -992,15 +1751,35 @@ class DataParallelPPOActor(BasePPOActor):
             'actor/gxpo_r_mean': r_mean,
             'actor/gxpo_r_std': r_var**0.5,
             'actor/gxpo_scale_mean': scale_sum / max(n_total, 1.0),
+            # alpha*scale as actually applied (post-clamp): >1 extrapolates past theta2,
+            # <1 contracts back toward theta0. Watch this, not scale_mean.
+            'actor/gxpo_effective_multiplier': eff_mean,
+            'actor/gxpo_contracting': 1.0 if eff_mean < 1.0 else 0.0,
             'actor/gxpo_scale_max': scale_mx,
             'actor/gxpo_disp2_norm': disp2_norm,
             'actor/gxpo_dispK_norm': dispK_norm,
             'actor/gxpo_dispK_over_disp2': dispK_norm / (disp2_norm + eps),
-            'actor/gxpo_cos_g0_g1': dot01 / (g0_norm * g1_norm + eps),
+            # Both sides restricted to gradient-space parameters: g1 does not
+            # exist for the others (their slot holds u0).
+            'actor/gxpo_cos_g0_g1': dot01 / (g0_sq_grad_only**0.5 * g1_norm + eps),
             'actor/gxpo_cos_g0_gslow': dot0slow / (g0_norm * gslow_norm + eps),
-            'actor/gxpo_inactive_frac': 1.0 - n_active / max(n_total, 1.0),
+            'actor/gxpo_inactive_frac': 1.0 - n_active / grad_coords,
             'actor/gxpo_ratio_clip_frac': ratio_clipped / max(n_active, 1.0),
+            'actor/gxpo_clip_scale_g0': float(clip_scale_g0),
+            'actor/gxpo_clip_scale_g1': float(clip_scale_g1),
+            # Fraction of coordinates rejected by the RMS-relative activity gate
+            # (threshold 1e-3 * RMS); same population as inactive_frac, reported
+            # under the retention-stability name.
+            'actor/gxpo_relative_threshold_reject_frac': 1.0 - n_active / grad_coords,
             'actor/gxpo_fallback_triggered': 0.0,
+            # Update-space path (Muon-owned matrices). Reported separately from
+            # the coordinatewise retention_mean/scale_mean above so runs on the
+            # two estimators stay comparable. n_update_space=0 on a pure
+            # gradient-space run, where these read zero.
+            'actor/gxpo_update_space_params': float(n_update_space),
+            'actor/gxpo_retention_rho_mean': upd_rho_mean,
+            'actor/gxpo_update_scale_mean': upd_scale_mean,
+            'actor/gxpo_retention_rho_negative_frac': upd_neg_frac,
             'reposition/jump_norm': abs(alpha) * dispK_norm,
             'reposition/jump_relative_to_param_norm': abs(alpha) * dispK_norm / (param_norm + eps),
         })
@@ -1024,6 +1803,7 @@ class DataParallelPPOActor(BasePPOActor):
         shutoff gate is open, single-pass GRPO afterwards."""
         assert self.gxpo_state is not None, 'update_policy_gxpo called without use_gxpo=True'
         self.actor_module.train()
+        self._ensure_fsdp_gradient_sync()
         bp_start = self.cumulative_bp
         raw_backward_start = self.raw_backward_calls
         self._gxpo_power_guard_active_s = 0.0
@@ -1035,10 +1815,17 @@ class DataParallelPPOActor(BasePPOActor):
         # huge z-score that permanently trips the shutoff gate on a fluke rather than a real
         # divergence. Skip extrapolation for this step only; the gate's rolling baseline is left untouched
         # since a degenerate batch was never a valid observation of the gate's trigger statistic.
+        # The on-policy math reward is binary: both malformed and incorrect
+        # responses are intentionally scored 0.  Therefore zero-reward mass
+        # cannot be used as a format-error detector; doing so would disable
+        # GXPO on nearly every batch.  Keep the legacy guard opt-in for tasks
+        # that still have a separate format reward.
+        reward_binary = bool(self.config.get('gxpo_binary_reward', False))
         format_error_ratio = (data.batch['token_level_scores'].sum(-1) == 0).float().mean().item()
+        format_skip_enabled = bool(self.config.get('gxpo_format_error_skip_enabled', False)) and not reward_binary
         force_standard = (
-            format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5)
-            or trigger_stop
+            (format_skip_enabled and format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5))
+            or (trigger_stop and not force_all_steps)
         )
 
         temperature = data.meta_info['temperature']  # temperature must be in the data.meta_info to avoid slient error
@@ -1122,6 +1909,10 @@ class DataParallelPPOActor(BasePPOActor):
         if isinstance(enabled_values, list):
             enabled_values = sum(enabled_values) / len(enabled_values) if enabled_values else 0.0
         metrics['actor/gxpo_prediction_active'] = float(enabled_values)
+        # Mirrors train/gxpo_optim_state_kept on the SFT arm: 0 = probe optimizer
+        # mutations rolled back (transactional), 1 = kept (transactional_fast_state).
+        metrics['actor/gxpo_optim_state_kept'] = (
+            0.0 if self.gxpo_optimizer_state_mode == 'transactional' else 1.0)
         metrics['actor/gxpo_trigger_warmup_active'] = float(not trigger_enabled)
         metrics['actor/gxpo_trigger_patience'] = float(self.gxpo_state.trigger_patience)
         metrics['actor/gxpo_fallback_step'] = (

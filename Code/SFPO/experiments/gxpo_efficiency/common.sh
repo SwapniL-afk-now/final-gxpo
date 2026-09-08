@@ -10,12 +10,44 @@ cd "$REPO_ROOT"
 # Make every launch reproducible from a fresh tmux shell.  The base image's
 # venv is not automatically activated, and FA3/dependency wheels are kept in
 # user-writable workspace paths on this unprivileged instance.
+# This checkout (final-gxpo) has never had its own .venv provisioned on this
+# host -- the working one lives in the sibling final-gxpo-h200 checkout. Try
+# this checkout's own venv first (so a future provision here wins silently),
+# then fall back to the known-working sibling.
 GXPO_PROJECT_ROOT="$(cd -- "$REPO_ROOT/../.." && pwd)"
-if [[ -x "$GXPO_PROJECT_ROOT/.venv/bin/python" ]]; then
-  export VIRTUAL_ENV="$GXPO_PROJECT_ROOT/.venv"
-  export PATH="$GXPO_PROJECT_ROOT/.venv/bin:$PATH"
-fi
-export PYTHONPATH="$REPO_ROOT/.runtime_deps:${PYTHONPATH:-}"
+for _gxpo_venv in "$GXPO_PROJECT_ROOT/.venv" "/office/dev_workspace/swapnil/final-gxpo-h200/.venv"; do
+  if [[ -x "$_gxpo_venv/bin/python" ]]; then
+    export VIRTUAL_ENV="$_gxpo_venv"
+    export PATH="$_gxpo_venv/bin:$PATH"
+    # This host has no system /usr/local/cuda and no bare `nvcc` on PATH; the
+    # only nvcc is the one the venv's nvidia-cuda-nvcc wheel unpacked into
+    # site-packages. flashinfer's JIT compiler (used by the vLLM rollout
+    # engine's FLASHINFER attention backend) needs CUDA_HOME to find it --
+    # without this it fails at the first uncached kernel shape with
+    # "Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist".
+    for _gxpo_cuda_home in "$_gxpo_venv"/lib/python*/site-packages/nvidia/cu13; do
+      if [[ -x "$_gxpo_cuda_home/bin/nvcc" ]]; then
+        export CUDA_HOME="$_gxpo_cuda_home"
+        # The pip nvidia-cuda-nvcc wheel ships only lib/ (no lib64) and only
+        # versioned .so.N files (no unversioned dev symlinks), so linking
+        # (-lcudart) and loading (dlopen) both fail against it out of the box;
+        # lib64 and the libcudart.so symlink are created once as a one-time
+        # environment fixup (see gxpo-efficiency-flashinfer-jit-toolchain memory).
+        # This also covers the runtime dlopen, which needs the .so found via
+        # LD_LIBRARY_PATH, not just the link-time -L flag.
+        export LD_LIBRARY_PATH="$_gxpo_cuda_home/lib:${LD_LIBRARY_PATH:-}"
+        break
+      fi
+    done
+    unset _gxpo_cuda_home
+    break
+  fi
+done
+unset _gxpo_venv
+# .runtime_deps is an optional extra-wheels shim (not present on this host);
+# REPO_ROOT itself must always be on PYTHONPATH since that's where the verl
+# package this launcher imports (`-m verl.trainer.main_ppo`) actually lives.
+export PYTHONPATH="$REPO_ROOT/.runtime_deps:$REPO_ROOT:${PYTHONPATH:-}"
 export HF_HOME="${HF_HOME:-$REPO_ROOT/.hf_home}"
 # A system-provided HF_HOME can exist but still be unwritable by the training
 # user.  Fall back to the repository cache instead of failing inside Ray's
@@ -53,21 +85,108 @@ GXPO_WARMUP_STEPS="${GXPO_WARMUP_STEPS:-50}"
 GXPO_TAU="${GXPO_TAU:-3.0}"
 GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
 GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-3}"
+# GXPO optimizer state across the two probe steps. Parameters are repositioned to
+# theta_tilde in both modes; only the optimizer state the slow correction starts from
+# differs:
+#   transactional            -- snapshot the optimizer state before probe 1 and roll back
+#                               to it after repositioning, so the slow correction is taken
+#                               from the moments the minibatch started with.
+#   transactional_fast_state -- no refresh: the probe steps' moments and step counter are
+#                               kept and the slow correction is taken from them, so Adam's
+#                               step counter advances 3x per minibatch instead of 1x.
+# OPT_STATE_TAG is appended to RUN_NAME below so the two arms never share a run dir or
+# wandb run; transactional is left untagged because it is the established baseline.
+GXPO_OPTIMIZER_STATE_MODE="${GXPO_OPTIMIZER_STATE_MODE:-transactional}"
+case "$GXPO_OPTIMIZER_STATE_MODE" in
+  transactional)            OPT_STATE_TAG="" ;;
+  transactional_fast_state) OPT_STATE_TAG="_optkeep" ;;
+  *) echo "PREFLIGHT FAIL: GXPO_OPTIMIZER_STATE_MODE must be transactional or transactional_fast_state, got '$GXPO_OPTIMIZER_STATE_MODE'" >&2; exit 2 ;;
+esac
+# Which space the retention ratio is measured in.
+#   auto   -- update-space (per-matrix scalar, read off the two real optimizer
+#             steps) for Muon-owned matrices, gradient-space elsewhere. Under
+#             AdamW no parameter is Muon-owned, so auto == grad.
+#   grad   -- force the coordinatewise g1/g0 estimator everywhere (A/B control).
+#   update -- force update-space everywhere.
+# Gradient ratios are meaningless for Muon: it normalizes the momentum matrix
+# before Newton-Schulz and scales the write-back by parameter shape alone, so
+# its step size does not depend on gradient magnitude at all.
+GXPO_RETENTION_SPACE="${GXPO_RETENTION_SPACE:-auto}"
+case "$GXPO_RETENTION_SPACE" in
+  auto|grad|update) ;;
+  *) echo "PREFLIGHT FAIL: GXPO_RETENTION_SPACE must be auto, grad or update, got '$GXPO_RETENTION_SPACE'" >&2; exit 2 ;;
+esac
 GXPO_FALLBACK_MODE="${GXPO_FALLBACK_MODE:-permanent}"
 GXPO_FALLBACK_WINDOW="${GXPO_FALLBACK_WINDOW:-10}"
 GXPO_ACTOR_DUTY_CYCLE="${GXPO_ACTOR_DUTY_CYCLE:-0}"
 GXPO_DIAG_FREQ="${GXPO_DIAG_FREQ:-10}"
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+# OOM fix: the gxpo_efficiency chain was missing the allocator setting the KD
+# launchers already carry (qwen25_math_1p5b_onpolicy_kd_gxpo.sh and friends).
+# Symptom here: vLLM generation died asking for 1.64GB with 94.60/94.97 GiB in
+# use, while ~11.5GB per GPU sat in reserved-but-unusable segments (reserved
+# 134.7GB vs allocated 111.8GB summed over both GPUs). Capping the split size
+# keeps blocks >=128MB intact so large contiguous requests can be served.
+# expandable_segments is NOT usable: vLLM's CuMemAllocator hard-crashes on it
+# at engine init (see the comment in the KD launchers).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128}"
 SFPO_ZSCORE_THRESHOLD="${SFPO_ZSCORE_THRESHOLD:-2.5}"
 SFPO_TRIGGER_PATIENCE="${SFPO_TRIGGER_PATIENCE:-3}"
 SFPO_RESET_ENTROPY_AFTER_WARMUP="${SFPO_RESET_ENTROPY_AFTER_WARMUP:-True}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
+# Pre-generation curriculum filter (verl/trainer/ppo/presampling_selector.py): skips
+# prompts the model has already solved recently ("easy") and, with decreasing
+# probability the longer they've stayed unsolved, ones it keeps failing ("hard") --
+# BEFORE generating for them, which is where the wall-clock savings actually come
+# from (skipped prompts never pay for a rollout+reward+backward pass at all).
+# Off by default -- preserves existing behavior for every entrypoint in this matrix
+# that doesn't opt in.
+GXPO_DYNAMIC_FILTERING="${GXPO_DYNAMIC_FILTERING:-False}"
+# dynamic_filtering_strategy=linear_backoff is broken upstream: presampling_selector.py's
+# filter_examples_linear_backoff() calls hard_linear_backoff_skip() without its required
+# `k` argument, so it raises TypeError on the first example it evaluates as a hard-skip
+# candidate. all_probabilistic is the only strategy that's actually wired end to end
+# (self.p_easy/self.p_hard init'd from config, adaptively tuned every epoch, logged to
+# examples/p_easy and examples/p_hard); keep_all is a documented no-op passthrough.
+GXPO_DYNAMIC_FILTERING_STRATEGY="${GXPO_DYNAMIC_FILTERING_STRATEGY:-all_probabilistic}"
+case "$GXPO_DYNAMIC_FILTERING_STRATEGY" in
+  linear_backoff)
+    echo "PREFLIGHT FAIL: GXPO_DYNAMIC_FILTERING_STRATEGY=linear_backoff is broken upstream" >&2
+    echo "  (filter_examples_linear_backoff -> hard_linear_backoff_skip() missing its" >&2
+    echo "  required k argument; TypeError on the first hard-skip candidate). Use" >&2
+    echo "  all_probabilistic or keep_all instead." >&2
+    exit 2
+    ;;
+  all_probabilistic|keep_all) ;;
+  *)
+    echo "PREFLIGHT FAIL: GXPO_DYNAMIC_FILTERING_STRATEGY must be all_probabilistic or" >&2
+    echo "  keep_all, got '$GXPO_DYNAMIC_FILTERING_STRATEGY'" >&2
+    exit 2
+    ;;
+esac
+# Initial skip probabilities for the all_probabilistic strategy; these are the
+# class methods' own default arguments (easy_probabilistic_skip/hard_probabilistic_skip
+# in presampling_selector.py) and self-tune every epoch after that via p_easy/p_hard.
+GXPO_P_EASY="${GXPO_P_EASY:-0.75}"
+GXPO_P_HARD="${GXPO_P_HARD:-0.5}"
+GXPO_TARGET_ZERO_VARIANCE="${GXPO_TARGET_ZERO_VARIANCE:-0.25}"
+# Prompts accumulate across dataloader pulls (skipping filtered ones) until this many
+# survive, then get trimmed to exactly this count -- so the trained batch size stays
+# fixed at TRAIN_BATCH_SIZE regardless of how much the filter skips, instead of shrinking
+# unpredictably. Must match TRAIN_BATCH_SIZE for that guarantee to hold.
+GXPO_SAMPLING_BATCH_SIZE="${GXPO_SAMPLING_BATCH_SIZE:-$TRAIN_BATCH_SIZE}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-128}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-3072}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 LR="${LR:-1e-6}"
+OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
+MUON_MOMENTUM="${MUON_MOMENTUM:-0.95}"
+MUON_NS_STEPS="${MUON_NS_STEPS:-5}"
+MUON_NESTEROV="${MUON_NESTEROV:-True}"
+MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-1e-2}"
+MUON_DISTRIBUTED_BACKEND="${MUON_DISTRIBUTED_BACKEND:-gather_scatter}"
 USE_LIGER="${USE_LIGER:-True}"
 OPTIM_FUSED="${OPTIM_FUSED:-False}"
 ENABLE_GRADIENT_CHECKPOINTING="${ENABLE_GRADIENT_CHECKPOINTING:-True}"
@@ -120,6 +239,17 @@ fi
 RUN_NAME="${GXPO_RUN_NAME:-${MODEL_ALIAS}_${METHOD}${METHOD:+_}$( [[ "$METHOD" == grpo ]] && echo "" || echo "k${K}_" )seed${TRAIN_SEED}}"
 # Remove the accidental doubled separator for GRPO while keeping names explicit.
 RUN_NAME="${RUN_NAME//__/_}"
+# Tag the no-refresh optimizer-state arm. Applied after the name is resolved so it holds
+# however RUN_NAME was derived, and guarded so re-entering common.sh cannot double-tag.
+if [[ -n "$OPT_STATE_TAG" && "$RUN_NAME" != *"$OPT_STATE_TAG" ]]; then
+  RUN_NAME="${RUN_NAME}${OPT_STATE_TAG}"
+fi
+# Tag runs with the pre-generation filter on, same guard pattern as OPT_STATE_TAG above --
+# this is a methodology change (fewer/different prompts trained on per step), so it must
+# get its own wandb run rather than resuming a pre-fix run's id/history.
+if [[ "${GXPO_DYNAMIC_FILTERING,,}" == "true" && "$RUN_NAME" != *_dynfilt ]]; then
+  RUN_NAME="${RUN_NAME}_dynfilt"
+fi
 RESULT_ROOT="${GXPO_RESULTS_ROOT:-$REPO_ROOT/results/gxpo_efficiency}"
 RUN_DIR="$RESULT_ROOT/$RUN_NAME"
 mkdir -p "$RUN_DIR"
@@ -186,6 +316,24 @@ TRAIN_FILES="['$DAPO_TRAIN','$LIGHTEVAL_TRAIN']"
 VAL_FILES="['$MATH500','$AIME24','$AIME25','$AMC23','$MINERVA','$OLYMPIAD']"
 
 METHOD_FLAGS=()
+OPTIMIZER_FLAGS=()
+case "${OPTIMIZER_NAME,,}" in
+  adamw)
+    ;;
+  muon)
+    OPTIMIZER_FLAGS+=(
+      +actor_rollout_ref.actor.optim.muon_momentum="$MUON_MOMENTUM"
+      +actor_rollout_ref.actor.optim.muon_ns_steps="$MUON_NS_STEPS"
+      +actor_rollout_ref.actor.optim.muon_nesterov="$MUON_NESTEROV"
+      +actor_rollout_ref.actor.optim.weight_decay="$MUON_WEIGHT_DECAY"
+      +actor_rollout_ref.actor.optim.muon_distributed_backend="$MUON_DISTRIBUTED_BACKEND"
+    )
+    ;;
+  *)
+    echo "Unsupported OPTIMIZER_NAME=$OPTIMIZER_NAME (expected adamw or muon)" >&2
+    exit 2
+    ;;
+esac
 # Gate v2 (opt-in; see .audit/gxpo_algorithm_findings.md):
 #   GXPO_TRIGGER_ROBUST=1   -> median/MAD z-score (resists early-warmup transient bursts)
 #   GXPO_TRIGGER_MIN_OBS=N  -> gate cannot trip until N scored post-warmup observations
@@ -225,6 +373,9 @@ esac
 if [[ -n "${GXPO_TRIGGER_SUSTAIN_W:-}" ]]; then
   METHOD_FLAGS+=(+actor_rollout_ref.actor.gxpo_trigger_sustain_w="$GXPO_TRIGGER_SUSTAIN_W")
 fi
+if [[ -n "${GXPO_RELATIVE_THRESHOLD:-}" ]]; then
+  METHOD_FLAGS+=(+actor_rollout_ref.actor.gxpo_relative_threshold="$GXPO_RELATIVE_THRESHOLD")
+fi
 
 case "$METHOD" in
   grpo)
@@ -245,6 +396,8 @@ case "$METHOD" in
   gxpo)
     METHOD_FLAGS+=(
       +actor_rollout_ref.actor.use_gxpo=True
+      # GXPO owns its trigger; disable the legacy trainer-side SFPO entropy gate.
+      +actor_rollout_ref.actor.zscore_w=0
       +actor_rollout_ref.actor.gxpo_k="$K"
       +actor_rollout_ref.actor.gxpo_alpha="$REPOSITION_ALPHA"
       +actor_rollout_ref.actor.gxpo_delta=1e-8
@@ -253,6 +406,8 @@ case "$METHOD" in
       +actor_rollout_ref.actor.gxpo_trigger_signal="$GXPO_TRIGGER_SIGNAL"
       +actor_rollout_ref.actor.gxpo_trigger_patience="$GXPO_TRIGGER_PATIENCE"
       +actor_rollout_ref.actor.gxpo_fallback_mode="$GXPO_FALLBACK_MODE"
+      +actor_rollout_ref.actor.gxpo_optimizer_state_mode="$GXPO_OPTIMIZER_STATE_MODE"
+      +actor_rollout_ref.actor.gxpo_retention_space="$GXPO_RETENTION_SPACE"
       +actor_rollout_ref.actor.gxpo_fallback_window="$GXPO_FALLBACK_WINDOW"
       +actor_rollout_ref.actor.gxpo_trigger_granularity=outer
       +actor_rollout_ref.actor.gxpo_warmup_steps="$GXPO_WARMUP_STEPS"
@@ -290,6 +445,13 @@ gxpo_tau=$GXPO_TAU
 gxpo_zscore_w=$GXPO_ZSCORE_W
 gxpo_trigger_signal=$GXPO_TRIGGER_SIGNAL
 gxpo_shutoff_mode=$GXPO_SHUTOFF_MODE
+gxpo_optimizer_state_mode=$GXPO_OPTIMIZER_STATE_MODE
+optimizer=$OPTIMIZER_NAME
+muon_momentum=$MUON_MOMENTUM
+muon_ns_steps=$MUON_NS_STEPS
+muon_nesterov=$MUON_NESTEROV
+muon_weight_decay=$MUON_WEIGHT_DECAY
+muon_distributed_backend=$MUON_DISTRIBUTED_BACKEND
 gxpo_trigger_robust=${GXPO_TRIGGER_ROBUST:-0}
 gxpo_trigger_min_obs=${GXPO_TRIGGER_MIN_OBS:-0}
 gxpo_max_active_steps=${GXPO_MAX_ACTIVE_STEPS:-0}
@@ -299,6 +461,7 @@ gxpo_fallback_window=$GXPO_FALLBACK_WINDOW
 gxpo_actor_duty_cycle=$GXPO_ACTOR_DUTY_CYCLE
 gxpo_diag_freq=$GXPO_DIAG_FREQ
 gxpo_trigger_granularity=outer
+dynamic_filtering=$GXPO_DYNAMIC_FILTERING (strategy=$GXPO_DYNAMIC_FILTERING_STRATEGY, p_easy=$GXPO_P_EASY, p_hard=$GXPO_P_HARD, target_zero_variance=$GXPO_TARGET_ZERO_VARIANCE, sampling_batch_size=$GXPO_SAMPLING_BATCH_SIZE)
 validation_interval=5
 validation_decoding=greedy temperature=0 do_sample=false n=1
 final_decoding=stochastic temperature=1.0 top_p=0.7 do_sample=true n=4 seeds=$FINAL_EVAL_SEEDS
@@ -316,6 +479,12 @@ python -u -m verl.trainer.main_ppo \
   data.val_files="$VAL_FILES" \
   data.train_batch_size="$TRAIN_BATCH_SIZE" \
   data.val_batch_size="$VAL_BATCH_SIZE" \
+  +data.dynamic_filtering="$GXPO_DYNAMIC_FILTERING" \
+  +data.dynamic_filtering_strategy="$GXPO_DYNAMIC_FILTERING_STRATEGY" \
+  +data.p_easy="$GXPO_P_EASY" \
+  +data.p_hard="$GXPO_P_HARD" \
+  +data.target_zero_variance="$GXPO_TARGET_ZERO_VARIANCE" \
+  +data.sampling_batch_size="$GXPO_SAMPLING_BATCH_SIZE" \
   data.max_prompt_length=1024 \
   data.max_response_length="$MAX_RESPONSE_LENGTH" \
   data.filter_overlong_prompts=True \
@@ -328,7 +497,8 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.model.attn_implementation="$ATTN_IMPL" \
   +actor_rollout_ref.model.use_liger="$USE_LIGER" \
   actor_rollout_ref.actor.optim.lr="$LR" \
-  +actor_rollout_ref.actor.optim.name=adamw \
+  +actor_rollout_ref.actor.optim.name="$OPTIMIZER_NAME" \
+  "${OPTIMIZER_FLAGS[@]}" \
   +actor_rollout_ref.actor.optim.fused="$OPTIM_FUSED" \
   actor_rollout_ref.actor.use_torch_compile="$USE_TORCH_COMPILE" \
   +actor_rollout_ref.actor.data_loader_seed="$TRAIN_SEED" \
