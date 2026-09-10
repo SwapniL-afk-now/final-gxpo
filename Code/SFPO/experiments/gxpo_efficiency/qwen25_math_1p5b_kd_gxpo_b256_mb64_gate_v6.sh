@@ -108,6 +108,28 @@ case "$GXPO_OPTIMIZER_STATE_MODE" in
   *) echo "PREFLIGHT FAIL: GXPO_OPTIMIZER_STATE_MODE must be transactional or transactional_fast_state, got '$GXPO_OPTIMIZER_STATE_MODE'" >&2; exit 2 ;;
 esac
 
+# Which space the retention ratio is measured in. GXPO models OPTIMIZER-induced
+# motion, and this trainer's optimizer is always AdamW -- which does NOT move the
+# parameters along the gradient, it moves them along m_hat/(sqrt(v_hat)+eps).
+#   auto -- optimizer-aware: r = d1/d0, the ratio of the two adaptive directions
+#           AdamW actually applied, reconstructed from the real probe
+#           displacements as d_t = ((1 - lr*wd)*theta_t - theta_{t+1})/lr. That
+#           inversion carries AdamW's moments, bias correction, epsilon
+#           convention and the CLIPPED gradient it really consumed.
+#   grad -- legacy raw-gradient r = g1/g0. This is what every pre-existing
+#           GXPO-SFT/KD run used, and it is the A/B control arm.
+# 'update' is the per-matrix Muon estimator and is rejected here: there is no
+# Muon-owned matrix in an AdamW KD run. See GXPO_OPTIMIZER_AWARE_RETENTION.md.
+# The trainer itself still defaults to grad, so this launcher is the explicit
+# opt-in; RETENTION_TAG below keeps the two arms on separate run identities.
+GXPO_RETENTION_SPACE="${GXPO_RETENTION_SPACE:-auto}"
+case "$GXPO_RETENTION_SPACE" in
+  auto)   RETENTION_TAG="_adamwdir" ;;
+  grad)   RETENTION_TAG="" ;;
+  update) echo "PREFLIGHT FAIL: GXPO_RETENTION_SPACE=update is the Muon per-matrix estimator and is not supported by the AdamW SFT/KD trainer; use auto or grad" >&2; exit 2 ;;
+  *) echo "PREFLIGHT FAIL: GXPO_RETENTION_SPACE must be auto or grad, got '$GXPO_RETENTION_SPACE'" >&2; exit 2 ;;
+esac
+
 export STUDENT_MODEL="${STUDENT_MODEL:-$REPO_ROOT/models/Qwen2.5-1.5B-Instruct}"
 export TEACHER_MODEL="${TEACHER_MODEL:-$REPO_ROOT/models/Qwen2.5-Math-7B-Instruct}"
 export KD_DATA_ROOT="${KD_DATA_ROOT:-$SFPO_ROOT/data/kd}"
@@ -133,6 +155,11 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 # Keep the no-refresh arm in its own run dir / wandb run.
 if [[ -n "$OPT_STATE_TAG" && "$GXPO_RUN_NAME" != *"$OPT_STATE_TAG" ]]; then
   export GXPO_RUN_NAME="${GXPO_RUN_NAME}${OPT_STATE_TAG}"
+fi
+# Same guard for the retention estimator: 'auto' is a different algorithm from the
+# raw-gradient runs already on disk, so it must not inherit their run identity.
+if [[ -n "$RETENTION_TAG" && "$GXPO_RUN_NAME" != *"$RETENTION_TAG"* ]]; then
+  export GXPO_RUN_NAME="${GXPO_RUN_NAME}${RETENTION_TAG}"
 fi
 RUN_DIR="$REPO_ROOT/results/gxpo_efficiency/$GXPO_RUN_NAME"
 
@@ -257,6 +284,7 @@ exec "$PYTHON_BIN" -m torch.distributed.run --nproc_per_node=2 -m verl.trainer.k
   +optim.gxpo_shutoff_mode="$GXPO_SHUTOFF_MODE" \
   +optim.gxpo_warmup="$GXPO_WARMUP_STEPS" \
   +optim.gxpo_optimizer_state_mode="$GXPO_OPTIMIZER_STATE_MODE" \
+  +optim.gxpo_retention_space="$GXPO_RETENTION_SPACE" \
   trainer.default_local_dir="$RUN_DIR" \
   trainer.project_name="$WANDB_PROJECT" \
   trainer.experiment_name="$GXPO_RUN_NAME" \

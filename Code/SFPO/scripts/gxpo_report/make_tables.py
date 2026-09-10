@@ -149,16 +149,30 @@ def table7(manifest, out_dir):
         a = met[met['actor/gxpo_enabled'] > 0.5]
         if a.empty:
             continue
+        # A column is simply absent when the estimator that defines it never
+        # ran -- an 'auto' AdamW run has no actor/gxpo_g1_norm or _r_mean at
+        # all, because its g1 slot holds u0 rather than a gradient. Report the
+        # family that WAS measured, and NaN (not 0) for one that was not.
+        def med(*columns):
+            for column in columns:
+                if column in a.columns and a[column].notna().any():
+                    return a[column].median()
+            return float('nan')
+
         rows.append({
             'k': run['k'], 'Policy passes': 3,
-            'Med. active ||g0||': a['actor/gxpo_g0_norm'].median(),
-            'Med. active ||g1||': a['actor/gxpo_g1_norm'].median(),
-            'Med. active ||gslow||': a['actor/gxpo_gslow_norm'].median(),
-            'Med. cos(g0,gslow)': a['actor/gxpo_cos_g0_gslow'].median(),
-            'Retention ratio': f"{a['actor/gxpo_r_mean'].median():.3f} ± {a['actor/gxpo_r_std'].median():.3f}",
-            '||dK||/||d2||': a['actor/gxpo_dispK_over_disp2'].median(),
-            'Scale mean': a['actor/gxpo_scale_mean'].median(),
-            'Inactive frac': a['actor/gxpo_inactive_frac'].median(),
+            'Med. active ||g0||': med('actor/gxpo_g0_norm'),
+            'Med. active ||g1||': med('actor/gxpo_g1_norm', 'actor/gxpo_adamw_d1_norm'),
+            'Med. active ||gslow||': med('actor/gxpo_gslow_norm'),
+            'Med. cos(g0,gslow)': med('actor/gxpo_cos_g0_gslow'),
+            'Retention ratio':
+                f"{med('actor/gxpo_r_mean', 'actor/gxpo_adamw_r_mean'):.3f} ± "
+                f"{med('actor/gxpo_r_std', 'actor/gxpo_adamw_r_std'):.3f}",
+            '||dK||/||d2||': med('actor/gxpo_dispK_over_disp2'),
+            'Scale mean': med('actor/gxpo_scale_mean'),
+            'Inactive frac': med('actor/gxpo_inactive_frac',
+                                 'actor/gxpo_adamw_inactive_frac'),
+            'Retention kind': med('actor/gxpo_retention_kind'),
         })
     write_table(pd.DataFrame(rows).sort_values('k'), out_dir, 'table7_active_phase',
                 float_format='%.4g')

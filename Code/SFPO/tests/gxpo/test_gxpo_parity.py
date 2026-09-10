@@ -637,11 +637,13 @@ def test_update_space_dots_may_be_supplied_precomputed():
 def test_gxpo_allocates_exactly_three_model_sized_buffers():
     """Memory invariant: GXPO keeps three model-shard buffers, never four.
 
-    The update-space estimator needs u0 = theta1 - theta0, but a fourth buffer
-    is a whole extra copy of the model per rank (~3GB at 1.5B, ~6GB at 3B) in a
-    run that already sat at 94.6 of 94.97 GiB. Muon-owned parameters therefore
-    store u0 in their g1 slot, which is dead weight for them: g1 exists only to
-    form r = g1/g0, the ratio this fix showed is uninformative for Muon.
+    Both optimizer-aware estimators need u0 = theta1 - theta0, but a fourth
+    buffer is a whole extra copy of the model per rank (~3GB at 1.5B, ~6GB at 3B)
+    in a run that already sat at 94.6 of 94.97 GiB. Muon-owned and
+    AdamW-direction parameters therefore store u0 in their g1 slot, which is dead
+    weight for them: g1 exists only to form r = g1/g0, the ratio that describes
+    neither Muon's displacement nor AdamW's adaptive step. The AdamW path
+    recovers theta1 = theta0 + u0 from that slot to form d0 and d1.
     """
     source = ACTOR_PATH.read_text()
     tree = ast.parse(source)
@@ -655,7 +657,7 @@ def test_gxpo_allocates_exactly_three_model_sized_buffers():
     assert 'theta1' not in code_only, (
         'a fourth model-sized buffer must not be allocated')
     # The g1 slot is repurposed, so its gradient capture must be skippable.
-    assert 'skip=update_space' in source
+    assert 'skip=u0_slots' in source
     # ...and the shutoff gate must correlate the corrective gradient against g0,
     # never g1: a Muon-owned parameter's g1 slot holds u0, not a gradient.
     assert 'gslow_stats[1] += (gradf * g0f).sum()' in source, (
@@ -702,7 +704,7 @@ def test_actor_routes_muon_params_to_update_space():
     """Wiring: the actor must branch on Muon ownership, not apply one estimator."""
     source = ACTOR_PATH.read_text()
     assert 'compute_gxpo_update_retention_scale' in source
-    assert "get('use_muon', False)" in source, 'Muon ownership must come from the optimizer'
+    assert "get('use_muon', None)" in source, 'Muon ownership must come from the optimizer'
     assert 'gxpo_retention_space' in source
     # The shard-reducing collective must sit outside the per-parameter loop so
     # every rank reaches it the same number of times.
@@ -717,3 +719,84 @@ if __name__ == '__main__':
             fn()
             print(f'PASS {name}')
     print('ALL GXPO PRODUCTION CHECKS PASSED')
+
+
+# --------------------------------------------------------------------------
+# Metric honesty (RL arm)
+# --------------------------------------------------------------------------
+
+def _actor_step_body():
+    source = ACTOR_PATH.read_text()
+    step = next(node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef) and node.name == '_gxpo_minibatch_step')
+    return ast.get_source_segment(source, step)
+
+
+def test_actor_undefined_metric_families_are_omitted_not_zeroed():
+    body = _actor_step_body()
+    for guard, keys in (
+            ('if has_grad:', ('actor/gxpo_g1_norm', 'actor/gxpo_r_mean',
+                              'actor/gxpo_r_std', 'actor/gxpo_cos_g0_g1',
+                              'actor/gxpo_inactive_frac', 'actor/gxpo_ratio_clip_frac',
+                              'actor/gxpo_clip_scale_g1',
+                              'actor/gxpo_relative_threshold_reject_frac')),
+            ('if has_muon:', ('actor/gxpo_retention_rho_mean',
+                              'actor/gxpo_update_scale_mean',
+                              'actor/gxpo_retention_rho_negative_frac')),
+            ('if has_adamw:', ('actor/gxpo_adamw_r_mean', 'actor/gxpo_adamw_r_std',
+                               'actor/gxpo_adamw_scale_mean',
+                               'actor/gxpo_adamw_scale_max',
+                               'actor/gxpo_adamw_inactive_frac',
+                               'actor/gxpo_adamw_ratio_clip_frac',
+                               'actor/gxpo_adamw_d0_norm', 'actor/gxpo_adamw_d1_norm',
+                               'actor/gxpo_adamw_cos_d0_d1'))):
+        assert guard in body, guard
+        for key in keys:
+            assert key in body, key
+            assert body.index(key) > body.index(guard), f'{key} must be gated on {guard}'
+
+
+def test_actor_default_metrics_carry_no_retention_measurement():
+    """A fallback step measured no retention. Zero-filling made it
+    indistinguishable in wandb from a real step whose retention was zero."""
+    source = ACTOR_PATH.read_text()
+    default = next(node for node in ast.walk(ast.parse(source))
+                   if isinstance(node, ast.FunctionDef)
+                   and node.name == '_gxpo_default_metrics')
+    body = ast.get_source_segment(source, default)
+    for banned in ('g0_norm', 'g1_norm', 'r_mean', 'r_std', 'scale_mean', 'scale_max',
+                   'disp2_norm', 'dispK_norm', 'cos_g0_g1', 'inactive_frac',
+                   'ratio_clip_frac', 'rho_mean', 'adamw_'):
+        assert banned not in body, banned
+    for kept in ('actor/gxpo_enabled', 'actor/gxpo_trigger_z',
+                 'actor/gxpo_trigger_stat', 'actor/gxpo_trigger_streak'):
+        assert kept in body, kept
+
+
+def test_actor_always_logs_a_retention_kind_census():
+    body = _actor_step_body()
+    for key in ('actor/gxpo_retention_kind', 'actor/gxpo_legacy_grad_params',
+                'actor/gxpo_update_space_params', 'actor/gxpo_adamw_direction_params'):
+        assert key in body, key
+        assert body.index(key) < body.index('if has_grad:'), f'{key} must be unconditional'
+
+
+def test_report_scripts_do_not_refill_absent_retention_with_zero():
+    repo = ACTOR_PATH.parents[3]
+    figures = (repo / 'scripts' / 'gxpo_report' / 'make_figures.py').read_text()
+    assert 'fillna(0.0)' not in figures
+    tables = (repo / 'scripts' / 'gxpo_report' / 'make_tables.py').read_text()
+    # The table falls back to the family that WAS measured rather than KeyError-ing
+    # or reporting a zero for one that never ran.
+    assert "med('actor/gxpo_r_mean', 'actor/gxpo_adamw_r_mean')" in tables
+
+
+def test_gxpo_actor_fallback_defines_force_all_steps_in_outer_scope():
+    """A trigger must fall back to standard updates instead of raising NameError."""
+    source = ACTOR_PATH.read_text()
+    tree = ast.parse(source)
+    update = next(node for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef) and node.name == 'update_policy_gxpo')
+    update_source = ast.get_source_segment(source, update)
+    assert "force_all_steps = bool(self.config.get('gxpo_force_all_steps', False))" in update_source
+    assert '(trigger_stop and not force_all_steps)' in update_source

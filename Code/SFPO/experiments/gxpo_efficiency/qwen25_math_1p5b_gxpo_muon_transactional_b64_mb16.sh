@@ -2,9 +2,8 @@
 #
 # qwen25_math_1p5b_gxpo_muon_transactional_b64_mb16.sh
 #
-# Complete entrypoint: Qwen2.5-Math-1.5B-Instruct | GXPO + Muon | batch 64 |
-# minibatch 16 | K=10 | alpha=0.3 | 2 GPUs (Blackwell 6000 Pro class, FSDP 2)
-# driven by the z-score cosine-disagreement trigger.
+# Complete entrypoint: Qwen2.5-Math-1.5B-Instruct | GXPO + Muon | batch 256 |
+# minibatch 64 | K=3 | alpha=0.8 | GPUs 1,2 (FSDP 2), entropy trigger.
 #
 # Optimizer-state mode: TRANSACTIONAL -- probe optimizer moments are
 # snapshotted before the two probe steps and rolled back after repositioning,
@@ -13,15 +12,14 @@
 # qwen25_math_1p5b_gxpo_muon_faststate_b64_mb16.sh, which keeps the probe
 # steps' moments instead (Adam's step counter then advances 3x per minibatch).
 #
-# Gate configuration - ORDINARY Z-SCORE PROFILE:
-#   signal    : grad (actor-side; disagreement = 1 - |cos(g0, g_slow)| from pre-clip grads)
-#   trigger   : ordinary mean/std z-score of disagreement >= 2.0,
-#               held for 2 consecutive scored batches
-#   history   : preceding 30 disagreement observations (ABS_THRESHOLD=0 selects z-path)
+# Gate configuration - ENTROPY PROFILE:
+#   signal    : entropy
+#   trigger   : ordinary mean/std z-score of the entropy signal >= 3.0,
+#               held for 3 consecutive scored batches
+#   history   : preceding 50 observations
 #   budget    : hard stop after 150 enabled steps regardless of gate (runtime cap)
 #
-# Optimizer: Muon (gather-scatter backend under FSDP) instead of AdamW; every
-# optimizer choice stays overridable via OPTIMIZER_NAME=adamw|muon.
+# Optimizer: Muon with the FSDP gather-scatter backend.
 #
 # Usage:
 #   bash qwen25_math_1p5b_gxpo_muon_transactional_b64_mb16.sh            # launch
@@ -49,21 +47,28 @@ fi
 # ------------------------------------------------------------ gate config ----
 # Experiment settings owned by this entrypoint.  The downstream common.sh chain
 # must preserve these inherited values instead of overriding them.
-export K="${K:-10}"
-export REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.3}"
-export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
-export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
-export GPU_IDS="${GPU_IDS:-0,1}"
-export GPU_COUNT="${GPU_COUNT:-2}"
-export FSDP_SIZE="${FSDP_SIZE:-2}"
+export K="3"
+export REPOSITION_ALPHA="0.8"
+export TRAIN_BATCH_SIZE="256"
+export PPO_MINI_BATCH_SIZE="64"
+export GPU_IDS="1,2"
+export GPU_COUNT="2"
+export FSDP_SIZE="2"
 
 # Optimizer selection: Muon with the FSDP gather-scatter backend.
-export OPTIMIZER_NAME="${OPTIMIZER_NAME:-muon}"
+export OPTIMIZER_NAME="muon"
 export MUON_MOMENTUM="${MUON_MOMENTUM:-0.95}"
 export MUON_NS_STEPS="${MUON_NS_STEPS:-5}"
 export MUON_NESTEROV="${MUON_NESTEROV:-True}"
 export MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-1e-2}"
 export MUON_DISTRIBUTED_BACKEND="${MUON_DISTRIBUTED_BACKEND:-gather_scatter}"
+
+# KL is fully disabled: no actor KL loss, no reward KL penalty, and no
+# reference-policy worker/log-prob computation (common.sh/main_ppo enforce this
+# when these switches and the KL coefficient are all zero).
+export USE_KL_LOSS="False"
+export KL_LOSS_COEF="0.0"
+export FINAL_EVAL_ENABLED="False"
 
 # Transactional GXPO: probe optimizer moments are snapshotted and restored, so
 # the two probe steps never pollute the moments of the slow correction step.
@@ -72,23 +77,23 @@ export GXPO_OPTIMIZER_STATE_MODE="transactional"
 # Retention is read off the two real optimizer steps (per-matrix scalar) for
 # Muon-owned matrices; gradient ratios cannot describe Muon's displacement,
 # because its step size is independent of gradient magnitude. Set
-# GXPO_RETENTION_SPACE=grad to reproduce the pre-fix arm.
-export GXPO_RETENTION_SPACE="${GXPO_RETENTION_SPACE:-auto}"
+# The optimizer-aware Muon update-space estimator is pinned for this run.
+export GXPO_RETENTION_SPACE="auto"
 
-# Actor-side prediction-quality gate (z-score path: ABS_THRESHOLD=0).
-export GXPO_TRIGGER_SIGNAL="${GXPO_TRIGGER_SIGNAL:-grad}"
-export GXPO_SHUTOFF_MODE="${GXPO_SHUTOFF_MODE:-cosine}"
-export GXPO_TRIGGER_ABS_THRESHOLD="${GXPO_TRIGGER_ABS_THRESHOLD:-0}"
-export GXPO_TRIGGER_SUSTAIN_W="${GXPO_TRIGGER_SUSTAIN_W:-10}"
+# Actor-side entropy gate (z-score path: ABS_THRESHOLD=0).
+export GXPO_TRIGGER_SIGNAL="entropy"
+export GXPO_SHUTOFF_MODE="trajectory_aware"
+export GXPO_TRIGGER_ABS_THRESHOLD="0"
+export GXPO_TRIGGER_SUSTAIN_W="10"
 # Ordinary mean/std z-score; robust median/MAD is intentionally disabled.
-export GXPO_TRIGGER_ROBUST="${GXPO_TRIGGER_ROBUST:-0}"
-export GXPO_TAU="${GXPO_TAU:-2.0}"
-export GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
-export GXPO_TRIGGER_MIN_OBS="${GXPO_TRIGGER_MIN_OBS:-0}"
-export GXPO_MAX_ACTIVE_STEPS="${GXPO_MAX_ACTIVE_STEPS:-150}"
-export GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-2}"
-export GXPO_WARMUP_STEPS="${GXPO_WARMUP_STEPS:-0}"
-export GXPO_RESET_ENTROPY_AFTER_WARMUP="${GXPO_RESET_ENTROPY_AFTER_WARMUP:-False}"
+export GXPO_TRIGGER_ROBUST="0"
+export GXPO_TAU="3.0"
+export GXPO_ZSCORE_W="50"
+export GXPO_TRIGGER_MIN_OBS="0"
+export GXPO_MAX_ACTIVE_STEPS="150"
+export GXPO_TRIGGER_PATIENCE="3"
+export GXPO_WARMUP_STEPS="0"
+export GXPO_RESET_ENTROPY_AFTER_WARMUP="False"
 
 # Memory profile proven on this host for 1.5B GXPO (see qwen25_math_1p5b_gxpo_b256_a05.sh).
 # Muon state (momentum only) is smaller than AdamW's, so this is conservative.
@@ -98,7 +103,21 @@ export LOG_PROB_MICRO_BATCH_SIZE="${LOG_PROB_MICRO_BATCH_SIZE:-8}"
 export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-1024}"
 export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-98304}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
-export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.7}"
+# 0.7 left this run at ~97.1 of 97.9 GB per GPU during generation and it OOM'd
+# in vLLM's MLP activation asking for 1.64GB. GXPO is not an ordinary RL actor:
+# on top of params/grads/optimizer it keeps three model-sized buffers
+# (theta0/g0/g1) resident for the whole step, ~9.3GB per rank at 1.5B and
+# ~19.3GB at 3B. 0.6 matches what the 3B launchers already use and leaves real
+# headroom instead of relying on the run staying under the line.
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.6}"
+
+# System-RAM profile for the rule-based verifier. Each scorer is a spawned
+# interpreter that re-imports the trainer's __main__, so it carries torch:
+# measured 698MB RSS / 367MB private each. reward_fn and val_reward_fn used to
+# hold separate 64-wide pools -> 128 workers, ~49GB of host RAM resident for the
+# whole run. naive.py now shares one pool; this pins its width so the box's core
+# count can never silently set it again.
+export REWARD_NUM_WORKERS="${REWARD_NUM_WORKERS:-16}"
 
 # ------------------------------------------------------------- preflight -----
 MISSING=0
@@ -143,16 +162,17 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   repo_root          : $REPO_ROOT
   model              : $MODEL_DIR
   data_root          : $DATA_ROOT
-  method             : gxpo + ${OPTIMIZER_NAME:-muon} (K=${K:-10}, alpha=${REPOSITION_ALPHA:-0.3})
-  batch / minibatch  : ${TRAIN_BATCH_SIZE:-64} / ${PPO_MINI_BATCH_SIZE:-16}
-  gpus               : ${GPU_COUNT:-2}  (ids ${GPU_IDS:-0,1}, FSDP_SIZE=${FSDP_SIZE:-2})
+  method             : gxpo + ${OPTIMIZER_NAME:-muon} (K=${K:-3}, alpha=${REPOSITION_ALPHA:-0.8})
+  batch / minibatch  : ${TRAIN_BATCH_SIZE:-256} / ${PPO_MINI_BATCH_SIZE:-64}
+  gpus               : ${GPU_COUNT:-2}  (ids ${GPU_IDS:-1,2}, FSDP_SIZE=${FSDP_SIZE:-2})
   max_steps          : ${MAX_STEPS:-400}   save_freq ${SAVE_FREQ:-20}
   optimizer          : ${OPTIMIZER_NAME:-muon} (momentum ${MUON_MOMENTUM:-0.95}, NS ${MUON_NS_STEPS:-5}, backend ${MUON_DISTRIBUTED_BACKEND:-gather_scatter})
   optimizer_state    : $GXPO_OPTIMIZER_STATE_MODE
   retention_space    : $GXPO_RETENTION_SPACE      (auto = update-space for Muon matrices)
+  kl loss            : $USE_KL_LOSS (coefficient $KL_LOSS_COEF)
   attention          : train ${ATTN_IMPL:-flash_attention_2} | vllm ${VLLM_ATTENTION_BACKEND:-FLASHINFER}
-  --- gate: ordinary z-score (abs=0) ---
-  trigger_signal     : $GXPO_TRIGGER_SIGNAL      (must not be 'entropy')
+  --- gate: entropy z-score (abs=0) ---
+  trigger_signal     : $GXPO_TRIGGER_SIGNAL
   shutoff_mode       : $GXPO_SHUTOFF_MODE
   tau / patience     : $GXPO_TAU / $GXPO_TRIGGER_PATIENCE
   robust statistic   : $GXPO_TRIGGER_ROBUST      (0 = ordinary mean/std)

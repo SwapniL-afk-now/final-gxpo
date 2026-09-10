@@ -51,6 +51,7 @@ GPU_UTIL="${EVAL_GPU_UTIL:-0.85}"
 MAX_TOKENS="${EVAL_RESPONSE_LENGTH:-3072}"
 MAX_MODEL_LEN="${EVAL_MAX_MODEL_LEN:-4096}"
 MAX_NUM_SEQS="${EVAL_MAX_NUM_SEQS:-256}"
+MAX_NUM_BATCHED_TOKENS="${EVAL_MAX_NUM_BATCHED_TOKENS:-65536}"
 
 missing=0
 for required in "$MATH500" "$AIME24" "$AIME25" "$AMC23" "$MINERVA" "$OLYMPIAD"; do
@@ -73,6 +74,30 @@ mkdir -p "$OUT"
 SKIP_GREEDY_FLAG=()
 if [[ "${SFT_VLLM_EVAL_SKIP_GREEDY:-0}" == "1" ]]; then
   SKIP_GREEDY_FLAG+=(--skip-greedy)
+fi
+
+if [[ "$GPU" == *,* ]]; then
+  # Independent TP=1 workers let every listed GPU evaluate concurrently.
+  PYTHONPATH="$CODE" python -u tools/kd_sft/evaluate_greedy.py \
+      --checkpoint-dir "$CKPT" \
+      --base-model "${EVAL_BASE_MODEL:-$CKPT}" \
+      --data-files "$MATH500" "$AIME24" "$AIME25" "$AMC23" "$MINERVA" "$OLYMPIAD" \
+      --seed "${SEEDS%%,*}" \
+      --n "$N" \
+      --temperature "$TEMP" \
+      --top-p "$TOP_P" \
+      --max-tokens "$MAX_TOKENS" \
+      --tp 1 \
+      --gpu-devices "$GPU" \
+      --gpu-memory-utilization "$GPU_UTIL" \
+      --max-model-len "$MAX_MODEL_LEN" \
+      --max-num-seqs "$MAX_NUM_SEQS" \
+      --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
+      --attention-backend "${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}" \
+      --sft-output-dir "$OUT" \
+      --output "$OUT/eval_pass${N}_6bench.json" \
+      2>&1 | tee "$OUT/eval.log"
+  exit
 fi
 
 PYTHONPATH="$CODE" python -u train-scripts/eval_sft_ckpt_vllm.py \

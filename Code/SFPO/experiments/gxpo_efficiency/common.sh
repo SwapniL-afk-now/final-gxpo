@@ -44,6 +44,21 @@ for _gxpo_venv in "$GXPO_PROJECT_ROOT/.venv" "/office/dev_workspace/swapnil/fina
   fi
 done
 unset _gxpo_venv
+# Triton JIT-compiles a small C launcher shim for every kernel it builds, and that
+# shim does `#include <Python.h>`. The venv's interpreter is the system python3.12
+# (sys.base_prefix=/usr), so sysconfig points Triton at /usr/include/python3.12 --
+# which does not exist here, since python3.12-dev is not installed and this user
+# cannot install it. gcc also searches CPATH, so pointing that at a copy of the
+# 3.12 headers is enough. Same fix the KD launchers in this directory already
+# carry (qwen25_3b_onpolicy_kd.sh:71); it belongs here so every RL entrypoint that
+# sources common.sh gets it instead of dying at the first uncached kernel.
+GXPO_PY_INCLUDE="${GXPO_PY_INCLUDE:-/office/shared_cache/.local/share/uv/python/cpython-3.12.14-linux-x86_64-gnu/include/python3.12}"
+if [[ -f "$GXPO_PY_INCLUDE/Python.h" ]]; then
+  export CPATH="$GXPO_PY_INCLUDE${CPATH:+:$CPATH}"
+else
+  echo "PREFLIGHT WARN: no Python.h at $GXPO_PY_INCLUDE; Triton kernel compilation" >&2
+  echo "                 will fail. Set GXPO_PY_INCLUDE to a python3.12 include dir." >&2
+fi
 # .runtime_deps is an optional extra-wheels shim (not present on this host);
 # REPO_ROOT itself must always be on PYTHONPATH since that's where the verl
 # package this launcher imports (`-m verl.trainer.main_ppo`) actually lives.
@@ -102,15 +117,23 @@ case "$GXPO_OPTIMIZER_STATE_MODE" in
   transactional_fast_state) OPT_STATE_TAG="_optkeep" ;;
   *) echo "PREFLIGHT FAIL: GXPO_OPTIMIZER_STATE_MODE must be transactional or transactional_fast_state, got '$GXPO_OPTIMIZER_STATE_MODE'" >&2; exit 2 ;;
 esac
-# Which space the retention ratio is measured in.
-#   auto   -- update-space (per-matrix scalar, read off the two real optimizer
-#             steps) for Muon-owned matrices, gradient-space elsewhere. Under
-#             AdamW no parameter is Muon-owned, so auto == grad.
-#   grad   -- force the coordinatewise g1/g0 estimator everywhere (A/B control).
+# Which space the retention ratio is measured in. GXPO models OPTIMIZER-induced
+# motion, so the right estimator is a property of the optimizer:
+#   auto   -- optimizer-aware. Muon-owned matrices use update-space (per-matrix
+#             scalar rho = <u0,u1>/<u0,u0>, read off the two real optimizer
+#             steps); AdamW-owned parameters use the coordinatewise AdamW
+#             optimizer-DIRECTION ratio r = d1/d0, where d_t is reconstructed
+#             from the real probe displacement as (c*theta_t - theta_{t+1})/lr
+#             with c = 1 - lr*weight_decay. An unrecognized optimizer falls back
+#             to gradient space with a warning rather than being modelled wrong.
+#   grad   -- force the legacy coordinatewise g1/g0 estimator everywhere. This is
+#             the pre-optimizer-aware AdamW behavior and the A/B control arm.
 #   update -- force update-space everywhere.
 # Gradient ratios are meaningless for Muon: it normalizes the momentum matrix
 # before Newton-Schulz and scales the write-back by parameter shape alone, so
-# its step size does not depend on gradient magnitude at all.
+# its step size does not depend on gradient magnitude at all. For AdamW they are
+# merely an approximation -- AdamW moves along m_hat/(sqrt(v_hat)+eps), not along
+# the gradient, so g1/g0 systematically overstates a gradient jump.
 GXPO_RETENTION_SPACE="${GXPO_RETENTION_SPACE:-auto}"
 case "$GXPO_RETENTION_SPACE" in
   auto|grad|update) ;;
@@ -182,6 +205,8 @@ SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 LR="${LR:-1e-6}"
 OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
+USE_KL_LOSS="${USE_KL_LOSS:-False}"
+KL_LOSS_COEF="${KL_LOSS_COEF:-0.0}"
 MUON_MOMENTUM="${MUON_MOMENTUM:-0.95}"
 MUON_NS_STEPS="${MUON_NS_STEPS:-5}"
 MUON_NESTEROV="${MUON_NESTEROV:-True}"
@@ -199,6 +224,7 @@ TRAINER_RESUME_MODE="${TRAINER_RESUME_MODE:-auto}"
 TRAINER_RESUME_FROM_PATH="${TRAINER_RESUME_FROM_PATH:-False}"
 GPU_COUNT="${GPU_COUNT:-${N_GPUS:-1}}"
 PROJECT="${WANDB_PROJECT:-gxpo-efficiency-final}"
+FINAL_EVAL_ENABLED="${FINAL_EVAL_ENABLED:-True}"
 
 if [[ -z "${MODEL_ALIAS:-}" || -z "${MODEL_ID:-}" || -z "${METHOD:-}" ]]; then
   echo "common.sh requires MODEL_ALIAS, MODEL_ID, and METHOD" >&2
@@ -243,6 +269,26 @@ RUN_NAME="${RUN_NAME//__/_}"
 # however RUN_NAME was derived, and guarded so re-entering common.sh cannot double-tag.
 if [[ -n "$OPT_STATE_TAG" && "$RUN_NAME" != *"$OPT_STATE_TAG" ]]; then
   RUN_NAME="${RUN_NAME}${OPT_STATE_TAG}"
+fi
+# Tag the retention estimator whenever it is NOT what the run name has historically
+# meant, so a new estimator can never resume an old run's wandb id, checkpoints or
+# result directory (trainer.resume_mode=auto would otherwise splice new metrics into
+# an old raw-gradient run). Same guard pattern as OPT_STATE_TAG.
+#   adamw + auto   -> _adamwdir : NEW. auto used to be a no-op under AdamW (no
+#                                 parameter is Muon-owned); it now selects the
+#                                 optimizer-direction estimator r = d1/d0.
+#   any   + update -> _updspace : forced update-space everywhere.
+#   any   + grad   -> untagged  : the legacy estimator, i.e. what every existing
+#                                 AdamW run name already means.
+#   muon  + auto   -> untagged  : the established Muon arm; its run dirs exist.
+RETENTION_TAG=""
+if [[ "$GXPO_RETENTION_SPACE" == "update" ]]; then
+  RETENTION_TAG="_updspace"
+elif [[ "$GXPO_RETENTION_SPACE" == "auto" && "${OPTIMIZER_NAME,,}" == "adamw" ]]; then
+  RETENTION_TAG="_adamwdir"
+fi
+if [[ -n "$RETENTION_TAG" && "$RUN_NAME" != *"$RETENTION_TAG"* ]]; then
+  RUN_NAME="${RUN_NAME}${RETENTION_TAG}"
 fi
 # Tag runs with the pre-generation filter on, same guard pattern as OPT_STATE_TAG above --
 # this is a methodology change (fewer/different prompts trained on per step), so it must
@@ -434,6 +480,8 @@ train_seed=$TRAIN_SEED
 train_batch_size=$TRAIN_BATCH_SIZE
 rollout_n=$ROLLOUT_N
 learning_rate=$LR
+use_kl_loss=$USE_KL_LOSS
+kl_loss_coef=$KL_LOSS_COEF
 max_steps=$MAX_STEPS
 save_freq=$SAVE_FREQ
 sfpo_warmup_steps=$SFPO_WARMUP_STEPS
@@ -446,6 +494,7 @@ gxpo_zscore_w=$GXPO_ZSCORE_W
 gxpo_trigger_signal=$GXPO_TRIGGER_SIGNAL
 gxpo_shutoff_mode=$GXPO_SHUTOFF_MODE
 gxpo_optimizer_state_mode=$GXPO_OPTIMIZER_STATE_MODE
+gxpo_retention_space=$GXPO_RETENTION_SPACE (run-name tag='${RETENTION_TAG:-none}')
 optimizer=$OPTIMIZER_NAME
 muon_momentum=$MUON_MOMENTUM
 muon_ns_steps=$MUON_NS_STEPS
@@ -463,8 +512,12 @@ gxpo_diag_freq=$GXPO_DIAG_FREQ
 gxpo_trigger_granularity=outer
 dynamic_filtering=$GXPO_DYNAMIC_FILTERING (strategy=$GXPO_DYNAMIC_FILTERING_STRATEGY, p_easy=$GXPO_P_EASY, p_hard=$GXPO_P_HARD, target_zero_variance=$GXPO_TARGET_ZERO_VARIANCE, sampling_batch_size=$GXPO_SAMPLING_BATCH_SIZE)
 validation_interval=5
-validation_decoding=greedy temperature=0 do_sample=false n=1
-final_decoding=stochastic temperature=1.0 top_p=0.7 do_sample=true n=4 seeds=$FINAL_EVAL_SEEDS
+validation_decoding=sampled temperature=0.7 do_sample=true n=1
+if [[ "$FINAL_EVAL_ENABLED" == "True" ]]; then
+  final_decoding=stochastic temperature=1.0 top_p=0.7 do_sample=true n=4 seeds=$FINAL_EVAL_SEEDS
+else
+  final_decoding=disabled
+fi
 gpu_count=$GPU_COUNT
 train_files=$TRAIN_FILES
 validation_files=$VAL_FILES
@@ -507,8 +560,8 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}" \
   actor_rollout_ref.actor.clip_ratio=0.2 \
   actor_rollout_ref.actor.grad_clip=1.0 \
-  actor_rollout_ref.actor.use_kl_loss=False \
-  actor_rollout_ref.actor.kl_loss_coef=0.0 \
+  actor_rollout_ref.actor.use_kl_loss="$USE_KL_LOSS" \
+  actor_rollout_ref.actor.kl_loss_coef="$KL_LOSS_COEF" \
   actor_rollout_ref.actor.kl_loss_type=low_var_kl \
   actor_rollout_ref.actor.fsdp_config.fsdp_size="${FSDP_SIZE:-1}" \
   actor_rollout_ref.actor.fsdp_config.param_offload="$ACTOR_PARAM_OFFLOAD" \
@@ -526,8 +579,8 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE:-1.0}" \
   actor_rollout_ref.rollout.top_p="${ROLLOUT_TOP_P:-1.0}" \
   actor_rollout_ref.rollout.val_kwargs.n=1 \
-  actor_rollout_ref.rollout.val_kwargs.do_sample=False \
-  actor_rollout_ref.rollout.val_kwargs.temperature=0 \
+  actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+  actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE:-8}" \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -555,19 +608,27 @@ python -u -m verl.trainer.main_ppo \
   "${METHOD_FLAGS[@]}" \
   | tee "$RUN_DIR/train.log"
 
-TERMINAL_STEP="$MAX_STEPS"
-if [[ ! -d "$RUN_DIR/global_step_$TERMINAL_STEP" ]]; then
-  TERMINAL_STEP="$(find "$RUN_DIR" -maxdepth 1 -type d -name 'global_step_*' -printf '%f\n' | sed 's/global_step_//' | sort -n | tail -1)"
-fi
-if [[ -z "$TERMINAL_STEP" || ! -d "$RUN_DIR/global_step_$TERMINAL_STEP" ]]; then
-  echo "Training finished without a terminal checkpoint under $RUN_DIR" >&2
-  exit 3
-fi
+if [[ "$FINAL_EVAL_ENABLED" == "True" ]]; then
+  TERMINAL_STEP="$MAX_STEPS"
+  if [[ ! -d "$RUN_DIR/global_step_$TERMINAL_STEP" ]]; then
+    TERMINAL_STEP="$(find "$RUN_DIR" -maxdepth 1 -type d -name 'global_step_*' -printf '%f\n' | sed 's/global_step_//' | sort -n | tail -1)"
+  fi
+  if [[ -z "$TERMINAL_STEP" || ! -d "$RUN_DIR/global_step_$TERMINAL_STEP" ]]; then
+    echo "Training finished without a terminal checkpoint under $RUN_DIR" >&2
+    exit 3
+  fi
 
-python -u tools/evaluate_gxpo_terminal.py \
-  --run-dir "$RUN_DIR" \
-  --base-model "$MODEL_ID" \
-  --data-files "$MATH500" "$AIME24" "$AIME25" "$AMC23" "$MINERVA" "$OLYMPIAD" \
-  --seeds $FINAL_EVAL_SEEDS \
-  --step "$TERMINAL_STEP" \
-  --n 4 --temperature 1.0 --top-p 0.7
+  python -u tools/evaluate_gxpo_terminal.py \
+    --run-dir "$RUN_DIR" \
+    --base-model "$MODEL_ID" \
+    --data-files "$MATH500" "$AIME24" "$AIME25" "$AMC23" "$MINERVA" "$OLYMPIAD" \
+    --seeds $FINAL_EVAL_SEEDS \
+    --step "$TERMINAL_STEP" \
+    --n 4 --temperature 1.0 --top-p 0.7 \
+    --log-wandb \
+    --wandb-project "$PROJECT" \
+    --wandb-run "$RUN_NAME" \
+    --wandb-id "$(cat "$RUN_DIR/wandb_id.txt" 2>/dev/null || true)"
+else
+  echo "Final evaluation disabled (FINAL_EVAL_ENABLED=False)."
+fi

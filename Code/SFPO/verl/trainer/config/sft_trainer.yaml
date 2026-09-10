@@ -15,7 +15,19 @@ data:
   # KL(pi_theta || pi_ref) anchor weight; 0.0 disables the reference model.
   kl_beta: 0.0
   # Reference policy path; null reuses model.partial_pretrain (the RL convention).
+  # Point it at a teacher checkpoint to distill instead of anchor.
   kl_ref_model: null
+  # Full-vocabulary forward KL(p_teacher || p_student) at every supervised token,
+  # instead of the K3 taken-token estimator of the reverse KL. Distillation, not
+  # an anchor. Ignored unless kl_beta > 0.
+  kl_full: False
+  # fp32 log_softmax chunk for the vocabulary sum above; the KL's peak memory.
+  kl_full_chunk_tokens: 512
+  # Micro-batch by a per-GPU token budget instead of a fixed row count. Needed
+  # whenever max_length far exceeds the real sequence lengths, since SFTDataset
+  # pads every row to max_length.
+  use_dynamic_bsz: False
+  max_token_len_per_gpu: 8192
 model:
   attn_implementation: flash_attention_2
   partial_pretrain: ~/models/gemma-1.1-7b-it

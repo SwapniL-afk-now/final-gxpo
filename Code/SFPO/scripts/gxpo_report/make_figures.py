@@ -195,7 +195,11 @@ def fig8_diagnostics(manifest, out_dir):
         k = int(run['k'])
         for ax, (col, _) in zip(axes, panels):
             if col in met.columns:
-                ax.plot(met['step'], met[col].fillna(0.0), color=K_COLORS.get(k, 'gray'),
+                # Do NOT fill: a null means the estimator that defines this
+                # column did not run on that step, and filling it with 0.0 draws
+                # a flat line that reads as a measurement. matplotlib breaks the
+                # line at NaN, which is the honest picture.
+                ax.plot(met['step'], met[col], color=K_COLORS.get(k, 'gray'),
                         label=f'k = {k}')
     for ax, (_, title) in zip(axes, panels):
         ax.set_xlabel('Training Steps')
@@ -207,9 +211,14 @@ def fig8_diagnostics(manifest, out_dir):
 
 def fig9_retention(manifest, out_dir):
     def curve(met):
-        if 'actor/gxpo_r_mean' not in met.columns:
-            return np.array([]), np.array([])
-        return met['step'].to_numpy(), met['actor/gxpo_r_mean'].fillna(0.0).to_numpy()
+        # Whichever retention estimator the run used. An 'auto' AdamW run has no
+        # actor/gxpo_r_mean at all (its g1 slot holds u0, not a gradient), so
+        # prefer the AdamW-direction column when it is the one that was measured.
+        for column in ('actor/gxpo_r_mean', 'actor/gxpo_adamw_r_mean'):
+            if column in met.columns and met[column].notna().any():
+                series = met[[ 'step', column]].dropna()
+                return series['step'].to_numpy(), series[column].to_numpy()
+        return np.array([]), np.array([])
 
     _curve_grid(manifest, out_dir, 'fig9_retention', curve, xlabel='Steps', ylabel='Retention Ratio')
 

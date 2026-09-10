@@ -1,17 +1,36 @@
 #!/usr/bin/env bash
-# SFT + reference-KL training on flat teacher responses (prompt + teacher_response):
-# supervised CE plus kl_beta * D_KL(pi_theta || pi_ref) (verl/trainer/fsdp_sft_trainer.py),
-# one plain optimizer step per batch. The KL term here is the plain RL-style
-# anchor against a frozen reference policy -- not a distillation term: no
-# teacher top-K cache is needed or used.
+# Off-policy SFT knowledge distillation on DeepScaleR problem/solution pairs:
+# supervised CE plus kl_beta * D_KL(p_teacher || p_student), one plain optimizer
+# step per batch (verl/trainer/fsdp_sft_trainer.py).
 #
-# Training data is the flat verified-correct teacher-response corpus; the
-# deleted top-K cache (dapo_lighteval_topk16_*) is no longer referenced anywhere
-# in this file.
+# The KL is a DISTILLATION term, not the RL-style anchor this file used to run.
+# Two things changed: the frozen model is the DeepScaleR-1.5B-Preview teacher
+# rather than a copy of the student's own init, and the divergence is a FULL
+# forward KL summed over all 151,936 logits at every supervised token
+# (data.kl_full=True) rather than the K3 one-token estimator of the reverse KL.
+# Both models are fed the same student tokenization, so position i is the same
+# token for both and their logit axes are the same vocabulary -- that is all
+# "matched tokens" requires. No teacher top-K cache and no teacher generation:
+# the teacher only runs forward passes. `solution` remains the hard CE target.
 #
-# Evaluation: six-benchmark vLLM eval runs in-training after every 5 steps
-# (trainer.benchmark_eval_freq=5, same eval_greedy/* wandb keys as the final
-# post-eval) plus one post-training pass below.
+# Training data is downloaded from
+# sam-12labs/DeepScaleR-Preview-Dataset_DeepSeek-R1-Distill-Qwen-32B_reasoning_traces
+# and cached locally by prep_32b_traces_kd.py. Each upstream row holds one
+# `problem` plus a LIST of 32B reasoning traces with a per-trace correctness
+# flag; the cache explodes it into one row per CORRECT trace with `problem` as
+# the prompt and the trace as `solution`. A problem with several correct traces
+# therefore yields several same-prompt rows, which the row-based SFTDataset
+# consumes as independent samples. The validation holdout is at PROBLEM level
+# (seed-42 shuffled), which is what makes val/loss meaningful here.
+#
+# Validation loss and the six-benchmark eval both run every 10 steps; the final
+# pass below uses two independent TP=1 vLLM workers and logs sampled
+# pass@4/average@4 metrics at temperature 0.7.
+#
+# Multi-GPU is supported WITH in-training eval in this tree: every rank offloads
+# to CPU, rank 0 runs the vLLM subprocess pinned to its own GPU, the other ranks
+# resume onto theirs, and the barrier after it has a 10h timeout. (An older tree
+# raised on world_size != 1; that guard is not here.)
 #
 # Usage:
 #   GPU=0 ./run_kd_sft_hybrid_dapo_lighteval_1p5b.sh
@@ -29,38 +48,72 @@ export PATH="$VENV_ROOT/bin:$VENV_ROOT/lib/python3.12/site-packages/nvidia/cu13/
 export CUDA_HOME="${CUDA_HOME:-$VENV_ROOT/lib/python3.12/site-packages/nvidia/cu13}"
 export CUDA_PATH="$CUDA_HOME"
 export CUDACXX="${CUDACXX:-$CUDA_HOME/bin/nvcc}"
-export PYTHONPATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd):${PYTHONPATH:-}"
+CODE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 export VLLM_USE_FLASHINFER_SAMPLER=0
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
-export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
-export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-1}"
-
-GPU="${GPU:?set GPU=0|1}"
+GPU="${GPU:?set GPU=0|1, or a comma list such as GPU=0,1}"
 export GPU
+NPROC="$(awk -F, '{print NF}' <<< "$GPU")"
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-$(( NPROC > 1 ? 0 : 1 ))}"
+export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-$(( NPROC > 1 ? 0 : 1 ))}"
 TRAIN_SEED="${TRAIN_SEED:-42}"
-LR="${LR:-1e-6}"
+LR="${LR:-5e-6}"
 PROJECT="${PROJECT:-gxpo-efficiency-final}"
 
 # Uses final-gxpo-h200's venv specifically (this repo, final-gxpo, ships no
 # .venv of its own). Override PYTHON_BIN to point elsewhere.
 MODEL="${MODEL:-/office/shared_cache/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306}"
-# Flat verified-correct teacher responses (prompt + teacher_response[_ids]).
-FLAT_TRAIN="${FLAT_TRAIN:-/office/dev_workspace/swapnil/final-gxpo/Code/SFPO/data/teacher_responses/qwen25_math7b_dapo_lighteval_train_n1_correct_only.parquet}"
-TRAIN="${TRAIN:-$FLAT_TRAIN}"
-VAL="${VAL:-$TRAIN}"
+MAX_LENGTH="${MAX_LENGTH:-16384}"
+DATASET_ID="${DATASET_ID:-sam-12labs/DeepScaleR-Preview-Dataset_DeepSeek-R1-Distill-Qwen-32B_reasoning_traces}"
+DATASET_DIR="${DATASET_DIR:-$CODE_ROOT/data/r1_32b_traces}"
+VAL_SIZE="${VAL_SIZE:-1000}"
+DATA_SEED="${DATA_SEED:-42}"
+TRAIN="${TRAIN:-$DATASET_DIR/train_32b_correct_max${MAX_LENGTH}.parquet}"
+VAL="${VAL:-$DATASET_DIR/val_32b_correct_max${MAX_LENGTH}_${VAL_SIZE}.parquet}"
+if [[ ! -f "$TRAIN" || ! -f "$VAL" ]]; then
+  mkdir -p "$DATASET_DIR"
+  "$PYTHON_BIN" "$(dirname "${BASH_SOURCE[0]}")/prep_32b_traces_kd.py" \
+    "$DATASET_ID" "$DATASET_DIR" "$MODEL" "$MAX_LENGTH" "$VAL_SIZE" "$DATA_SEED"
+fi
 
-# Reference policy for the KL anchor. Defaults to the student's own starting
-# weights (the standard RL KL reference); point at a frozen teacher to anchor
-# to the teacher instead.
-KL_REF_MODEL="${KL_REF_MODEL:-$MODEL}"
-# KL anchor weight. Tune on a smoke run: too high stalls learning on the
-# teacher traces, too low lets the policy drift off them.
-KL_BETA="${KL_BETA:-0.1}"
-MAX_LENGTH="${MAX_LENGTH:-4096}"
+# The distillation teacher. DeepScaleR-1.5B-Preview shares the student's Qwen2
+# architecture and its 151,936 vocabulary, so one tokenization serves both and
+# the trainer's vocab_size preflight passes. The trainer builds it from ITS OWN
+# config, not the student's -- the two disagree on rope_theta (1e4 vs 1e6) and
+# tie_word_embeddings (False vs True), and the student config would silently
+# drop the teacher's untied lm_head.
+KL_REF_MODEL="${KL_REF_MODEL:-/office/dev_workspace/swapnil/final-gxpo/models/DeepScaleR-1.5B-Preview}"
+# Distillation weight: loss = CE + KL_BETA * KL(teacher || student). 1.0 is plain
+# CE+KL. This is NOT comparable to the 0.1 the old K3 anchor used -- that anchor
+# started at exactly 0 (reference == student init) while a full teacher KL starts
+# at several nats/token. Check train/kl on a smoke run before a long one.
+KL_BETA="${KL_BETA:-1.0}"
+# Token budget per micro-batch. The binding constraint is the [tokens, 151936]
+# logits tensor in the CE path (~3.7GB bf16 at 12288) plus ~1.5GB for the fp32
+# KL chunk. Must stay above the longest real sequence -- the trainer RAISES if
+# one row exceeds the budget -- and the 32B correct traces run long: longest
+# 10,425, p99 7,575, p50 3,172 student tokens (prompt + trace + eos), so 8192
+# is too small and 12288 is the setting.
+MAX_TOKEN_LEN_PER_GPU="${MAX_TOKEN_LEN_PER_GPU:-12288}"
+# FSDP sharding strategy. FULL_SHARD (ZeRO-3) all-gathers every flat parameter
+# in forward and AGAIN in backward; SHARD_GRAD_OP (ZeRO-2) holds the forward
+# all-gather through backward, halving parameter traffic for one extra
+# unsharded bf16 copy of the model (~3GB for 1.5B). On a PCIe-only box with a
+# 1.5B model that is the right trade. Single-rank runs keep full_shard so
+# nothing about the existing GPU=<n> arm changes.
+if (( NPROC > 1 )); then
+  FSDP_SHARDING_STRATEGY="${FSDP_SHARDING_STRATEGY:-shard_grad_op}"
+else
+  FSDP_SHARDING_STRATEGY="${FSDP_SHARDING_STRATEGY:-full_shard}"
+fi
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
 
-EXP="${EXP:-sftkl_b${KL_BETA}_flat14k_b96_lr${LR}_seed${TRAIN_SEED}}"
+NPROC_TAG=""
+if (( NPROC > 1 )); then NPROC_TAG="_${NPROC}gpu"; fi
+EXP="${EXP:-sftkd_plain_fullkl_b${KL_BETA}_r1_32b_b${TRAIN_BATCH_SIZE}_lr${LR}_len${MAX_LENGTH}_seed${TRAIN_SEED}${NPROC_TAG}}"
 RUN_DIR="${RUN_DIR:-./runs/${EXP}}"
 mkdir -p "$RUN_DIR"
 
@@ -102,22 +155,27 @@ if [[ "${SKIP_EVAL:-0}" != "1" ]]; then
   done
 fi
 
-"$PYTHON_BIN" -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=1 \
+"$PYTHON_BIN" -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="$NPROC" \
     -m verl.trainer.fsdp_sft_trainer \
     data.train_files="$TRAIN" \
     data.val_files="$VAL" \
-    data.prompt_key=prompt \
-    data.response_key=teacher_response \
-    data.train_batch_size=96 \
+    data.prompt_key=problem \
+    data.response_key=solution \
+    data.train_batch_size="$TRAIN_BATCH_SIZE" \
     data.micro_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
     data.max_length="$MAX_LENGTH" \
     data.truncation=error \
     data.normalize_by_sequence=True \
     data.kl_beta="$KL_BETA" \
     data.kl_ref_model="$KL_REF_MODEL" \
+    data.kl_full=True \
+    ++data.kl_full_chunk_tokens="${KL_CHUNK_TOKENS:-2048}" \
+    data.use_dynamic_bsz=True \
+    data.max_token_len_per_gpu="$MAX_TOKEN_LEN_PER_GPU" \
+    ++data.val_micro_batch_size_per_gpu="${VAL_MICRO_BATCH_SIZE:-2}" \
     model.partial_pretrain="$MODEL" \
-    model.enable_gradient_checkpointing=True \
-    ++model.fsdp_config.strategy=fsdp2 \
+    model.enable_gradient_checkpointing="${GRAD_CKPT:-True}" \
+    ++model.fsdp_config.sharding_strategy="$FSDP_SHARDING_STRATEGY" \
     model.use_liger=True \
     optim.lr="$LR" \
     optim.betas="[0.9,0.999]" \
@@ -129,11 +187,11 @@ fi
     trainer.default_local_dir="$RUN_DIR" \
     trainer.default_hdfs_dir=null \
     trainer.logger=['console','wandb'] \
-    trainer.total_epochs=3 \
-    trainer.total_training_steps="${MAX_STEPS:-200}" \
-    ++trainer.test_freq=0 \
-    ++trainer.save_freq=0 \
-    ++trainer.benchmark_eval_freq=5 \
+    trainer.total_epochs="${TOTAL_EPOCHS:-25}" \
+    trainer.total_training_steps="${MAX_STEPS:-300}" \
+    ++trainer.test_freq="${TEST_FREQ:-25}" \
+    ++trainer.save_freq="${SAVE_FREQ:-0}" \
+    ++trainer.benchmark_eval_freq="${BENCHMARK_EVAL_FREQ:-50}" \
     ++trainer.eval_sample_n=1 \
     ++trainer.eval_seed_count=1 \
     ++trainer.eval_skip_greedy=1 \
@@ -148,10 +206,11 @@ if [[ "${SKIP_EVAL:-0}" != 1 ]]; then
     "$PYTHON_BIN" "$CODE_ROOT/tools/kd_sft/evaluate_greedy.py" \
     --checkpoint-dir "$CKPT_ABS" --base-model "$MODEL" \
     --data-files "$MATH500" "$AIME24" "$AIME25" "$AMC23" "$MINERVA" "$OLYMPIAD" \
-    --seed "${EVAL_SEED:-0}" --n 1 --temperature 0.7 --top-p 1.0 \
-    --max-tokens "${EVAL_MAX_TOKENS:-3072}" --tp 1 --gpu-memory-utilization 0.85 \
+    --seed "${EVAL_SEED:-0}" --n "${EVAL_FINAL_N:-4}" --temperature 0.7 --top-p 1.0 \
+    --max-tokens "${EVAL_MAX_TOKENS:-3072}" --tp 1 --gpu-devices "$GPU" --gpu-memory-utilization 0.85 \
     --max-model-len "${EVAL_MAX_MODEL_LEN:-4096}" --max-num-seqs 256 --max-num-batched-tokens 65536 \
     --attention-backend "$VLLM_ATTENTION_BACKEND" \
     --log-wandb --wandb-project "$PROJECT" --wandb-run "$EXP-post-eval" \
-    --output "$RUN_DIR/eval_pass1_6bench.json" 2>&1 | tee "$RUN_DIR/eval_pass1_6bench.log"
+    --output "$RUN_DIR/eval_pass4_6bench.json" 2>&1 | tee "$RUN_DIR/eval_pass4_6bench.log"
+  rm -rf "$CKPT_ABS"
 fi

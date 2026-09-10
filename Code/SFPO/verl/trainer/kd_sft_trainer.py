@@ -109,8 +109,12 @@ class KDSFTTrainer(FSDPSFTTrainer):
         self.val_sampler = DistributedSampler(
             self.val_dataset, shuffle=False, num_replicas=world_size, rank=rank,
             drop_last=True)
+        val_micro_batch_size = int(config.data.get('val_micro_batch_size_per_gpu',
+                                             config.data.micro_batch_size_per_gpu))
+        if val_micro_batch_size < 1:
+            raise ValueError('data.val_micro_batch_size_per_gpu must be positive')
         self.val_dataloader = DataLoader(
-            dataset=self.val_dataset, batch_size=config.data.micro_batch_size_per_gpu,
+            dataset=self.val_dataset, batch_size=val_micro_batch_size,
             sampler=self.val_sampler, num_workers=8, pin_memory=True, drop_last=True)
 
     def _compute_loss_and_backward(self, batch: TensorDict, do_backward=True):

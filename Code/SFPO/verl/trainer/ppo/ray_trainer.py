@@ -753,14 +753,25 @@ class RayPPOTrainer(object):
                 values[benchmark] = float(value)
         for benchmark in BENCHMARK_ORDER:
             if benchmark in values:
-                result[f'eval_greedy/{benchmark}_pass1'] = values[benchmark]
+                value = values[benchmark]
+                result[f'eval_greedy/{benchmark}_pass1'] = value
+                # The final-gxpo SFT/KD runs (including ytr1pu3r) use the
+                # eval_sampled/* schema for their n=1 benchmark pass. The RL
+                # validator is configured to the same sampled n=1 protocol by
+                # the efficiency launcher, so publish the identical stable
+                # keys here as well. Keep eval_greedy/* for older tables.
+                result[f'eval_sampled/{benchmark}_pass1'] = value
+                result[f'eval_sampled/{benchmark}_average1'] = value
         if os.environ.get('GXPO_EFFICIENCY_RUN') and set(values) != set(BENCHMARK_ORDER):
             missing = sorted(set(BENCHMARK_ORDER) - set(values))
             raise RuntimeError(f'GXPO efficiency validation requires all six benchmarks; missing {missing}')
         if values:
             # Macro-average across benchmark datasets, never across examples.
-            result['eval_greedy/avg_pass1'] = float(np.mean([values[k] for k in BENCHMARK_ORDER if k in values]))
+            avg_pass1 = float(np.mean([values[k] for k in BENCHMARK_ORDER if k in values]))
+            result['eval_greedy/avg_pass1'] = avg_pass1
             result['eval_greedy/benchmark_count'] = len(values)
+            result['eval_sampled/avg_pass1'] = avg_pass1
+            result['eval_sampled/avg_average1'] = avg_pass1
         result['eval_greedy/global_step'] = int(self.global_steps)
         return result
 
@@ -1460,7 +1471,9 @@ class RayPPOTrainer(object):
                 'gxpo/g1_fresh_cosine': scalar(metrics.get('actor/gxpo_cos_g0_gslow')),
                 'gxpo/two_step_displacement_norm': scalar(metrics.get('actor/gxpo_disp2_norm')),
                 'gxpo/predicted_displacement_norm': scalar(metrics.get('actor/gxpo_dispK_norm')),
-                'gxpo/reposition_displacement_norm': (alpha or 0.0) * (scalar(metrics.get('actor/gxpo_dispK_norm'), 0.0) or 0.0),
+                'gxpo/reposition_displacement_norm': (
+                    None if scalar(metrics.get('actor/gxpo_dispK_norm')) is None
+                    else (alpha or 0.0) * scalar(metrics.get('actor/gxpo_dispK_norm'))),
                 'gxpo/prediction_to_observed_displacement_ratio': scalar(metrics.get('actor/gxpo_dispK_over_disp2')),
                 'gxpo/prediction_scale_mean': scalar(metrics.get('actor/gxpo_scale_mean')),
                 'gxpo/prediction_scale_std': scalar(metrics.get('actor/gxpo_r_std')),
@@ -1468,7 +1481,12 @@ class RayPPOTrainer(object):
                 'gxpo/retention_mean': scalar(metrics.get('actor/gxpo_r_mean')),
                 'gxpo/retention_std': scalar(metrics.get('actor/gxpo_r_std')),
                 'gxpo/retention_abs_mean': scalar(metrics.get('actor/gxpo_r_mean')),
-                'gxpo/active_coordinate_fraction': 1.0 - (scalar(metrics.get('actor/gxpo_inactive_frac'), 0.0) or 0.0),
+                # None, not 1.0, when the gradient-space family did not run:
+                # "100% of coordinates active" is a measurement, and an 'auto'
+                # run never made it.
+                'gxpo/active_coordinate_fraction': (
+                    None if scalar(metrics.get('actor/gxpo_inactive_frac')) is None
+                    else 1.0 - scalar(metrics.get('actor/gxpo_inactive_frac'))),
                 'gxpo/unsafe_coordinate_fraction': scalar(metrics.get('actor/gxpo_ratio_clip_frac')),
                 'gxpo/reliability_stat': scalar(metrics.get('actor/gxpo_trigger_stat')),
                 'gxpo/reliability_threshold': scalar(actor_cfg.get('gxpo_tau'), 0.0),
@@ -1478,6 +1496,27 @@ class RayPPOTrainer(object):
                 'gxpo/trigger_patience': scalar(actor_cfg.get('gxpo_trigger_patience'), 1.0),
                 'gxpo/entropy_window_ready': scalar(metrics.get('actor/gxpo_entropy_window_ready'), 0.0),
                 'gxpo/trigger_warmup_active': scalar(metrics.get('actor/gxpo_trigger_warmup_active'), 0.0),
+                # Which retention estimator produced the row, and how the
+                # parameters split across the three. Without these a null in the
+                # legacy retention columns above is unexplained.
+                'gxpo/retention_kind': scalar(metrics.get('actor/gxpo_retention_kind')),
+                'gxpo/legacy_grad_params': scalar(metrics.get('actor/gxpo_legacy_grad_params')),
+                'gxpo/update_space_params': scalar(metrics.get('actor/gxpo_update_space_params')),
+                'gxpo/adamw_direction_params': scalar(metrics.get('actor/gxpo_adamw_direction_params')),
+                # AdamW optimizer-direction family (r = d1/d0). Null on a run
+                # that used the gradient or Muon estimator, never zero.
+                'gxpo/adamw_retention_mean': scalar(metrics.get('actor/gxpo_adamw_r_mean')),
+                'gxpo/adamw_retention_std': scalar(metrics.get('actor/gxpo_adamw_r_std')),
+                'gxpo/adamw_prediction_scale_mean': scalar(metrics.get('actor/gxpo_adamw_scale_mean')),
+                'gxpo/adamw_prediction_scale_max': scalar(metrics.get('actor/gxpo_adamw_scale_max')),
+                'gxpo/adamw_unsafe_coordinate_fraction': scalar(metrics.get('actor/gxpo_adamw_ratio_clip_frac')),
+                'gxpo/adamw_d0_norm': scalar(metrics.get('actor/gxpo_adamw_d0_norm')),
+                'gxpo/adamw_d1_norm': scalar(metrics.get('actor/gxpo_adamw_d1_norm')),
+                'gxpo/adamw_d0_d1_cosine': scalar(metrics.get('actor/gxpo_adamw_cos_d0_d1')),
+                # Muon update-space family. Null on a pure-AdamW run.
+                'gxpo/muon_retention_rho_mean': scalar(metrics.get('actor/gxpo_retention_rho_mean')),
+                'gxpo/muon_update_scale_mean': scalar(metrics.get('actor/gxpo_update_scale_mean')),
+                'gxpo/muon_retention_rho_negative_frac': scalar(metrics.get('actor/gxpo_retention_rho_negative_frac')),
             })
         elif actor_cfg.get('use_sfpo', False):
             alpha = scalar(actor_cfg.get('sfpo_step_size'), 0.5)

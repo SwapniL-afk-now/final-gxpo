@@ -9,6 +9,10 @@ Muon. The relevant implementation is in:
 - verl/workers/actor/optimizer_transaction.py
 - verl/workers/muon.py
 
+For how GXPO chooses a retention estimator per optimizer -- in particular the
+AdamW optimizer-direction rule that non-Muon parameters now use under
+`gxpo_retention_space=auto` -- see `GXPO_OPTIMIZER_AWARE_RETENTION.md`.
+
 ## Summary
 
 For each PPO mini-batch, GXPO performs two real optimizer steps as probes,
@@ -16,8 +20,10 @@ measures how the second step retains the direction of the first, repositions
 the model along the resulting two-step displacement, and then performs one
 slow corrective step. For Muon-owned matrices, retention is measured in
 parameter-update space as one scalar per matrix. This preserves the direction
-chosen by Muon's Newton--Schulz orthogonalization. Non-Muon parameters use the
-coordinatewise gradient-space estimator.
+chosen by Muon's Newton--Schulz orthogonalization. Non-Muon parameters use a
+coordinatewise estimator: under `gxpo_retention_space=auto` that is the AdamW
+optimizer-direction ratio `r = d1/d0`, and under `grad` it is the legacy
+raw-gradient ratio `r = g1/g0`.
 
 ## Notation
 
@@ -119,10 +125,18 @@ Muon. The actual multiplier is alpha * scale:
 The optional gxpo_min_effective_multiplier can clamp this multiplier from below;
 the actor warns if the mean effective multiplier is below one.
 
-### Gradient-space estimator for other parameters
+### Coordinatewise estimator for other parameters
 
-Embeddings, output heads, norms, and other parameters not owned by Muon use the
-original coordinatewise estimator. For active coordinates:
+Embeddings, output heads, norms, and other parameters not owned by Muon use a
+coordinatewise estimator. Which one depends on `gxpo_retention_space`.
+
+Under `auto` those parameters are AdamW-owned (Muon runs its own decoupled-AdamW
+branch for them), so they use the AdamW optimizer-direction ratio `r = d1/d0`,
+where `d_t = ((1 - lr*wd) * theta_t - theta_{t+1}) / lr` is reconstructed from
+the real probe displacement. See `GXPO_OPTIMIZER_AWARE_RETENTION.md`.
+
+Under `grad`, every parameter -- Muon-owned included -- falls back to the legacy
+raw-gradient estimator described next. For active coordinates:
 
 ~~~text
 r     = (c1 * g1) / (c0 * g0)
@@ -140,12 +154,14 @@ Retention-space selection is controlled by gxpo_retention_space:
 
 | Setting | Muon parameters | Other parameters |
 | --- | --- | --- |
-| auto (default) | update-space scalar | gradient-space |
-| grad | gradient-space | gradient-space |
+| auto (default) | update-space scalar | AdamW optimizer-direction (`d1/d0`) |
+| grad | gradient-space | gradient-space (`g1/g0`, legacy) |
 | update | update-space | update-space |
 
-With a pure AdamW optimizer, auto selects no update-space parameters and leaves
-the AdamW baseline path unchanged.
+With a pure AdamW optimizer, auto selects no update-space parameters; every
+trainable parameter takes the AdamW optimizer-direction path. Under `auto` an
+optimizer that is neither Muon nor a recognized decoupled AdamW falls back to
+gradient space with one warning rather than being modelled incorrectly.
 
 ## Pass 3: slow corrective update
 
@@ -251,6 +267,9 @@ Important metrics for a Muon GXPO run include:
   optimizer/muon_scatter_time
 
 For Muon runs with retention_space=auto, actor/gxpo_r_mean,
-actor/gxpo_r_std, and actor/gxpo_cos_g0_g1 describe only the gradient-space
-subset, normally the AdamW-owned parameters. They are not Muon retention
-statistics.
+actor/gxpo_r_std, and actor/gxpo_cos_g0_g1 describe only the *legacy
+gradient-space* subset, which under auto is empty (the AdamW-owned parameters
+now report under actor/gxpo_adamw_r_mean and friends). They are not Muon
+retention statistics. The AdamW subset's retention is reported separately -- see
+the diagnostics section of `GXPO_OPTIMIZER_AWARE_RETENTION.md` -- so the Muon and
+AdamW halves of a hybrid run can be read independently.

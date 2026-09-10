@@ -31,26 +31,39 @@ class NaiveRewardManager:
     hundreds of CPUs sat idle). The pool is created once and reused every step, so
     cheap rewards (math string-match) pay the fork cost once, not per step, and
     their results are byte-identical to the old serial path. Worker count via
-    REWARD_NUM_WORKERS (default min(128, nproc)).
+    REWARD_NUM_WORKERS (default min(16, nproc)); one pool is shared by all instances.
     """
+
+    # ONE pool for the whole process, shared by every manager instance. main_ppo builds
+    # two of these (reward_fn and val_reward_fn); per-instance pools meant validation
+    # silently doubled the worker count -- and the resident RAM -- at the first
+    # _validate(). Class-level so both instances reuse the same workers.
+    _executor = None
 
     def __init__(self, tokenizer, num_examine, compute_score=None) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or _default_compute_score
-        self._executor = None
 
-    def _pool(self):
-        if self._executor is None:
-            n = int(os.environ.get("REWARD_NUM_WORKERS", min(64, os.cpu_count() or 8)))
+    @classmethod
+    def _pool(cls):
+        if cls._executor is None:
+            # Width is the only lever on this pool's host RAM. Each worker is a whole
+            # interpreter, and 'spawn' re-imports the parent's __main__ as __mp_main__,
+            # so a worker under `-m verl.trainer.main_ppo` loads torch no matter what
+            # callable is submitted: measured 698MB RSS / 367MB private each, against
+            # 54MB for a worker whose __main__ is torch-free. The 64-wide default was
+            # sized for prime_code unit-test execution (seconds per example); math
+            # verification is milliseconds, so a far narrower pool still saturates it.
+            n = int(os.environ.get("REWARD_NUM_WORKERS", min(16, os.cpu_count() or 8)))
             # 'spawn': fresh interpreters with no inherited CUDA state, so prime_code's
             # inner multiprocessing.Process (nested fork) doesn't trip torch's
             # "not valid in a forked process" guard that killed the default-fork pool.
-            self._executor = ProcessPoolExecutor(
+            cls._executor = ProcessPoolExecutor(
                 max_workers=max(1, n),
                 mp_context=multiprocessing.get_context("spawn"),
             )
-        return self._executor
+        return cls._executor
 
     def _safe_compute_score(self, kw):
         """One example's score should never be able to take down the whole training
@@ -96,7 +109,7 @@ class NaiveRewardManager:
             return results
         except Exception as e:
             print(f"[NaiveRewardManager] parallel scoring failed ({e}); falling back to serial.")
-            self._executor = None
+            type(self)._executor = None
             return [self._safe_compute_score(kw) for kw in args_list]
 
     def _decode(self, data):

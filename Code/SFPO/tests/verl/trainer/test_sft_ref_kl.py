@@ -4,6 +4,9 @@ import sys
 from pathlib import Path
 
 import re
+import types
+
+import pytest
 import torch
 
 REPO = Path(__file__).resolve().parents[3]
@@ -12,6 +15,8 @@ OFFPOLICY = REPO / 'train-scripts' / 'off-policy-sft-kd'
 
 sys.path.insert(0, str(REPO))
 from verl.trainer.fsdp_sft_trainer import (  # noqa: E402
+    FSDPSFTTrainer,
+    full_kl_per_token,
     k3_kl_per_token,
     mean_over_batch_rows,
     mean_response_entropy,
@@ -99,8 +104,9 @@ def test_launchers_train_flat_teacher_responses_not_topk_cache():
             assert stale not in text, (name, stale)
         assert '-m verl.trainer.fsdp_sft_trainer' in text, name
         assert 'data.response_key=teacher_response' in text, name
+        assert '++data.val_micro_batch_size_per_gpu="${VAL_MICRO_BATCH_SIZE:-4}"' in text, name
         assert 'data.kl_beta=' in text, name
-        assert 'benchmark_eval_freq=5' in text, name
+        assert '++trainer.benchmark_eval_freq="${BENCHMARK_EVAL_FREQ:-0}"' in text, name
 
 
 def test_launchers_eval_wiring_fixed():
@@ -111,6 +117,7 @@ def test_launchers_eval_wiring_fixed():
         assert 'CODE_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"' in text, name
         assert '--max-num-seqs 256' in text, name
         assert '--attention-backend' in text, name
+        assert '--n 4 --temperature 0.7' in text, name
         assert '--log-wandb' in text, name
 
 
@@ -132,7 +139,7 @@ def test_gxpo_launcher_offers_both_optimizer_state_modes_under_separate_names():
     assert 'transactional_fast_state) OPT_STATE_TAG="_optkeep" ;;' in text
     assert 'PREFLIGHT FAIL: GXPO_OPTIMIZER_STATE_MODE must be' in text
     assert ('EXP="sftkl_gxpo_k${K}_a${ALPHA}_b${KL_BETA}_flat14k_lr${LR}'
-            '_seed${TRAIN_SEED}${OPT_STATE_TAG}"') in text
+            '_seed${TRAIN_SEED}${OPT_STATE_TAG}${RETENTION_TAG}${NPROC_TAG}"') in text
 
 
 def test_sft_trainer_refreshes_optimizer_state_only_in_transactional_mode():
@@ -147,8 +154,8 @@ def test_sft_trainer_refreshes_optimizer_state_only_in_transactional_mode():
 def test_gxpo_launcher_update_and_gate_profile():
     text = _launcher('run_kd_sft_gxpo_hybrid_dapo_lighteval_1p5b.sh')
     assert 'K="${K:-3}"' in text
-    assert 'ALPHA="${ALPHA:-0.8}"' in text
-    assert 'trainer.total_training_steps="${MAX_STEPS:-400}"' in text
+    assert 'ALPHA="${ALPHA:-0.1}"' in text
+    assert 'trainer.total_training_steps="${MAX_STEPS:-300}"' in text
     assert 'GXPO_TAU="${GXPO_TAU:-3.0}"' in text
     assert 'GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-3}"' in text
     assert 'GXPO_WARMUP="${GXPO_WARMUP:-0}"' in text
@@ -197,7 +204,7 @@ def test_launchers_eval_single_sample_cadence():
         assert '++trainer.eval_sample_n=1' in text, name
         assert '++trainer.eval_seed_count=1' in text, name
         assert '++trainer.eval_skip_greedy=1' in text, name
-        assert 'benchmark_eval_freq=5' in text, name
+        assert '++trainer.benchmark_eval_freq="${BENCHMARK_EVAL_FREQ:-0}"' in text, name
         assert 'EVAL_CODE_ROOT=' in text, name
         # The in-training eval harness runs under `set -u` and reads $GPU;
         # it must be exported or every cadence eval dies unbound.
@@ -212,21 +219,13 @@ if __name__ == '__main__':
     print('ALL SFT REF-KL CHECKS PASSED')
 
 
-def test_gxpo_launcher_defaults_extrapolate_rather_than_contract():
-    """K/alpha must put the effective multiplier alpha*scale above 1.
-
-    theta_tilde = theta0 + alpha*scale*(theta2-theta0), and `scale` is bounded to
-    [1, K/2+1], tending to K/2 as the retention ratio r -> 1 (tiny probe steps).
-    So alpha*K/2 is the multiplier the launcher actually converges to. Below 1 the
-    reposition lands SHORT of theta2 and the 3-pass update contracts -- which is
-    what K=5/alpha=0.3 did (0.3 * 2.5 = 0.75).
-    """
+def test_gxpo_launcher_alpha_is_the_requested_conservative_value():
+    """The requested alpha 0.1 intentionally keeps GXPO conservative for K=3."""
     text = _launcher('run_kd_sft_gxpo_hybrid_dapo_lighteval_1p5b.sh')
     k = int(re.search(r'K="\$\{K:-(\d+)\}"', text).group(1))
     alpha = float(re.search(r'ALPHA="\$\{ALPHA:-([\d.]+)\}"', text).group(1))
-    assert alpha * (k / 2.0) > 1.0, (k, alpha, alpha * k / 2.0)
-    # And the floor of the scale range must not drag it below 1 by much either.
-    assert alpha >= 0.5, alpha
+    assert k == 3
+    assert alpha == 0.1
 
 
 def test_gxpo_launcher_gate_is_reachable_before_the_budget_cap():
@@ -274,3 +273,179 @@ def test_rl_actor_mirrors_the_contraction_guard():
     assert "'actor/gxpo_contracting'" in source
     # The all-reduce split must follow the stats width, not a hardcoded one.
     assert 'full[:stats.numel()], full[stats.numel():]' in source
+
+
+# --- full-vocabulary teacher KL (data.kl_full=True) ---------------------------
+
+
+def test_full_kl_is_zero_for_identical_distributions():
+    torch.manual_seed(11)
+    logits = torch.randn(17, 29)
+    got = full_kl_per_token(logits, logits.clone())
+    assert torch.allclose(got, torch.zeros(17), atol=1e-6)
+
+
+def test_full_kl_matches_an_independent_implementation():
+    """Cross-check against F.kl_div, which computes KL(target || input)."""
+    torch.manual_seed(5)
+    teacher = torch.randn(23, 7)
+    student = torch.randn(23, 7)
+    got = full_kl_per_token(teacher, student)
+    expected = torch.nn.functional.kl_div(
+        torch.log_softmax(student.float(), dim=-1),
+        torch.log_softmax(teacher.float(), dim=-1),
+        log_target=True, reduction='none').sum(dim=-1)
+    assert torch.allclose(got, expected, atol=1e-6)
+
+
+def test_full_kl_is_the_forward_direction_not_the_reverse():
+    """KL(teacher || student), so swapping the arguments must change the value."""
+    torch.manual_seed(7)
+    teacher = torch.randn(9, 13) * 3.0
+    student = torch.randn(9, 13)
+    assert not torch.allclose(full_kl_per_token(teacher, student),
+                              full_kl_per_token(student, teacher), atol=1e-3)
+
+
+def test_full_kl_chunking_does_not_change_the_result():
+    torch.manual_seed(13)
+    teacher, student = torch.randn(40, 11), torch.randn(40, 11)
+    one_shot = full_kl_per_token(teacher, student, chunk_tokens=1000)
+    for chunk in (1, 3, 7, 40):
+        assert torch.allclose(full_kl_per_token(teacher, student, chunk_tokens=chunk),
+                              one_shot, atol=1e-6), chunk
+
+
+def test_full_kl_is_nonnegative():
+    torch.manual_seed(17)
+    for _ in range(20):
+        got = full_kl_per_token(torch.randn(8, 31), torch.randn(8, 31))
+        assert (got >= -1e-6).all()
+
+
+def test_full_kl_gradient_reaches_the_student_only():
+    teacher = torch.randn(6, 19, requires_grad=True)
+    student = torch.randn(6, 19, requires_grad=True)
+    full_kl_per_token(teacher, student).sum().backward()
+    assert student.grad is not None and student.grad.abs().sum() > 0
+    # The teacher is frozen: detached inside the kernel, so no gradient at all.
+    assert teacher.grad is None
+
+
+def test_full_kl_handles_an_empty_mask():
+    assert full_kl_per_token(torch.zeros(0, 5), torch.zeros(0, 5)).shape == (0,)
+
+
+# --- token-budgeted micro-batches (data.use_dynamic_bsz=True) -----------------
+
+
+def _splitter(**data_cfg):
+    """_split_micro_batches only touches self.config, so a stub is enough."""
+    from omegaconf import OmegaConf
+    from tensordict import TensorDict
+
+    stub = types.SimpleNamespace(config=OmegaConf.create({'data': data_cfg}))
+
+    def split(lengths, width=None):
+        width = width or max(lengths)
+        mask = torch.zeros(len(lengths), width, dtype=torch.long)
+        for row, length in enumerate(lengths):
+            mask[row, :length] = 1
+        batch = TensorDict({'attention_mask': mask, 'input_ids': mask.clone()},
+                           batch_size=len(lengths))
+        return FSDPSFTTrainer._split_micro_batches(stub, batch)
+
+    return split
+
+
+def test_dynamic_split_respects_the_padded_token_budget():
+    lengths = [10, 4000, 25, 3000, 8, 12, 900, 7, 1500, 30]
+    groups = _splitter(use_dynamic_bsz=True, max_token_len_per_gpu=8192)(lengths)
+    for group in groups:
+        real = group['attention_mask'].sum(dim=1)
+        # The cost that matters is rows * widest row, because the trainer trims
+        # each micro-batch to its widest row rather than packing it.
+        assert len(real) * int(real.max()) <= 8192
+
+
+def test_dynamic_split_keeps_every_row_exactly_once():
+    lengths = [10, 4000, 25, 3000, 8, 12, 900, 7, 1500, 30]
+    groups = _splitter(use_dynamic_bsz=True, max_token_len_per_gpu=8192)(lengths)
+    seen = sorted(int(n) for g in groups for n in g['attention_mask'].sum(dim=1))
+    assert seen == sorted(lengths)
+
+
+def test_dynamic_split_is_deterministic_for_gxpos_three_passes():
+    lengths = [10, 4000, 25, 3000, 8, 12, 900, 7, 1500, 30]
+    split = _splitter(use_dynamic_bsz=True, max_token_len_per_gpu=8192)
+    shapes = [[tuple(g['attention_mask'].shape) for g in split(lengths)] for _ in range(3)]
+    assert shapes[0] == shapes[1] == shapes[2]
+
+
+def test_dynamic_split_rejects_a_budget_below_the_longest_row():
+    with pytest.raises(ValueError, match='longest sequence'):
+        _splitter(use_dynamic_bsz=True, max_token_len_per_gpu=512)([10, 900])
+
+
+def test_dynamic_split_ignores_padding_width_not_real_length():
+    """Rows padded to max_length must be budgeted by their REAL length."""
+    split = _splitter(use_dynamic_bsz=True, max_token_len_per_gpu=8192)
+    # 40 rows of 100 real tokens each, padded out to 16384 as SFTDataset does.
+    groups = split([100] * 40, width=16384)
+    assert len(groups) == 1, 'real cost is 40*100=4000, well inside the budget'
+
+
+def test_fixed_split_is_unchanged_and_weights_reduce_to_one_over_n():
+    """The row-weighted accumulation must reproduce the old 1/n exactly."""
+    groups = _splitter(use_dynamic_bsz=False, micro_batch_size_per_gpu=4)([9] * 12)
+    assert [int(g.batch_size[0]) for g in groups] == [4, 4, 4]
+    total = sum(int(g.batch_size[0]) for g in groups)
+    assert all(abs(int(g.batch_size[0]) / total - 1 / len(groups)) < 1e-12 for g in groups)
+
+
+# --- launcher wiring ---------------------------------------------------------
+
+
+def test_launchers_distill_from_the_teacher_with_full_kl():
+    for name in ('run_kd_sft_hybrid_dapo_lighteval_1p5b.sh',
+                 'run_kd_sft_gxpo_hybrid_dapo_lighteval_1p5b.sh'):
+        text = _launcher(name)
+        assert 'data.kl_full=True' in text, name
+        assert 'DeepScaleR-1.5B-Preview' in text, name
+        # The teacher must NOT be the student's own init any more.
+        assert 'KL_REF_MODEL="${KL_REF_MODEL:-$MODEL}"' not in text, name
+        assert 'data.use_dynamic_bsz=True' in text, name
+        assert 'data.max_token_len_per_gpu=' in text, name
+
+
+def test_launchers_run_validation_and_benchmarks_every_ten_steps():
+    for name in ('run_kd_sft_hybrid_dapo_lighteval_1p5b.sh',
+                 'run_kd_sft_gxpo_hybrid_dapo_lighteval_1p5b.sh'):
+        text = _launcher(name)
+        assert 'data.val_files="$VAL"' in text, name
+        assert 'data.val_files=null' not in text, name
+        assert '++trainer.test_freq="${TEST_FREQ:-10}"' in text, name
+        assert '++trainer.benchmark_eval_freq="${BENCHMARK_EVAL_FREQ:-10}"' in text, name
+
+
+def test_launchers_carry_the_requested_schedule():
+    for name in ('run_kd_sft_hybrid_dapo_lighteval_1p5b.sh',
+                 'run_kd_sft_gxpo_hybrid_dapo_lighteval_1p5b.sh'):
+        text = _launcher(name)
+        assert 'LR="${LR:-5e-6}"' in text, name
+        assert 'TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-512}"' in text, name
+        assert 'MAX_LENGTH="${MAX_LENGTH:-16384}"' in text, name
+        assert 'trainer.total_training_steps="${MAX_STEPS:-300}"' in text, name
+        # total_training_steps is a min() cap against total_epochs*steps_per_epoch,
+        # so too few epochs would silently end the run early: 6391/512 = 12 steps
+        # per epoch, so 300 steps needs 25 epochs to bind.
+        assert 'trainer.total_epochs="${TOTAL_EPOCHS:-25}"' in text, name
+
+
+def test_trainer_builds_a_teacher_from_its_own_config():
+    source = (REPO / 'verl' / 'trainer' / 'fsdp_sft_trainer.py').read_text()
+    # Reusing the student's config drops an untied teacher lm_head silently.
+    assert 'ref_config = AutoConfig.from_pretrained(' in source
+    assert 'config=ref_config' in source
+    assert 'config=config, torch_dtype=torch.bfloat16' not in source
+    assert 'vocab_size' in source

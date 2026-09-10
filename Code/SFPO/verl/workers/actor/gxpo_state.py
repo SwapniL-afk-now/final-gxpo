@@ -25,7 +25,9 @@ from typing import Optional, Tuple
 import torch
 
 __all__ = ['GXPOState', 'geometric_sum_horner', 'compute_gxpo_retention_scale',
-           'compute_gxpo_update_retention_scale']
+           'compute_gxpo_update_retention_scale', 'adamw_direction',
+           'adamw_direction_from_step',
+           'compute_gxpo_adamw_direction_retention_scale', 'RetentionKind']
 
 
 def geometric_sum_horner(value: torch.Tensor, n: int) -> torch.Tensor:
@@ -38,45 +40,146 @@ def geometric_sum_horner(value: torch.Tensor, n: int) -> torch.Tensor:
     return result
 
 
-def compute_gxpo_retention_scale(g0: torch.Tensor, g1: torch.Tensor, K: int,
-                                 delta: float, *, clip_scale_g0: float = 1.0,
-                                 clip_scale_g1: float = 1.0,
-                                 g0_rms: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor,
-                                                                                torch.Tensor,
-                                                                                torch.Tensor,
-                                                                                torch.Tensor]:
-    """Compute production GXPO ratio/scale and diagnostic masks.
+class RetentionKind:
+    """How GXPO measures retention for one parameter tensor.
 
-    The retention ratio uses the gradients that actually drove each clipped
-    probe update: ``(c1 * g1) / (c0 * g0)``. Activity is determined per
-    parameter tensor using a relative RMS threshold. Inactive coordinates
-    receive neutral retention. Active ratios are clipped to [-2, 3],
-    non-finite ratios are replaced with one, and the geometric scale is
-    bounded to [1, K / 2 + 1]. ``delta`` remains the S_2 denominator guard.
+    GXPO extrapolates *optimizer-induced motion*, not raw-gradient motion. Which
+    of the three is correct is a property of the optimizer that owns the tensor:
+
+    ``LEGACY_GRAD``
+        ``r = (c1 * g1) / (c0 * g0)``, coordinatewise. Exact only when the step is
+        proportional to the gradient (plain SGD, where the optimizer direction IS
+        the gradient); this is the historical GXPO estimator, kept verbatim for
+        reproducibility and A/B ablation.
+    ``ADAMW_DIRECTION``
+        ``r = d1 / d0``, coordinatewise, where ``d_t`` is the adaptive
+        moment-preconditioned direction AdamW actually applied. It is
+        reconstructed from the real probe displacement (see
+        :func:`adamw_direction`), so it carries AdamW's first and second moments,
+        its bias correction, its epsilon convention, and the clipped gradient the
+        optimizer really consumed -- none of which ``g1 / g0`` sees.
+    ``MUON_UPDATE``
+        ``rho = <u0, u1> / <u0, u0>``, one scalar per matrix. Muon's geometry is
+        matrix-coupled: it normalizes the momentum matrix before Newton-Schulz
+        and scales the write-back by parameter shape alone, so its step size does
+        not depend on gradient magnitude and a coordinatewise rule would distort
+        the orthogonalized direction it chose.
+    """
+
+    LEGACY_GRAD = 'legacy_grad'
+    ADAMW_DIRECTION = 'adamw_direction'
+    MUON_UPDATE = 'muon_update'
+
+
+def adamw_direction(theta_before: torch.Tensor, theta_after: torch.Tensor, lr: float,
+                    weight_decay: float) -> torch.Tensor:
+    """Reconstruct the adaptive direction a decoupled-AdamW step actually applied.
+
+    Every decoupled-weight-decay AdamW implementation this actor can be built
+    with -- ``torch.optim.AdamW`` and the AdamW branch of
+    ``verl.workers.muon.Muon`` -- writes the parameter as::
+
+        theta_{t+1} = (1 - lr * weight_decay) * theta_t - lr * d_t
+
+    so with ``c = 1 - lr * weight_decay`` the direction is exactly::
+
+        d_t = (c * theta_t - theta_{t+1}) / lr
+
+    Reading ``d_t`` off the displacement instead of re-deriving it from
+    ``m_hat / (sqrt(v_hat) + eps)`` is deliberate: it depends on no optimizer
+    state-key names (``exp_avg``/``exp_avg_sq``/``step`` for torch,
+    ``moment1``/``moment2``/``step`` for Muon's branch), it inherits whichever
+    bias-correction and epsilon ordering that implementation chose, and it is
+    formed from the *clipped* gradient the optimizer was actually handed rather
+    than the raw one GXPO captured. It is therefore correct by construction for
+    both, and stays correct if either implementation changes internally.
+
+    ``lr`` must be strictly positive; at ``lr == 0`` (an LR-warmup step) the step
+    carries no direction at all and the caller must fall back to neutral
+    retention rather than divide by zero.
+    """
+    if not lr > 0.0:
+        raise ValueError(f'AdamW direction is undefined at lr={lr}; the caller must use '
+                         'neutral retention for a non-positive learning rate')
+    work_dtype = (torch.float64 if torch.float64 in (theta_before.dtype, theta_after.dtype)
+                  else torch.float32)
+    before = theta_before.to(dtype=work_dtype)
+    after = theta_after.to(dtype=work_dtype)
+    c = 1.0 - lr * weight_decay
+    return (before * c - after) / lr
+
+
+def adamw_direction_from_step(theta_before: torch.Tensor, u: torch.Tensor, lr: float,
+                              weight_decay: float) -> torch.Tensor:
+    """Same direction as :func:`adamw_direction`, read off the step instead of the endpoint.
+
+    When the caller already holds ``u = theta_{t+1} - theta_t`` (GXPO stores the first
+    probe displacement in the g1 slot), substituting ``theta_after = theta_t + u`` into
+    ``d_t = (c * theta_t - theta_after) / lr`` collapses to::
+
+        d_t = -(u / lr) - weight_decay * theta_t
+
+    which is algebraically identical and never forms ``theta_t + u``. That addition is
+    where the precision goes: at lr=1e-6 the step is |u| ~ 1e-7 against |theta| ~ 1e-2,
+    whose FP32 ulp is ~1.2e-9, so rounding the sum injects ~0.2-0.5% relative error into
+    d0 -- the denominator of r = d1 / d0 and the quantity the activity gate thresholds
+    on. Prefer this form wherever the displacement is in hand; ``adamw_direction``
+    remains correct (and necessary) when only the two endpoints are, as for d1, whose
+    ``theta_after`` is a real parameter.
+
+    ``lr`` must be strictly positive, for the same reason and with the same contract as
+    :func:`adamw_direction`.
+    """
+    if not lr > 0.0:
+        raise ValueError(f'AdamW direction is undefined at lr={lr}; the caller must use '
+                         'neutral retention for a non-positive learning rate')
+    work_dtype = (torch.float64 if torch.float64 in (theta_before.dtype, u.dtype)
+                  else torch.float32)
+    before = theta_before.to(dtype=work_dtype)
+    step = u.to(dtype=work_dtype)
+    return -(step / lr) - before * weight_decay
+
+
+def _coordinatewise_retention_scale(denominator: torch.Tensor, numerator: torch.Tensor,
+                                    K: int, delta: float, *, den_scale: float = 1.0,
+                                    num_scale: float = 1.0,
+                                    den_rms: Optional[torch.Tensor] = None
+                                    ) -> Tuple[torch.Tensor, torch.Tensor,
+                                               torch.Tensor, torch.Tensor]:
+    """Shared coordinatewise retention core for the gradient- and AdamW-direction paths.
+
+    The two paths differ only in *which signal* the ratio is formed from; the
+    stabilization is identical by construction, so that swapping the signal is
+    the only substantive difference between the legacy and optimizer-aware AdamW
+    arms: a relative-RMS activity gate on the denominator, neutral retention for
+    inactive coordinates, ratio clipping to [-2, 3], NaN/Inf -> neutral, and the
+    geometric scale S_K/S_2 bounded to [1, K / 2 + 1].
     """
     if K < 2:
         raise ValueError(f'GXPO K must be at least two, got {K}')
-    if g0.shape != g1.shape:
-        raise ValueError(f'g0 and g1 must have the same shape, got {g0.shape} and {g1.shape}')
+    if denominator.shape != numerator.shape:
+        raise ValueError('retention signals must have the same shape, got '
+                         f'{denominator.shape} and {numerator.shape}')
 
-    # Retention is gradient-sensitive. Widen BF16/FP16 inputs before any
-    # division or Horner recurrence; callers using FP32/FP64 retain their dtype.
-    work_dtype = torch.float64 if torch.float64 in (g0.dtype, g1.dtype) else torch.float32
-    g0_work = g0.to(dtype=work_dtype)
-    g1_work = g1.to(dtype=work_dtype)
-    one = torch.ones_like(g0_work)
-    # When supplied by the FSDP actor, g0_rms is reduced across the sharding
+    # Retention is signal-sensitive. Widen BF16/FP16 inputs before any division
+    # or Horner recurrence; callers using FP32/FP64 retain their dtype.
+    work_dtype = (torch.float64 if torch.float64 in (denominator.dtype, numerator.dtype)
+                  else torch.float32)
+    den_work = denominator.to(dtype=work_dtype)
+    num_work = numerator.to(dtype=work_dtype)
+    one = torch.ones_like(den_work)
+    # When supplied by the FSDP actor, den_rms is reduced across the sharding
     # process group. This makes the activity mask invariant to FSDP_SIZE.
-    if g0_rms is None:
-        g0_rms = g0_work.square().mean().sqrt()
+    if den_rms is None:
+        den_rms = den_work.square().mean().sqrt()
     else:
-        g0_rms = g0_rms.to(device=g0.device, dtype=work_dtype)
-    threshold = g0_rms * 1e-3
-    active = g0_work.abs() > threshold
+        den_rms = den_rms.to(device=denominator.device, dtype=work_dtype)
+    threshold = den_rms * 1e-3
+    active = den_work.abs() > threshold
     # Avoid invalid inactive-coordinate divisions without altering the active
-    # ratio. The input gradient buffers remain read-only.
-    denominator = torch.where(active, g0_work * clip_scale_g0, one)
-    candidate = (g1_work * clip_scale_g1) / denominator
+    # ratio. The input buffers remain read-only.
+    safe_den = torch.where(active, den_work * den_scale, one)
+    candidate = (num_work * num_scale) / safe_den
     finite = torch.isfinite(candidate)
     ratio_clipped = active & ((~finite) | (candidate < -2.0) | (candidate > 3.0))
     candidate.clamp_(-2.0, 3.0).nan_to_num_(nan=1.0)
@@ -89,6 +192,70 @@ def compute_gxpo_retention_scale(g0: torch.Tensor, g1: torch.Tensor, K: int,
     active_scale.clamp_(1.0, K / 2.0 + 1.0)
     scale = torch.where(active, active_scale, one)
     return ratio, scale, active, ratio_clipped
+
+
+def compute_gxpo_adamw_direction_retention_scale(d0: torch.Tensor, d1: torch.Tensor, K: int,
+                                                 delta: float, *,
+                                                 d0_rms: Optional[torch.Tensor] = None
+                                                 ) -> Tuple[torch.Tensor, torch.Tensor,
+                                                            torch.Tensor, torch.Tensor]:
+    """Optimizer-aware GXPO retention for AdamW-owned parameters.
+
+    ``r = d1 / d0``, coordinatewise, where ``d0`` and ``d1`` are the two adaptive
+    directions AdamW actually applied during the probe steps (see
+    :func:`adamw_direction`). This replaces the legacy ``g1 / g0``: AdamW does
+    not move the parameters along the gradient, it moves them along
+    ``m_hat / (sqrt(v_hat) + eps)``, and with beta1 = 0.9 / beta2 = 0.999 those
+    two change by very different factors between consecutive steps -- a gradient
+    that doubles moves ``m`` by 10% of the difference and ``sqrt(v)`` by far
+    less, so ``g1 / g0`` systematically overstates the motion AdamW will produce.
+
+    Stabilization is deliberately identical to the gradient-space estimator
+    (activity gate at 1e-3 * RMS, ratio in [-2, 3], scale in [1, K / 2 + 1]) so
+    that the retention *signal* is the only thing this changes. Activity is
+    judged on ``d0`` -- the quantity actually being divided by -- not on ``g0``.
+
+    Args:
+        d0: adaptive direction of the first probe step.
+        d1: adaptive direction of the second probe step.
+        K: extrapolation horizon.
+        delta: S_2 denominator guard.
+        d0_rms: RMS of ``d0`` reduced across the FSDP sharding process group, so
+            the activity threshold is invariant to shard count. Computed locally
+            when omitted.
+
+    Returns:
+        ``(ratio, scale, active, ratio_clipped)``, all shaped like ``d0``.
+    """
+    return _coordinatewise_retention_scale(d0, d1, K, delta, den_rms=d0_rms)
+
+
+def compute_gxpo_retention_scale(g0: torch.Tensor, g1: torch.Tensor, K: int,
+                                 delta: float, *, clip_scale_g0: float = 1.0,
+                                 clip_scale_g1: float = 1.0,
+                                 g0_rms: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor,
+                                                                                torch.Tensor,
+                                                                                torch.Tensor,
+                                                                                torch.Tensor]:
+    """Legacy raw-gradient GXPO ratio/scale and diagnostic masks.
+
+    The retention ratio uses the gradients that actually drove each clipped
+    probe update: ``(c1 * g1) / (c0 * g0)``. Activity is determined per
+    parameter tensor using a relative RMS threshold. Inactive coordinates
+    receive neutral retention. Active ratios are clipped to [-2, 3],
+    non-finite ratios are replaced with one, and the geometric scale is
+    bounded to [1, K / 2 + 1]. ``delta`` remains the S_2 denominator guard.
+
+    This is exact only when the optimizer moves the parameters along the
+    gradient, i.e. plain SGD. For AdamW it is an approximation that ignores the
+    moment preconditioner entirely; see
+    :func:`compute_gxpo_adamw_direction_retention_scale` for the optimizer-aware
+    replacement, which ``gxpo_retention_space=auto`` selects. This function is
+    retained -- and reachable via ``gxpo_retention_space=grad`` -- so the old
+    behavior stays exactly reproducible for A/B comparison.
+    """
+    return _coordinatewise_retention_scale(g0, g1, K, delta, den_scale=clip_scale_g0,
+                                           num_scale=clip_scale_g1, den_rms=g0_rms)
 
 
 def compute_gxpo_update_retention_scale(u0: Optional[torch.Tensor],

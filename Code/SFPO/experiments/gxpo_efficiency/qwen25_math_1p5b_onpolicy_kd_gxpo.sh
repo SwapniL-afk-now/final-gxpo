@@ -144,6 +144,26 @@ case "$GXPO_OPTIMIZER_STATE_MODE" in
   *) echo "PREFLIGHT FAIL: GXPO_OPTIMIZER_STATE_MODE must be transactional or transactional_fast_state, got '$GXPO_OPTIMIZER_STATE_MODE'" >&2; exit 2 ;;
 esac
 
+# Which space the retention ratio is measured in. GXPO models OPTIMIZER-induced
+# motion, and this run's optimizer is AdamW -- which does NOT move the parameters
+# along the gradient, it moves them along m_hat/(sqrt(v_hat)+eps).
+#   auto -- optimizer-aware: r = d1/d0, the ratio of the two adaptive directions
+#           AdamW actually applied, reconstructed from the real probe
+#           displacements as d_t = ((1 - lr*wd)*theta_t - theta_{t+1})/lr. That
+#           inversion carries AdamW's moments, bias correction, epsilon
+#           convention and the CLIPPED gradient it really consumed.
+#   grad -- legacy raw-gradient r = g1/g0, what every earlier run here used.
+# This is passed EXPLICITLY rather than left to the actor default, because this
+# launcher builds its own run name: an inherited default could change the
+# algorithm without changing the name. See GXPO_OPTIMIZER_AWARE_RETENTION.md.
+GXPO_RETENTION_SPACE="${GXPO_RETENTION_SPACE:-auto}"
+case "$GXPO_RETENTION_SPACE" in
+  auto)   RETENTION_TAG="_adamwdir" ;;
+  grad)   RETENTION_TAG="" ;;
+  update) echo "PREFLIGHT FAIL: GXPO_RETENTION_SPACE=update is the Muon per-matrix estimator; this is an AdamW run, use auto or grad" >&2; exit 2 ;;
+  *) echo "PREFLIGHT FAIL: GXPO_RETENTION_SPACE must be auto or grad, got '$GXPO_RETENTION_SPACE'" >&2; exit 2 ;;
+esac
+
 if [[ "$KD_SOURCE" == "offpolicy_oss" ]]; then
   RUN_NAME="${RUN_NAME:-${MODEL_ALIAS}_offpolicy_kd_gxpo_oss_k3_a0.1_b256_topk16}"
 else
@@ -153,6 +173,11 @@ PROJECT="${WANDB_PROJECT:-gxpo-efficiency-final}"
 # Keep the no-refresh arm in its own run dir / wandb run.
 if [[ -n "$OPT_STATE_TAG" && "$RUN_NAME" != *"$OPT_STATE_TAG" ]]; then
   RUN_NAME="${RUN_NAME}${OPT_STATE_TAG}"
+fi
+# Same guard for the retention estimator: 'auto' is a different algorithm from the
+# raw-gradient runs already on disk, so it must not inherit their run identity.
+if [[ -n "$RETENTION_TAG" && "$RUN_NAME" != *"$RETENTION_TAG"* ]]; then
+  RUN_NAME="${RUN_NAME}${RETENTION_TAG}"
 fi
 RUN_DIR="${RUN_DIR:-$GXPO_PROJECT_ROOT/results/gxpo_efficiency/$RUN_NAME}"
 
@@ -314,6 +339,7 @@ mkdir -p "$VLLM_CACHE_ROOT" "$VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR"
   actor_rollout_ref.actor.use_kl_loss=False \
   actor_rollout_ref.actor.entropy_coeff="${ENTROPY_COEFF:-0}" \
   +actor_rollout_ref.actor.gxpo_optimizer_state_mode="$GXPO_OPTIMIZER_STATE_MODE" \
+  +actor_rollout_ref.actor.gxpo_retention_space="$GXPO_RETENTION_SPACE" \
   actor_rollout_ref.actor.kl_loss_coef=0.0 \
   actor_rollout_ref.actor.fsdp_config.param_offload=False \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \

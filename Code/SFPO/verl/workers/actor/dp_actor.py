@@ -32,7 +32,10 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.workers.actor import BasePPOActor
-from verl.workers.actor.gxpo_state import (GXPOState, compute_gxpo_retention_scale,
+from verl.workers.actor.gxpo_state import (GXPOState, RetentionKind, adamw_direction,
+                                          adamw_direction_from_step,
+                                          compute_gxpo_adamw_direction_retention_scale,
+                                          compute_gxpo_retention_scale,
                                           compute_gxpo_update_retention_scale)
 from verl.workers.actor.optimizer_transaction import snapshot_optimizer_state
 from verl.utils.py_functional import append_to_dict
@@ -114,7 +117,8 @@ class DataParallelPPOActor(BasePPOActor):
         # GXPO: shutoff-gate state + lazily allocated per-parameter buffers
         self.gxpo_state = None
         self._gxpo_bufs = None
-        self._gxpo_update_space_cache = None
+        self._gxpo_retention_cache = None
+        self._gxpo_unsupported_optimizer_warned = False
         self._gxpo_precision_validated = False
         self._gxpo_strict_precision = bool(self.config.get('gxpo_strict_precision', True))
         self._gxpo_fsdp_invariant_threshold = bool(
@@ -1102,67 +1106,85 @@ class DataParallelPPOActor(BasePPOActor):
 
     @staticmethod
     def _gxpo_default_metrics(enabled: float = 0.0, z_score: float = 0.0) -> dict:
+        """Metrics defined on a step where the GXPO 3-pass update did NOT run.
+
+        Only the gate state qualifies. Everything else -- norms, retention
+        ratios, scales, displacements -- is a measurement of an update that did
+        not happen, and zero-filling it made a fallback step indistinguishable
+        in wandb from a real step whose retention happened to be zero. The
+        retention keys are therefore absent here, exactly as the per-family
+        keys are absent from a GXPO step that did not use that family.
+        ``reduce_metrics`` is a per-key mean with no key union, so an absent key
+        simply does not contribute to that step.
+        """
         return {
             'actor/gxpo_enabled': enabled,
             'actor/gxpo_trigger_z': z_score,
             'actor/gxpo_trigger_stat': 0.0,
             'actor/gxpo_trigger_streak': 0.0,
-            'actor/gxpo_g0_norm': 0.0,
-            'actor/gxpo_g1_norm': 0.0,
-            'actor/gxpo_gslow_norm': 0.0,
-            'actor/gxpo_r_mean': 0.0,
-            'actor/gxpo_r_std': 0.0,
-            'actor/gxpo_scale_mean': 0.0,
-            'actor/gxpo_scale_max': 0.0,
-            'actor/gxpo_disp2_norm': 0.0,
-            'actor/gxpo_dispK_norm': 0.0,
-            'actor/gxpo_dispK_over_disp2': 0.0,
-            'actor/gxpo_cos_g0_g1': 0.0,
-            'actor/gxpo_cos_g0_gslow': 0.0,
-            'actor/gxpo_inactive_frac': 0.0,
-            'actor/gxpo_ratio_clip_frac': 0.0,
-            'actor/gxpo_clip_scale_g0': 0.0,
-            'actor/gxpo_clip_scale_g1': 0.0,
-            'actor/gxpo_relative_threshold_reject_frac': 0.0,
-            'actor/gxpo_update_space_params': 0.0,
-            'actor/gxpo_retention_rho_mean': 0.0,
-            'actor/gxpo_update_scale_mean': 0.0,
-            'actor/gxpo_retention_rho_negative_frac': 0.0,
         }
 
     def _gxpo_init_buffers(self):
         if self._gxpo_bufs is not None:
             return
         self._gxpo_params = [p for p in self.actor_module.parameters() if p.requires_grad]
-        # Three buffers, never four. The update-space estimator needs u0 =
-        # theta1 - theta0, but it does not need a buffer of its own: for a
-        # Muon-owned parameter the g1 slot is dead weight. g1 exists only to
-        # form the coordinatewise ratio r = g1/g0 and its moment diagnostics,
-        # and that ratio is precisely the quantity this fix showed carries no
-        # information about Muon's displacement. So Muon-owned parameters store
-        # u0 in their g1 slot instead, and never capture g1 at all. The shutoff
-        # gate is unaffected -- it reads g0 and the corrective gradient, never g1.
+        # Three buffers, never four. Both optimizer-aware estimators need
+        # u0 = theta1 - theta0, and neither needs a buffer of its own: for a
+        # parameter they own, the g1 slot is dead weight. g1 exists only to form
+        # the legacy coordinatewise ratio r = g1/g0 and its moment diagnostics --
+        # a ratio that describes neither Muon's displacement (its step size is
+        # gradient-magnitude invariant) nor AdamW's (its step is the
+        # moment-preconditioned direction, not the gradient). So those parameters
+        # store u0 in their g1 slot instead and never capture g1 at all; the
+        # AdamW path recovers theta1 = theta0 + u0 from it and forms both
+        # directions. The shutoff gate is unaffected -- it reads g0 and the
+        # corrective gradient, never g1.
         self._gxpo_bufs = {
             name: [torch.empty_like(p) for p in self._gxpo_params]
             for name in ('theta0', 'g0', 'g1')
         }
 
-    def _gxpo_update_space_mask(self):
-        """Per-parameter mask selecting the update-space retention estimator.
+    def _gxpo_adamw_direction_supported(self) -> bool:
+        """Whether this optimizer's non-Muon parameters take a decoupled-AdamW step.
 
-        Returns None when every parameter should keep the gradient-space path,
-        None means every parameter keeps the gradient-space path.
+        The AdamW-direction estimator reconstructs ``d_t`` from the parameter
+        displacement, which is exact for -- and only for -- an update of the form
+        ``theta_{t+1} = (1 - lr * wd) * theta_t - lr * d_t``. Two implementations
+        in this tree have that form: ``torch.optim.AdamW`` and the AdamW branch
+        of ``verl.workers.muon.Muon``. Anything else (SGD, ``torch.optim.Adam``,
+        whose weight decay is coupled into the gradient, an unknown wrapper) is
+        NOT silently treated as AdamW.
+        """
+        optimizer = self.actor_optimizer
+        if isinstance(optimizer, torch.optim.AdamW):
+            return True
+        try:
+            from verl.workers.muon import Muon
+        except ImportError:  # pragma: no cover - muon is always importable in-tree
+            return False
+        return isinstance(optimizer, Muon)
+
+    def _gxpo_retention_kinds(self):
+        """Per-parameter retention classification, cached for the actor's lifetime.
+
+        Returns a list of :class:`RetentionKind` values aligned with
+        ``self._gxpo_params``, or None when every parameter takes the legacy
+        gradient-space path (the historical fast path, kept so a pure-legacy run
+        allocates and branches exactly as it always did).
 
         ``gxpo_retention_space``:
-          ``auto``   -- update-space for Muon-owned parameters, gradient-space
-                        for the rest. Under a plain AdamW optimizer no parameter
-                        carries ``use_muon``, so this is a no-op and existing
-                        AdamW baselines stay bit-identical.
-          ``grad``   -- force today's behavior everywhere (clean A/B control).
-          ``update`` -- force update-space everywhere.
+          ``auto``   -- optimizer-aware. A Muon-owned matrix gets per-matrix
+                        update-space retention; a parameter owned by a recognized
+                        decoupled-AdamW implementation gets coordinatewise
+                        AdamW-direction retention. An unrecognized optimizer falls
+                        back to legacy gradient space with one warning rather than
+                        being silently modelled as AdamW.
+          ``grad``   -- force the legacy raw-gradient estimator everywhere
+                        (clean A/B control; reproduces the pre-patch behavior).
+          ``update`` -- force update-space everywhere (unchanged forced control).
         """
-        if self._gxpo_update_space_cache is not None:
-            return self._gxpo_update_space_cache[0]
+        if self._gxpo_retention_cache is not None:
+            return self._gxpo_retention_cache[0]
 
         space = str(self.config.get('gxpo_retention_space', 'auto')).lower()
         if space not in ('auto', 'grad', 'update'):
@@ -1170,20 +1192,65 @@ class DataParallelPPOActor(BasePPOActor):
                 f"gxpo_retention_space must be one of auto|grad|update, got '{space}'")
 
         if space == 'grad':
-            mask = None
+            kinds = None
         elif space == 'update':
-            mask = [True] * len(self._gxpo_params)
+            kinds = [RetentionKind.MUON_UPDATE] * len(self._gxpo_params)
         else:
             # Muon tags every parameter it owns at construction time
             # (verl/workers/muon.py, `self.state[p]['use_muon'] = ...`). Absent
-            # for any other optimizer, hence the False default.
+            # for any other optimizer, hence the None default below.
             state = getattr(self.actor_optimizer, 'state', {})
-            mask = [bool(state.get(p, {}).get('use_muon', False)) for p in self._gxpo_params]
-            if not any(mask):
-                mask = None
+            adamw_ok = self._gxpo_adamw_direction_supported()
+            non_muon = (RetentionKind.ADAMW_DIRECTION if adamw_ok
+                        else RetentionKind.LEGACY_GRAD)
+            kinds = []
+            for parameter in self._gxpo_params:
+                use_muon = state.get(parameter, {}).get('use_muon', None)
+                kinds.append(RetentionKind.MUON_UPDATE if use_muon else non_muon)
+            if not adamw_ok and not self._gxpo_unsupported_optimizer_warned:
+                self._gxpo_unsupported_optimizer_warned = True
+                if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                    print(f'[GXPO] WARNING: gxpo_retention_space=auto does not recognize '
+                          f'{type(self.actor_optimizer).__name__} as a decoupled-AdamW '
+                          f'optimizer; its parameters fall back to the legacy '
+                          f'gradient-space estimator r = g1/g0 rather than being modelled '
+                          f'with the AdamW optimizer-direction rule.', flush=True)
+            if all(kind == RetentionKind.LEGACY_GRAD for kind in kinds):
+                kinds = None
 
-        self._gxpo_update_space_cache = (mask,)
-        return mask
+        self._gxpo_retention_cache = (kinds,)
+        return kinds
+
+    @staticmethod
+    def _gxpo_u0_slot_mask(kinds):
+        """Which g1 slots hold ``u0 = theta1 - theta0`` instead of a raw gradient.
+
+        Both non-legacy estimators need the first probe displacement and neither
+        needs raw ``g1``: Muon reads ``<u0, u1>/<u0, u0>`` off it, and the AdamW
+        path reconstructs ``theta1 = theta0 + u0`` to form ``d0`` and ``d1``. So
+        both borrow the g1 slot and GXPO still allocates three model-sized
+        buffers, never four. The shutoff gate is unaffected -- it reads g0 and
+        the corrective gradient, never g1.
+        """
+        if kinds is None:
+            return None
+        return [kind != RetentionKind.LEGACY_GRAD for kind in kinds]
+
+    def _gxpo_param_group_hparams(self):
+        """Return ``(lrs, weight_decays)`` aligned with ``self._gxpo_params``.
+
+        Read from the live param groups rather than assumed constant: LR is
+        schedule-driven and both may differ per group. ``torch.optim.AdamW``
+        names the decay ``weight_decay``; Muon names it ``wd``.
+        """
+        lookup = {}
+        for group in self.actor_optimizer.param_groups:
+            lr = float(group.get('lr', 0.0))
+            decay = float(group.get('weight_decay', group.get('wd', 0.0)))
+            for parameter in group['params']:
+                lookup[id(parameter)] = (lr, decay)
+        pairs = [lookup.get(id(p), (0.0, 0.0)) for p in self._gxpo_params]
+        return [lr for lr, _ in pairs], [wd for _, wd in pairs]
 
     @staticmethod
     def _all_ranks_flag(value: bool, device, reduce_op=None) -> bool:
@@ -1195,14 +1262,28 @@ class DataParallelPPOActor(BasePPOActor):
             torch.distributed.all_reduce(flag, op=reduce_op)
         return bool(flag.item())
 
-    def _gxpo_global_g0_rms(self, gradients):
-        """Return per-flat-parameter RMS values invariant to FSDP shard size."""
-        if not gradients:
+    def _gxpo_global_tensor_rms(self, tensors):
+        """Return per-flat-tensor RMS values invariant to FSDP shard size.
+
+        Used for both retention activity thresholds: RMS(g0) on the legacy
+        gradient path and RMS(d0) on the AdamW optimizer-direction path. One
+        collective covers every tensor.
+
+        ``tensors`` may be a generator, and each element is reduced to two
+        scalars before the next is produced. That lets the AdamW caller stream
+        freshly derived directions through here without ever holding a second
+        full-model copy of them.
+        """
+        norms, counts = [], []
+        for tensor in tensors:
+            widened = tensor.float()
+            norms.append(torch.linalg.vector_norm(widened))
+            counts.append(widened.numel())
+        if not norms:
             return []
-        norms = torch.stack([torch.linalg.vector_norm(gradient.float()) for gradient in gradients])
-        counts = torch.tensor([gradient.numel() for gradient in gradients],
-                              dtype=torch.float32, device=norms.device)
-        stats = torch.stack((norms.square(), counts))
+        stats = torch.stack((torch.stack(norms).square(),
+                             torch.tensor(counts, dtype=torch.float32,
+                                          device=norms[0].device)))
         if torch.distributed.is_initialized() and isinstance(self.actor_module, FSDP):
             # FSDP.process_group is the sharding group for both FULL_SHARD and
             # HYBRID_SHARD. Do not reduce over the replica dimension a second
@@ -1211,7 +1292,7 @@ class DataParallelPPOActor(BasePPOActor):
                                          group=self.actor_module.process_group)
         return (stats[0] / stats[1].clamp_min(1.0)).sqrt().unbind()
 
-    def _gxpo_update_space_dots(self, params, theta0, u0_bufs, update_space):
+    def _gxpo_update_space_dots(self, params, theta0, u0_bufs, muon_mask):
         """Return per-parameter ``[<u0, u1>, <u0, u0>]``, summed across FSDP shards.
 
         Retention in update space is a property of the *whole* parameter matrix,
@@ -1222,7 +1303,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         Returns None when nothing uses the update-space path.
         """
-        selected = [i for i, use in enumerate(update_space) if use]
+        selected = [i for i, use in enumerate(muon_mask) if use]
         if not selected:
             return None
         rows = []
@@ -1238,11 +1319,45 @@ class DataParallelPPOActor(BasePPOActor):
             rows.append(torch.stack(((u0 * disp2).sum() - self_dot, self_dot)))
         dots = torch.stack(rows)
         if torch.distributed.is_initialized() and isinstance(self.actor_module, FSDP):
-            # Same group and same reasoning as _gxpo_global_g0_rms: shard
+            # Same group and same reasoning as _gxpo_global_tensor_rms: shard
             # dimension only, never the replica dimension.
             torch.distributed.all_reduce(dots, op=torch.distributed.ReduceOp.SUM,
                                          group=self.actor_module.process_group)
         return dict(zip(selected, dots.unbind()))
+
+    def _gxpo_adamw_direction_rms(self, indices, theta0, u0_bufs, lrs, weight_decays):
+        """Return ``{index: RMS(d0)}`` for the AdamW-direction parameters.
+
+        The activity gate divides by ``d0``, so it must be thresholded on ``d0``
+        -- not on ``g0``, which is a different quantity once the moment
+        preconditioner is in the loop. Each ``d0`` is rebuilt transiently and
+        released as soon as its norm is taken, so this costs one extra
+        elementwise pass and no persistent memory; the main loop rebuilds it.
+
+        One collective, reduced over the FSDP sharding process group only, keeps
+        the threshold invariant to shard count exactly as the g0 path is.
+        """
+        if not indices:
+            return {}
+
+        # Some Muon parameter groups intentionally have lr=0 during a schedule
+        # boundary. No AdamW direction exists for those parameters; the main
+        # reposition loop already assigns neutral retention there. Do not send
+        # them through adamw_direction(), whose division-by-zero guard is meant
+        # to protect direct callers.
+        valid_indices = [i for i in indices if lrs[i] > 0.0]
+        if not valid_indices:
+
+            return {}
+        def directions():
+            for i in valid_indices:
+                # u0 lives in the g1 slot, so d0 comes straight off the step --
+                # forming theta0 + u0 only to subtract theta0 back off would round
+                # away digits the ratio's denominator needs.
+                yield adamw_direction_from_step(theta0[i].float(), u0_bufs[i].float(),
+                                                lrs[i], weight_decays[i])
+
+        return dict(zip(valid_indices, self._gxpo_global_tensor_rms(directions())))
 
     def _gxpo_validate_precision_contract(self):
         """Fail on every rank if AdamW/GXPO state has fallen out of FP32."""
@@ -1282,7 +1397,7 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_bufs = None
         self._gxpo_params = []
         # Keyed on the released parameter objects; must not outlive them.
-        self._gxpo_update_space_cache = None
+        self._gxpo_retention_cache = None
 
     def _gxpo_capture_grads(self, bufs, skip=None):
         """Copy p.grad into bufs. ``skip`` marks slots holding something else."""
@@ -1369,7 +1484,19 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_init_buffers()
         params = self._gxpo_params
         theta0, g0_bufs, g1_bufs = (self._gxpo_bufs[k] for k in ('theta0', 'g0', 'g1'))
-        update_space = self._gxpo_update_space_mask()
+        kinds = self._gxpo_retention_kinds()
+        # Slots whose g1 buffer holds u0 rather than a raw gradient.
+        u0_slots = self._gxpo_u0_slot_mask(kinds)
+        adamw_indices = ([i for i, kind in enumerate(kinds)
+                          if kind == RetentionKind.ADAMW_DIRECTION] if kinds else [])
+        muon_mask = ([kind == RetentionKind.MUON_UPDATE for kind in kinds]
+                     if kinds else None)
+        # Per-parameter (lr, weight_decay) as of each probe step. AdamW's
+        # decoupled update is theta_{t+1} = (1 - lr*wd) * theta_t - lr * d_t, so
+        # both are needed to invert it. They are read from the live param groups
+        # after each step rather than assumed constant: LR is schedule-driven and
+        # both may differ per group.
+        lrs0 = wds0 = lrs1 = wds1 = None
 
         with torch.no_grad():
             self._gxpo_copy_parameters(theta0, [p.data for p in params])
@@ -1425,14 +1552,17 @@ class DataParallelPPOActor(BasePPOActor):
             return fallback()
 
         # u0 = theta1 - theta0, the first real optimizer step, written into the
-        # g1 slot of each Muon-owned parameter (see _gxpo_init_buffers). Done in
-        # place via copy-then-subtract so no full-size temporary is materialized.
-        if update_space is not None:
+        # g1 slot of every parameter on an optimizer-aware estimator (see
+        # _gxpo_init_buffers). Done in place via copy-then-subtract so no
+        # full-size temporary is materialized.
+        if u0_slots is not None:
             with torch.no_grad():
-                for i, use in enumerate(update_space):
+                for i, use in enumerate(u0_slots):
                     if use:
                         g1_bufs[i].copy_(params[i].data)
                         g1_bufs[i].sub_(theta0[i])
+        if adamw_indices:
+            lrs0, wds0 = self._gxpo_param_group_hparams()
 
         # Pass 2: g1 at theta_{t,1}
         try:
@@ -1443,7 +1573,7 @@ class DataParallelPPOActor(BasePPOActor):
             restore_probe_state()
             raise
         # Capture raw gradients before clipping, matching g0.
-        self._gxpo_capture_grads(g1_bufs, skip=update_space)
+        self._gxpo_capture_grads(g1_bufs, skip=u0_slots)
         step_start = time.perf_counter()
         gn1 = probe_clip_grads().detach().item()
         clip_scale_g1 = min(1.0, float(self.config.get('grad_clip', 1.0)) / (abs(gn1) + 1e-12))
@@ -1455,6 +1585,8 @@ class DataParallelPPOActor(BasePPOActor):
         self._gxpo_power_guard(step_start)
         if not valid_gn1_global:
             return fallback()
+        if adamw_indices:
+            lrs1, wds1 = self._gxpo_param_group_hparams()
 
         # Retention ratio, geometric scale, reposition (theta2 is the live p.data)
         device = theta0[0].device
@@ -1477,6 +1609,18 @@ class DataParallelPPOActor(BasePPOActor):
         # silently make runs on the two paths incomparable.
         upd_stats = torch.zeros(3, dtype=torch.float32, device=device)  # [rho_sum, scale_sum, n_neg]
         n_update_space = 0
+        # AdamW optimizer-direction aggregates, again kept apart: r = d1/d0 is a
+        # different quantity from both the legacy gradient ratio and Muon's rho,
+        # and averaging them together would report a number describing nothing.
+        # [sum_r, sum_r_sq, n_active, ratio_clipped, n_coords, scale_sum,
+        #  d0_sq, d1_sq, dot_d0_d1]
+        # The last three are the AdamW analogue of g0_sq/g1_sq/dot_g0_g1: without
+        # them an 'auto' run reports no magnitude or turn information about the
+        # directions it is extrapolating, because the g1 slot holds u0.
+        adamw_stats = torch.zeros(9, dtype=torch.float32, device=device)
+        n_grad_params = 0
+        adamw_scale_max = torch.zeros(1, dtype=torch.float32, device=device)
+        n_adamw_params = 0
         scale_max = torch.zeros(1, dtype=torch.float32, device=device)
         param_sq = torch.zeros(1, dtype=torch.float32, device=device)
         do_diag = self._gxpo_diag_freq > 0 and (step_idx % self._gxpo_diag_freq == 0)
@@ -1499,14 +1643,20 @@ class DataParallelPPOActor(BasePPOActor):
                     torch.cuda.synchronize()
 
             global_g0_rms = (
-                self._gxpo_global_g0_rms(g0_bufs)
+                self._gxpo_global_tensor_rms(g0_bufs)
                 if self._gxpo_fsdp_invariant_threshold else [None] * len(g0_bufs)
             )
-            # Collective for the update-space path: must be reached by every rank
-            # unconditionally, so it sits outside the per-parameter loop.
+            # Collectives for the two optimizer-aware paths: each must be reached
+            # by every rank unconditionally, so they sit outside the
+            # per-parameter loop. Every rank classifies the same parameters, so
+            # every rank takes the same branch here.
             update_dots = (
-                self._gxpo_update_space_dots(params, theta0, g1_bufs, update_space)
-                if update_space is not None else None
+                self._gxpo_update_space_dots(params, theta0, g1_bufs, muon_mask)
+                if muon_mask is not None and any(muon_mask) else None
+            )
+            adamw_d0_rms = (
+                self._gxpo_adamw_direction_rms(adamw_indices, theta0, g1_bufs, lrs0, wds0)
+                if adamw_indices and self._gxpo_fsdp_invariant_threshold else {}
             )
             _p2_sync_every = max(1, _GXPO_NORM_CHUNK)
             for _p2_i, (p, t0, g0b, g1b, g0_rms) in enumerate(
@@ -1520,7 +1670,9 @@ class DataParallelPPOActor(BasePPOActor):
                 # ---- resolution at grad magnitudes ~1e-4..1e-2 with a 1e-8
                 # ---- activity gate); the write-back casts to param dtype.
                 # ---- Under FP32 params these float() calls are no-ops.
-                is_update_space = update_dots is not None and _p2_i in update_dots
+                kind = kinds[_p2_i] if kinds is not None else RetentionKind.LEGACY_GRAD
+                is_update_space = kind == RetentionKind.MUON_UPDATE
+                is_adamw_direction = kind == RetentionKind.ADAMW_DIRECTION
                 if is_update_space:
                     # Muon-owned matrix: gradient ratios say nothing about its
                     # displacement (its step size is gradient-magnitude
@@ -1540,6 +1692,63 @@ class DataParallelPPOActor(BasePPOActor):
                     upd_stats[1] += scale
                     upd_stats[2] += (rho_u < 0).float()
                     n_update_space += 1
+                elif is_adamw_direction:
+                    # AdamW-owned parameter: retention is the ratio of the two
+                    # *adaptive* directions the optimizer actually applied, not
+                    # of the raw gradients. Both are reconstructed from the real
+                    # probe displacements, which is what makes this exact rather
+                    # than a re-derivation of AdamW's internals:
+                    #
+                    #   theta1 = theta0 + u0                (u0 lives in the g1 slot)
+                    #   d0 = (c0 * theta0 - theta1) / lr0
+                    #   d1 = (c1 * theta1 - theta2) / lr1,  c = 1 - lr * weight_decay
+                    #
+                    # so d_t carries AdamW's moments, bias correction, epsilon
+                    # convention, and the clipped gradient it was really handed.
+                    # g1b holds u0 for these parameters, so the gradient-space
+                    # estimator is not merely wrong here, it is inapplicable.
+                    lr0, wd0 = lrs0[_p2_i], wds0[_p2_i]
+                    lr1, wd1 = lrs1[_p2_i], wds1[_p2_i]
+                    n_adamw_params += 1
+                    adamw_stats[4] += g0b.numel()
+                    if lr0 > 0.0 and lr1 > 0.0:
+                        t0f = t0.float()
+                        u0 = g1b.float()
+                        theta1 = t0f + u0
+                        # d0 from the step, not the endpoint: theta1 rounds u0
+                        # (~1e-7) against t0 (~1e-2), and d0 is what d1 divides by.
+                        d0 = adamw_direction_from_step(t0f, u0, lr0, wd0)
+                        del u0
+                        d1 = adamw_direction(theta1, p.data.float(), lr1, wd1)
+                        del theta1
+                        r, scale, active, ratio_clipped = (
+                            compute_gxpo_adamw_direction_retention_scale(
+                                d0, d1, K, delta, d0_rms=adamw_d0_rms.get(_p2_i)))
+                        adamw_stats[6] += d0.square().sum()
+                        adamw_stats[7] += d1.square().sum()
+                        adamw_stats[8] += (d0 * d1).sum()
+                        del d0, d1
+                        adamw_stats[0] += r.sum()
+                        adamw_stats[1] += r.square().sum()
+                        adamw_stats[2] += active.sum()
+                        adamw_stats[3] += ratio_clipped.sum()
+                        adamw_stats[5] += scale.sum()
+                        # A zero-sized parameter can produce an empty scale
+                        # tensor under FSDP. It contributes no coordinates and
+                        # must not be reduced with amax (PyTorch rejects an
+                        # empty reduction); the neutral accumulator remains
+                        # valid for the minibatch.
+                        if scale.numel():
+                            adamw_scale_max = torch.maximum(
+                                adamw_scale_max, scale.amax().reshape(1))
+                    else:
+                        # LR warmup step: the probe steps moved nothing along a
+                        # direction, so there is no retention to read. Neutral
+                        # scale, and no coordinate counted as active.
+                        scale = torch.ones((), dtype=torch.float32, device=device)
+                        adamw_stats[5] += float(g0b.numel())
+                        adamw_scale_max = torch.maximum(
+                            adamw_scale_max, torch.ones_like(adamw_scale_max))
                 else:
                     # ---- Grad-level precision: g0/g1 buffers inherit param dtype
                     # ---- via empty_like. The r = g1/g0 ratio, K-step Horner sums,
@@ -1547,6 +1756,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # ---- resolution at grad magnitudes ~1e-4..1e-2 with a 1e-8
                     # ---- activity gate); the write-back casts to param dtype.
                     # ---- Under FP32 params these float() calls are no-ops.
+                    n_grad_params += 1
                     g0f = g0b.float()
                     g1f = g1b.float()
                     r, scale, active, ratio_clipped = compute_gxpo_retention_scale(
@@ -1574,7 +1784,7 @@ class DataParallelPPOActor(BasePPOActor):
                 disp2 = p.data.float() - t0.float()
                 stats[3] += disp2.square().sum()
 
-                if do_diag and not is_update_space:
+                if do_diag and kind == RetentionKind.LEGACY_GRAD:
                     # Table 6: closed-form S_K/S_2 vs explicit Horner sums.
                     # Gradient-space only: this compares two ways of evaluating
                     # S_K(r)/S_2(r), and the update-space path has no r.
@@ -1656,12 +1866,29 @@ class DataParallelPPOActor(BasePPOActor):
 
         # single global reduction so every rank takes the identical gate decision
         if torch.distributed.is_initialized():
-            full = torch.cat([stats, gslow_stats])
+            # adamw_stats holds coordinatewise sums over this rank's shard and is
+            # reduced with the rest. upd_stats deliberately is not: rho is already
+            # globally reduced inside _gxpo_update_space_dots, and n_update_space
+            # is a parameter count identical on every rank, so summing would
+            # multiply both by the world size.
+            full = torch.cat([stats, gslow_stats, adamw_stats])
             torch.distributed.all_reduce(full, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(scale_max, op=torch.distributed.ReduceOp.MAX)
+            maxima = torch.cat([scale_max, adamw_scale_max])
+            torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX)
+            scale_max, adamw_scale_max = maxima[:1], maxima[1:]
             torch.distributed.all_reduce(param_sq, op=torch.distributed.ReduceOp.SUM)
-            stats, gslow_stats = full[:stats.numel()], full[stats.numel():]
+            stats, gslow_stats, adamw_stats = (full[:stats.numel()],
+                                               full[stats.numel():stats.numel() + gslow_stats.numel()],
+                                               full[stats.numel() + gslow_stats.numel():])
         param_norm = float(param_sq.sqrt().item())
+
+        (adamw_sum_r, adamw_sum_r_sq, adamw_n_active, adamw_ratio_clipped,
+         adamw_n_coords, adamw_scale_sum, adamw_d0_sq, adamw_d1_sq,
+         adamw_dot_d0d1) = adamw_stats.tolist()
+        adamw_coords = max(adamw_n_coords, 1.0)
+        adamw_r_mean = adamw_sum_r / adamw_coords
+        adamw_r_var = max(adamw_sum_r_sq / adamw_coords - adamw_r_mean**2, 0.0)
+        adamw_d0_norm, adamw_d1_norm = adamw_d0_sq**0.5, adamw_d1_sq**0.5
 
         upd_rho_sum, upd_scale_sum, upd_n_neg = upd_stats.tolist()
         _upd_denom = max(n_update_space, 1)
@@ -1740,49 +1967,89 @@ class DataParallelPPOActor(BasePPOActor):
 
         metrics = pass3_metrics
         append_to_dict(metrics, {'actor/grad_norm': float(gn_slow)})
+        # Retention-kind census. A metric is emitted ONLY when the estimator that
+        # defines it actually ran: under 'auto' the g1 slot holds u0 rather than a
+        # gradient, so g1_norm / r_mean / r_std / cos_g0_g1 have no value, and
+        # reporting 0.0 for them is worse than reporting nothing -- wandb cannot
+        # distinguish a placeholder from a measurement and draws a flat line
+        # through every retention plot. Absent is unambiguous: reduce_metrics is a
+        # per-key np.mean with no key union, so a key simply missing from some
+        # steps averages over the steps where it meant something.
+        # 0 legacy_grad, 1 adamw_direction, 2 muon_update, 3 mixed. Codes match
+        # the SFT arm so the two can be plotted together.
+        has_grad = n_grad_coords > 0
+        has_adamw = adamw_n_coords > 0
+        has_muon = n_update_space > 0
+        _kinds_present = sum((has_grad, has_adamw, has_muon))
+        retention_kind_code = (3.0 if _kinds_present > 1
+                               else 2.0 if has_muon
+                               else 1.0 if has_adamw
+                               else 0.0)
         append_to_dict(metrics, {
             'actor/gxpo_enabled': 1.0,
             'actor/gxpo_trigger_z': float(z_score),
             'actor/gxpo_trigger_stat': float(trigger_stat),
             'actor/gxpo_trigger_streak': float(state.trigger_streak),
+            'actor/gxpo_retention_kind': retention_kind_code,
+            'actor/gxpo_legacy_grad_params': float(n_grad_params),
+            'actor/gxpo_update_space_params': float(n_update_space),
+            'actor/gxpo_adamw_direction_params': float(n_adamw_params),
+            # Path-agnostic: these describe the reposition itself, not a ratio,
+            # so they are defined whichever estimator ran.
             'actor/gxpo_g0_norm': g0_norm,
-            'actor/gxpo_g1_norm': g1_norm,
             'actor/gxpo_gslow_norm': gslow_norm,
-            'actor/gxpo_r_mean': r_mean,
-            'actor/gxpo_r_std': r_var**0.5,
             'actor/gxpo_scale_mean': scale_sum / max(n_total, 1.0),
-            # alpha*scale as actually applied (post-clamp): >1 extrapolates past theta2,
-            # <1 contracts back toward theta0. Watch this, not scale_mean.
             'actor/gxpo_effective_multiplier': eff_mean,
             'actor/gxpo_contracting': 1.0 if eff_mean < 1.0 else 0.0,
             'actor/gxpo_scale_max': scale_mx,
             'actor/gxpo_disp2_norm': disp2_norm,
             'actor/gxpo_dispK_norm': dispK_norm,
             'actor/gxpo_dispK_over_disp2': dispK_norm / (disp2_norm + eps),
-            # Both sides restricted to gradient-space parameters: g1 does not
-            # exist for the others (their slot holds u0).
-            'actor/gxpo_cos_g0_g1': dot01 / (g0_sq_grad_only**0.5 * g1_norm + eps),
             'actor/gxpo_cos_g0_gslow': dot0slow / (g0_norm * gslow_norm + eps),
-            'actor/gxpo_inactive_frac': 1.0 - n_active / grad_coords,
-            'actor/gxpo_ratio_clip_frac': ratio_clipped / max(n_active, 1.0),
             'actor/gxpo_clip_scale_g0': float(clip_scale_g0),
-            'actor/gxpo_clip_scale_g1': float(clip_scale_g1),
-            # Fraction of coordinates rejected by the RMS-relative activity gate
-            # (threshold 1e-3 * RMS); same population as inactive_frac, reported
-            # under the retention-stability name.
-            'actor/gxpo_relative_threshold_reject_frac': 1.0 - n_active / grad_coords,
             'actor/gxpo_fallback_triggered': 0.0,
-            # Update-space path (Muon-owned matrices). Reported separately from
-            # the coordinatewise retention_mean/scale_mean above so runs on the
-            # two estimators stay comparable. n_update_space=0 on a pure
-            # gradient-space run, where these read zero.
-            'actor/gxpo_update_space_params': float(n_update_space),
-            'actor/gxpo_retention_rho_mean': upd_rho_mean,
-            'actor/gxpo_update_scale_mean': upd_scale_mean,
-            'actor/gxpo_retention_rho_negative_frac': upd_neg_frac,
             'reposition/jump_norm': abs(alpha) * dispK_norm,
             'reposition/jump_relative_to_param_norm': abs(alpha) * dispK_norm / (param_norm + eps),
         })
+        if has_grad:
+            # Legacy gradient-space family (r = g1/g0), on the coordinates that
+            # actually took that path. cos_g0_g1 uses g0 restricted to those same
+            # coordinates so it is a cosine between two comparable vectors.
+            append_to_dict(metrics, {
+                'actor/gxpo_g1_norm': g1_norm,
+                'actor/gxpo_r_mean': r_mean,
+                'actor/gxpo_r_std': r_var**0.5,
+                'actor/gxpo_cos_g0_g1': dot01 / (g0_sq_grad_only**0.5 * g1_norm + eps),
+                'actor/gxpo_inactive_frac': 1.0 - n_active / grad_coords,
+                'actor/gxpo_ratio_clip_frac': ratio_clipped / max(n_active, 1.0),
+                'actor/gxpo_clip_scale_g1': float(clip_scale_g1),
+                'actor/gxpo_relative_threshold_reject_frac': 1.0 - n_active / grad_coords,
+            })
+        if has_muon:
+            # Muon update-space family: a per-matrix scalar rho, never averaged
+            # with either coordinatewise r.
+            append_to_dict(metrics, {
+                'actor/gxpo_retention_rho_mean': upd_rho_mean,
+                'actor/gxpo_update_scale_mean': upd_scale_mean,
+                'actor/gxpo_retention_rho_negative_frac': upd_neg_frac,
+            })
+        if has_adamw:
+            # AdamW optimizer-direction family (r = d1/d0) on its own
+            # denominator. d0_norm/d1_norm/cos_d0_d1 are the direct analogues of
+            # g0_norm/g1_norm/cos_g0_g1 for the directions AdamW actually took.
+            append_to_dict(metrics, {
+                'actor/gxpo_adamw_r_mean': adamw_r_mean,
+                'actor/gxpo_adamw_r_std': adamw_r_var**0.5,
+                'actor/gxpo_adamw_scale_mean': adamw_scale_sum / adamw_coords,
+                'actor/gxpo_adamw_scale_max': float(adamw_scale_max.item()),
+                'actor/gxpo_adamw_inactive_frac': 1.0 - adamw_n_active / adamw_coords,
+                'actor/gxpo_adamw_ratio_clip_frac':
+                    adamw_ratio_clipped / max(adamw_n_active, 1.0),
+                'actor/gxpo_adamw_d0_norm': adamw_d0_norm,
+                'actor/gxpo_adamw_d1_norm': adamw_d1_norm,
+                'actor/gxpo_adamw_cos_d0_d1':
+                    adamw_dot_d0d1 / (adamw_d0_norm * adamw_d1_norm + eps),
+            })
         if do_diag:
             errK = errK_sq**0.5
             append_to_dict(metrics, {
@@ -1823,6 +2090,10 @@ class DataParallelPPOActor(BasePPOActor):
         reward_binary = bool(self.config.get('gxpo_binary_reward', False))
         format_error_ratio = (data.batch['token_level_scores'].sum(-1) == 0).float().mean().item()
         format_skip_enabled = bool(self.config.get('gxpo_format_error_skip_enabled', False)) and not reward_binary
+        # This value is also read by _gxpo_minibatch_step, but that method has
+        # its own local scope. Keep the outer update decision explicit here so
+        # a trigger can transition to the standard step without a NameError.
+        force_all_steps = bool(self.config.get('gxpo_force_all_steps', False))
         force_standard = (
             (format_skip_enabled and format_error_ratio > self.config.get('gxpo_format_error_skip_threshold', 0.5))
             or (trigger_stop and not force_all_steps)

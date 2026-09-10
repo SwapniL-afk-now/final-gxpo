@@ -28,6 +28,7 @@ def evaluate_seed(llm, tokenizer, data_files, seed, n, temperature, top_p, max_t
     from vllm import SamplingParams
 
     per_benchmark = {}
+    per_benchmark_pass = {}
     sampling = SamplingParams(
         n=n,
         temperature=temperature,
@@ -43,6 +44,7 @@ def evaluate_seed(llm, tokenizer, data_files, seed, n, temperature, top_p, max_t
         ]
         outputs = llm.generate(prompts, sampling)
         values = []
+        pass_values = []
         data_source = str(frame["data_source"].iloc[0])
         for row_index, output in enumerate(outputs):
             ground_truth = frame["reward_model"].iloc[row_index]["ground_truth"]
@@ -53,10 +55,12 @@ def evaluate_seed(llm, tokenizer, data_files, seed, n, temperature, top_p, max_t
                 for candidate in output.outputs
             ]
             values.append(float(np.mean(correct)))
+            pass_values.append(float(any(correct)))
         key = _benchmark_key(data_file, data_source)
         per_benchmark[key] = float(np.mean(values)) if values else float("nan")
-        print(f"seed={seed} {key}: Pass@1(avg@{n})={per_benchmark[key]:.6f}")
-    return per_benchmark
+        per_benchmark_pass[key] = float(np.mean(pass_values)) if pass_values else float("nan")
+        print(f"seed={seed} {key}: pass@{n}={per_benchmark_pass[key]:.6f} average@{n}={per_benchmark[key]:.6f}")
+    return per_benchmark, per_benchmark_pass
 
 
 def _benchmark_key(data_file, source):
@@ -88,6 +92,12 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=3072)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    parser.add_argument("--log-wandb", action="store_true",
+                        help="log final_eval/* and eval_sampled/* metrics to the training W&B run")
+    parser.add_argument("--wandb-project", default=os.environ.get("WANDB_PROJECT"))
+    parser.add_argument("--wandb-run", default=os.environ.get("GXPO_RUN_NAME"))
+    parser.add_argument("--wandb-id", default=None,
+                        help="existing W&B run id; resume that run instead of creating a new one")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).expanduser().resolve()
@@ -112,13 +122,15 @@ def main():
             gpu_memory_utilization=args.gpu_memory_utilization,
             dtype="bfloat16",
         )
-        per_seed = {
-            str(seed): evaluate_seed(
+        per_seed = {}
+        per_seed_pass = {}
+        for seed in args.seeds:
+            averages, passes = evaluate_seed(
                 llm, tokenizer, args.data_files, seed, args.n,
                 args.temperature, args.top_p, args.max_tokens,
             )
-            for seed in args.seeds
-        }
+            per_seed[str(seed)] = averages
+            per_seed_pass[str(seed)] = passes
         del llm
         gc.collect()
         try:
@@ -130,25 +142,45 @@ def main():
     benchmarks = {}
     for benchmark in BENCHMARK_ORDER:
         values = [row[benchmark] for row in per_seed.values() if benchmark in row]
+        pass_values = [row[benchmark] for row in per_seed_pass.values() if benchmark in row]
         benchmarks[benchmark] = {
             "per_seed": {seed: row.get(benchmark) for seed, row in per_seed.items()},
             "mean": float(np.mean(values)) if values else None,
             "std": float(np.std(values)) if values else None,
+            "pass_at_n": float(np.mean(pass_values)) if pass_values else None,
+            "pass_at_n_std": float(np.std(pass_values)) if pass_values else None,
         }
     per_seed_avg = {
         seed: float(np.mean([row[b] for b in BENCHMARK_ORDER if b in row]))
         for seed, row in per_seed.items()
         if any(b in row for b in BENCHMARK_ORDER)
     }
+    per_seed_pass_avg = {
+        seed: float(np.mean([row[b] for b in BENCHMARK_ORDER if b in row]))
+        for seed, row in per_seed_pass.items()
+        if any(b in row for b in BENCHMARK_ORDER)
+    }
     benchmarks["avg_pass1"] = {
         "per_seed": per_seed_avg,
         "mean": float(np.mean(list(per_seed_avg.values()))) if per_seed_avg else None,
         "std": float(np.std(list(per_seed_avg.values()))) if per_seed_avg else None,
+        "pass_at_n": float(np.mean(list(per_seed_pass_avg.values()))) if per_seed_pass_avg else None,
+        "pass_at_n_std": float(np.std(list(per_seed_pass_avg.values()))) if per_seed_pass_avg else None,
     }
     flat_metrics = {}
     for benchmark, values in benchmarks.items():
         flat_metrics[f"final_eval/{benchmark}_mean"] = values.get("mean")
         flat_metrics[f"final_eval/{benchmark}_std"] = values.get("std")
+        # Match the benchmark naming used by the SFT/KD evaluator (for
+        # example ytr1pu3r) while retaining the GXPO-specific final_eval/*
+        # summary. This terminal evaluator currently reports the sampled
+        # average; with n=1 it is exactly the reference pass1/average1 value.
+        if benchmark != "avg_pass1":
+            flat_metrics[f"eval_sampled/{benchmark}_average{args.n}"] = values.get("mean")
+            flat_metrics[f"eval_sampled/{benchmark}_pass{args.n}"] = values.get("pass_at_n")
+        else:
+            flat_metrics[f"eval_sampled/avg_average{args.n}"] = values.get("mean")
+            flat_metrics[f"eval_sampled/avg_pass{args.n}"] = values.get("pass_at_n")
     result = {
         "schema_version": 1,
         "checkpoint_step": args.step,
@@ -159,10 +191,11 @@ def main():
             "top_p": args.top_p,
             "do_sample": True,
             "n": args.n,
-            "pass_metric": f"Pass@1(avg@{args.n})",
+            "pass_metric": f"Pass@{args.n}",
         },
         "benchmarks": benchmarks,
         "per_seed": per_seed,
+        "per_seed_pass_at_n": per_seed_pass,
         # Flat names make the local artifact directly usable by W&B/table
         # tooling while retaining the structured per-benchmark records.
         "metrics": flat_metrics,
@@ -178,6 +211,22 @@ def main():
     })
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(f"Wrote {output}")
+
+    if args.log_wandb:
+        import wandb
+
+        init_kwargs = {
+            "project": args.wandb_project,
+            "name": args.wandb_run,
+            "job_type": "post_eval",
+            "resume": "allow",
+        }
+        if args.wandb_id:
+            init_kwargs["id"] = args.wandb_id
+        run = wandb.init(**init_kwargs)
+        run.log(flat_metrics, step=args.step)
+        run.finish()
+        print(f"Logged {len(flat_metrics)} final/eval metrics to W&B at step {args.step}", flush=True)
 
 
 if __name__ == "__main__":

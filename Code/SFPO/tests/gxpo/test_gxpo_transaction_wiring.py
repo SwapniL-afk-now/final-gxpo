@@ -134,3 +134,69 @@ def test_no_launcher_re_defaults_the_mode_past_its_validation():
                 assert '${GXPO_OPTIMIZER_STATE_MODE:-' not in line, (
                     f'{path.relative_to(REPO)}: forward the validated variable '
                     f'("$GXPO_OPTIMIZER_STATE_MODE"), not a re-default: {line.strip()}')
+
+
+# ---------------------------------------------------------------------------
+# Optimizer-aware AdamW retention: run identity and A/B reproducibility.
+# ---------------------------------------------------------------------------
+
+def test_common_tags_the_run_name_for_the_optimizer_aware_adamw_arm():
+    """adamw + auto is a NEW algorithm under an OLD run name; it must be tagged.
+
+    trainer.resume_mode=auto would otherwise let an optimizer-direction run
+    resume the existing raw-gradient run's wandb id, checkpoints and result
+    directory, splicing two different estimators into one history.
+    """
+    common = (EFFICIENCY / 'common.sh').read_text()
+    assert 'RETENTION_TAG="_adamwdir"' in common
+    assert 'RETENTION_TAG="_updspace"' in common
+    assert '${RETENTION_TAG}' in common, 'the tag must reach RUN_NAME'
+    # grad is the legacy estimator, so it keeps the historical (untagged) name.
+    tag_block = common[common.index('RETENTION_TAG=""'):common.index('RESULT_ROOT=')]
+    assert 'grad' not in tag_block
+
+
+def test_adamw_retention_space_is_forwarded_to_the_trainer():
+    common = (EFFICIENCY / 'common.sh').read_text()
+    assert 'actor_rollout_ref.actor.gxpo_retention_space="$GXPO_RETENTION_SPACE"' in common
+    # Validated once, then forwarded as the validated variable (no re-default).
+    for line in common.splitlines():
+        if 'gxpo_retention_space=' in line and line.lstrip().startswith('+'):
+            assert '${GXPO_RETENTION_SPACE:-' not in line, line.strip()
+
+
+def test_the_two_adamw_arms_are_separate_launchers_with_pinned_estimators():
+    baseline = (EFFICIENCY / 'qwen25_math_1p5b_gxpo_k10.sh').read_text()
+    optimizer_aware = (
+        EFFICIENCY / 'qwen25_math_1p5b_gxpo_adamw_transactional_dir_k10.sh').read_text()
+
+    # The legacy arm must not silently inherit the now-optimizer-aware `auto`.
+    assert 'GXPO_RETENTION_SPACE="${GXPO_RETENTION_SPACE:-grad}"' in baseline, (
+        'the raw-gradient A/B baseline must pin grad, or it changes algorithm '
+        'without changing its name')
+
+    assert 'export OPTIMIZER_NAME="adamw"' in optimizer_aware
+    assert 'export GXPO_OPTIMIZER_STATE_MODE="transactional"' in optimizer_aware
+    assert 'export GXPO_RETENTION_SPACE="${GXPO_RETENTION_SPACE:-auto}"' in optimizer_aware
+    assert 'source "$SCRIPT_DIR/common.sh"' in optimizer_aware
+    # Same experiment envelope as the baseline: only the estimator differs.
+    # K/alpha/minibatch are pinned by both; batch 64 is common.sh's default,
+    # which the baseline inherits and this arm restates at the same value.
+    for setting in ('K:-10', 'REPOSITION_ALPHA:-0.3', 'PPO_MINI_BATCH_SIZE:-16'):
+        assert setting in optimizer_aware, setting
+        assert setting in baseline, setting
+    assert 'TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"' in optimizer_aware
+    assert 'TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"' in (EFFICIENCY / 'common.sh').read_text()
+    assert 'TRAIN_BATCH_SIZE' not in baseline, 'baseline must keep inheriting the shared default'
+
+
+def test_muon_transactional_launcher_keeps_its_muon_hyperparameters():
+    """This patch must not touch the Muon arm's optimizer configuration."""
+    text = (EFFICIENCY / 'qwen25_math_1p5b_gxpo_muon_transactional_b64_mb16.sh').read_text()
+    for setting in ('MUON_MOMENTUM="${MUON_MOMENTUM:-0.95}"',
+                    'MUON_NS_STEPS="${MUON_NS_STEPS:-5}"',
+                    'MUON_NESTEROV="${MUON_NESTEROV:-True}"',
+                    'MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-1e-2}"',
+                    'MUON_DISTRIBUTED_BACKEND="${MUON_DISTRIBUTED_BACKEND:-gather_scatter}"',
+                    'GXPO_RETENTION_SPACE="${GXPO_RETENTION_SPACE:-auto}"'):
+        assert setting in text, setting

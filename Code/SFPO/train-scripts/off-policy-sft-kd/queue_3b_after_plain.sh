@@ -27,13 +27,17 @@ done
 sleep 30
 
 MODEL_3B=/office/shared_cache/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1
-export EXP="sftkl_3b_b0.1_flat14k_b96_lr1e-6_seed42"
+# MAX_LENGTH tracks the 32B-trace default (p50 3,172 tokens -- 2688 would drop
+# over half the cache); MAX_TOKEN_LEN_PER_GPU likewise must clear the longest
+# real row (10,425), hence 12288.
+export EXP="sftkl_3b_b0.1_r1_32b_flat16k_b96_lr1e-6_seed42"
 
 echo "[queue] $(date '+%F %T') launching 3B: EXP=$EXP GPU=$GPU"
 GPU="$GPU" \
 MODEL="$MODEL_3B" \
 MAX_STEPS="${MAX_STEPS:-400}" \
-MAX_LENGTH=2688 \
+MAX_LENGTH=16384 \
+MAX_TOKEN_LEN_PER_GPU=12288 \
 MICRO_BATCH_SIZE=2 \
 EXP="$EXP" \
 RUN_DIR="$D/runs/$EXP" \
