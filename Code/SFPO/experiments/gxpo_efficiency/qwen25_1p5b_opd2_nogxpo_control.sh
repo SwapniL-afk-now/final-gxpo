@@ -2,7 +2,7 @@
 #
 # qwen25_1p5b_opd2_nogxpo_control.sh
 #
-# Qwen3-1.7B non-thinking (student) | OPD^2 delta distillation | plain AdamW, NO GXPO
+# Qwen2.5-1.5B-Instruct (student) | OPD^2 delta distillation | plain AdamW, NO GXPO
 #
 # The A/B control for qwen25_1p5b_opd2_gxpo_adamw_dir_k10.sh: byte-identical
 # OPD^2 configuration and hyperparameters, with METHOD=grpo so the actor takes a
@@ -24,16 +24,20 @@
 # correct below the loss). They compose with zero changes to either: the PPO
 # clip, the retention estimator and the trigger gate are untouched.
 #
-#   student      : Qwen/Qwen3-1.7B            (non-thinking mode, ENABLE_THINKING=False)
-#   teacher      : Qwen/Qwen3-4B-Instruct-2507
-#   teacher_base : Qwen/Qwen3-4B-Base         (the paper's exact pair)
+#   student      : Qwen/Qwen2.5-1.5B-Instruct
+#   teacher      : Qwen/Qwen2.5-Math-1.5B-Instruct
+#   teacher_base : Qwen/Qwen2.5-Math-1.5B     (the teacher's pre-instruct base)
 #
-# Every hyperparameter below is the paper's own recipe
+# All three share one tokenizer; the chat templates differ only in the default
+# system prompt, which SYSTEM_PROMPT overrides, so prompt ids are identical.
+#
+# Hyperparameters follow the paper's recipe
 # (on-policy-delta/opd2/recipes/Qwen3-1.7B/opd2/config_open_nvidia_100k.yaml):
 # effective batch 256, one response per prompt, 100 steps, lr 5e-6 with a cosine
-# schedule floored at 0.1x and 10% warmup, temperature 0.7, 8192-token responses,
-# top-K 1024 instead of the full vocabulary, gen_loss_weight 0.1, reference KL
-# fully disabled. Models are the paper's own; only the dataset differs.
+# schedule floored at 0.1x and 10% warmup, temperature 0.7, top-K 1024 instead of
+# the full vocabulary, gen_loss_weight 0.1, reference KL fully disabled.
+# Deviation: 3072-token responses (paper 8192) -- Qwen2.5-Math has 4096
+# positions and prompts take up to 1024; common.sh's preflight enforces it.
 #
 # Usage:
 #   bash qwen25_1p5b_opd2_nogxpo_control.sh            # launch
@@ -58,19 +62,18 @@ fi
 
 # --------------------------------------------------------------- OPD^2 cfg ---
 export OPD2_ENABLED=1
-export OPD2_TEACHER="${OPD2_TEACHER:-$REPO_ROOT/models/Qwen3-4B-Instruct-2507}"
-export OPD2_TEACHER_BASE="${OPD2_TEACHER_BASE:-$REPO_ROOT/models/Qwen3-4B-Base}"
+export OPD2_TEACHER="${OPD2_TEACHER:-/office/dev_workspace/swapnil/gradient-extrapolation-based-policy-optimization-gxpo-speed-audit/models/Qwen2.5-Math-1.5B-Instruct}"
+export OPD2_TEACHER_BASE="${OPD2_TEACHER_BASE:-$REPO_ROOT/models/Qwen2.5-Math-1.5B}"
 # top-K truncation for the E_base[.] mean corrections. The weight is the
 # student's own probability, ~0 outside its own top-K, so this is near-lossless.
 # <=0 selects the exact full-vocabulary path through the same code.
 export OPD2_TOPK="${OPD2_TOPK:-1024}"
 export OPD2_GEN_LOSS_WEIGHT="${OPD2_GEN_LOSS_WEIGHT:-0.1}"
 export OPD2_REWARDS_BIAS="${OPD2_REWARDS_BIAS:-0.0}"
-# The student prompt is rendered non-thinking (Qwen3 template + enable_thinking=
-# False appends an empty <think></think> block); Qwen3-4B-Instruct-2507 has no
-# think mode, so its prompt is re-rendered with its own chat_template -- the
-# reference's opd_no_think_teacher. teacher_base shares the teacher's prompt.
-# The Qwen3 tokenizers share every id, so the id contract is a no-op.
+# The teacher prompt is re-rendered with the teacher's own chat_template (the
+# reference's opd_no_think_teacher); teacher_base shares it. For this trio the
+# render is id-identical to the student's and the id contract is a no-op.
+# ENABLE_THINKING only affects Qwen3 templates; Qwen2.5 ignores it.
 export OPD2_TEACHER_TEMPLATE="${OPD2_TEACHER_TEMPLATE:-True}"
 export ENABLE_THINKING="${ENABLE_THINKING:-False}"
 # Rows are scored one at a time by default, exactly like the reference trainer.
@@ -94,7 +97,7 @@ export LR="${LR:-5e-6}"
 export LR_WARMUP_STYLE="${LR_WARMUP_STYLE:-cosine}"
 export LR_WARMUP_RATIO="${LR_WARMUP_RATIO:-0.1}"
 export LR_MIN_RATIO="${LR_MIN_RATIO:-0.1}"
-export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
+export MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-3072}"
 export ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.7}"
 export SYSTEM_PROMPT="${SYSTEM_PROMPT:-You are a helpful assistant. Solve the problem carefully and provide a clear final answer.}"
 # beta=0.0 in the recipe: no reference-policy KL anywhere. common.sh's OPD^2
@@ -110,21 +113,21 @@ export OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
 
 export ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 # The three frozen/student forwards per response are on top of the usual RL step,
-# and responses run to 8192 tokens. Leave vLLM more headroom than the reward-RL
+# and responses run to 3072 tokens. Leave vLLM more headroom than the reward-RL
 # arms do.
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.45}"
 
 # ------------------------------------------------------------- preflight -----
 MISSING=0
 GXPO_ASSET_ROOT="/office/dev_workspace/swapnil/gradient-extrapolation-based-policy-optimization-gxpo-speed-audit"
-MODEL_DIR="${STUDENT_MODEL:-/office/shared_cache/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B/snapshots/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e}"
+MODEL_DIR="${STUDENT_MODEL:-/office/shared_cache/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306}"
 DATA_ROOT="${GXPO_DATA_ROOT:-$GXPO_ASSET_ROOT/Code/SFPO/data}"
 export MODEL_QWEN25_1P5B_INSTRUCT="$MODEL_DIR"
 export GXPO_DATA_ROOT="$DATA_ROOT"
 
 if [[ ! -f "$MODEL_DIR/config.json" ]]; then
   echo "PREFLIGHT FAIL: student weights not found at $MODEL_DIR" >&2
-  echo "  (point STUDENT_MODEL at a local Qwen3-1.7B copy)" >&2
+  echo "  (point STUDENT_MODEL at a local Qwen2.5-1.5B-Instruct copy)" >&2
   MISSING=1
 fi
 for _label in TEACHER:"$OPD2_TEACHER" TEACHER_BASE:"$OPD2_TEACHER_BASE"; do
@@ -132,9 +135,9 @@ for _label in TEACHER:"$OPD2_TEACHER" TEACHER_BASE:"$OPD2_TEACHER_BASE"; do
   if [[ ! -f "$_path/config.json" ]]; then
     echo "PREFLIGHT FAIL: OPD^2 $_name weights not found at $_path" >&2
     if [[ "$_name" == "TEACHER_BASE" ]]; then
-      echo "  hf download Qwen/Qwen3-4B-Base --local-dir $_path" >&2
+      echo "  hf download Qwen/Qwen2.5-Math-1.5B --local-dir $_path" >&2
     else
-      echo "  hf download Qwen/Qwen3-4B-Instruct-2507 --local-dir $_path" >&2
+      echo "  hf download Qwen/Qwen2.5-Math-1.5B-Instruct --local-dir $_path" >&2
     fi
     MISSING=1
   fi
@@ -189,7 +192,7 @@ EOT
 fi
 
 # ---------------------------------------------------------------- launch -----
-MODEL_ALIAS="${MODEL_ALIAS:-qwen3-1p7b}"
+MODEL_ALIAS="${MODEL_ALIAS:-qwen25-1p5b-qmath}"
 MODEL_ID="$MODEL_QWEN25_1P5B_INSTRUCT"
 METHOD="grpo"
 source "$SCRIPT_DIR/common.sh"

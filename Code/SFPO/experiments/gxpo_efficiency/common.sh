@@ -483,14 +483,14 @@ if [[ "$OPD2_ON" -eq 1 ]]; then
   # special-token block above the base vocab is allowed to differ in MEANING
   # (that is what the teacher chat-template render is for), but a differing base
   # vocab would silently score the wrong tokens.
-  python - "$MODEL_ID" "$OPD2_TEACHER" "$OPD2_TEACHER_BASE" <<'PY' || exit 2
+  python - "$MODEL_ID" "$OPD2_TEACHER" "$OPD2_TEACHER_BASE" "$MAX_RESPONSE_LENGTH" <<'PY' || exit 2
 import json, sys
 
 def base_vocab(path):
     with open(f"{path}/tokenizer.json", encoding="utf-8") as f:
         return json.load(f)["model"]["vocab"]
 
-student, teacher, teacher_base = sys.argv[1:4]
+student, teacher, teacher_base, max_resp = sys.argv[1:5]
 sv = base_vocab(student)
 for name, path in (("teacher", teacher), ("teacher_base", teacher_base)):
     v = base_vocab(path)
@@ -498,6 +498,15 @@ for name, path in (("teacher", teacher), ("teacher_base", teacher_base)):
         raise SystemExit(
             f"PREFLIGHT FAIL: {name} base BPE vocab differs from the student "
             f"({len(v)} vs {len(sv)} entries or differing ids); OPD^2 needs a shared vocab.")
+    # The frozen models score prompt + response in one HF forward; past
+    # max_position_embeddings RoPE is out of range and the signal is silently
+    # garbage (Qwen2.5-Math-* has only 4096). 1024 = data.max_prompt_length below.
+    with open(f"{path}/config.json", encoding="utf-8") as f:
+        max_pos = json.load(f).get("max_position_embeddings")
+    if max_pos and 1024 + int(max_resp) > max_pos:
+        raise SystemExit(
+            f"PREFLIGHT FAIL: {name} has max_position_embeddings={max_pos}, but prompt 1024 + "
+            f"MAX_RESPONSE_LENGTH {max_resp} exceeds it; set MAX_RESPONSE_LENGTH<={max_pos - 1024}.")
 print(f"OPD^2 vocab check OK: {len(sv)} shared base BPE entries")
 PY
   if [[ "${USE_KL_LOSS,,}" != "false" || "$KL_LOSS_COEF" != "0.0" ]]; then
