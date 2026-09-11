@@ -97,9 +97,27 @@ MAX_STEPS="${MAX_STEPS:-400}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 SFPO_WARMUP_STEPS="${SFPO_WARMUP_STEPS:-50}"
 GXPO_WARMUP_STEPS="${GXPO_WARMUP_STEPS:-50}"
+# Referenced unconditionally by the gxpo METHOD_FLAGS below but never defaulted
+# here, so under `set -u` every entrypoint that did not export it died with
+# "unbound variable" the moment it reached common.sh -- including
+# qwen25_math_1p5b_gxpo_k10.sh and ..._gxpo_adamw_transactional_dir_k10.sh
+# (their --dry-run exits before this file, which is why it stayed hidden).
+# True matches SFPO_RESET_ENTROPY_AFTER_WARMUP's default and what most
+# launchers that DO export it use.
+GXPO_RESET_ENTROPY_AFTER_WARMUP="${GXPO_RESET_ENTROPY_AFTER_WARMUP:-True}"
 GXPO_TAU="${GXPO_TAU:-3.0}"
 GXPO_ZSCORE_W="${GXPO_ZSCORE_W:-30}"
 GXPO_TRIGGER_PATIENCE="${GXPO_TRIGGER_PATIENCE:-3}"
+# Floor on GXPO's effective displacement multiplier alpha*scale. When the measured
+# retention is low, alpha*scale can fall BELOW 1, which makes the 3-pass update
+# land short of theta2 -- contracting instead of extrapolating, i.e. paying 3
+# passes for a damped ordinary step. dp_actor warns once when that happens; set
+# this to 1.0 to clamp instead. 0 (default) preserves the historical behavior.
+GXPO_MIN_EFFECTIVE_MULTIPLIER="${GXPO_MIN_EFFECTIVE_MULTIPLIER:-0}"
+# Entropy bonus subtracted from the policy loss (policy_loss = pg_loss - entropy*coeff).
+# yaml default is 0.001; raise it to fight entropy collapse under a step size that's
+# too large for the advantage's geometry (dp_actor.py:1061).
+ENTROPY_COEFF="${ENTROPY_COEFF:-0.001}"
 # GXPO optimizer state across the two probe steps. Parameters are repositioned to
 # theta_tilde in both modes; only the optimizer state the slow correction starts from
 # differs:
@@ -203,8 +221,81 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-3072}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
+# Responses per prompt for periodic/final VALIDATION decoding (val_kwargs.n).
+# Independent of ROLLOUT_N above, which is the training-time num_generations.
+VAL_N="${VAL_N:-1}"
 LR="${LR:-1e-6}"
+# LR schedule. `warmup_style` and `min_lr_ratio` are declared in
+# verl/trainer/config/ppo_trainer.yaml but used to be DEAD -- fsdp_workers.py
+# hardcoded the constant-with-warmup schedule. They are honoured now, so these
+# defaults (constant, no warmup) preserve every existing arm exactly.
+LR_WARMUP_STYLE="${LR_WARMUP_STYLE:-constant}"
+LR_WARMUP_RATIO="${LR_WARMUP_RATIO:-0.0}"
+LR_MIN_RATIO="${LR_MIN_RATIO:-0.0}"
+case "$LR_WARMUP_STYLE" in
+  constant|cosine) ;;
+  *) echo "PREFLIGHT FAIL: LR_WARMUP_STYLE must be constant or cosine, got '$LR_WARMUP_STYLE'" >&2; exit 2 ;;
+esac
+
+# ------------------------------------------------------------------- OPD^2 ---
+# On-Policy Delta Distillation (arXiv:2607.15161). Turning this on REPLACES the
+# verifier advantage with the dense per-token teacher-delta signal:
+#   signal = (teacher_gt - teacher_base_gt) - (E_base[teacher] - E_base[teacher_base])
+# gated to zero wherever it disagrees with the (teacher - student) update
+# direction. The math verifier keeps running (its reward still feeds GXPO's
+# degenerate-batch guard and every reward dashboard) but no longer drives the
+# update. Orthogonal to GXPO, which lives below the loss.
+# Everything defaults off: with OPD2_ENABLED unset, every existing entrypoint
+# resolves to exactly the config it resolved to before.
+OPD2_ENABLED="${OPD2_ENABLED:-0}"
+OPD2_TEACHER="${OPD2_TEACHER:-}"
+OPD2_TEACHER_BASE="${OPD2_TEACHER_BASE:-}"
+OPD2_TOPK="${OPD2_TOPK:-1024}"
+OPD2_GEN_LOSS_WEIGHT="${OPD2_GEN_LOSS_WEIGHT:-0.1}"
+OPD2_REWARDS_BIAS="${OPD2_REWARDS_BIAS:-0.0}"
+OPD2_TEACHER_TEMPLATE="${OPD2_TEACHER_TEMPLATE:-True}"
+OPD2_MICRO_BATCH_SIZE="${OPD2_MICRO_BATCH_SIZE:-1}"
+OPD2_CHUNK_TOKENS="${OPD2_CHUNK_TOKENS:-512}"
+OPD2_KEEP_ON_GPU="${OPD2_KEEP_ON_GPU:-False}"
+# True = teacher + teacher_base get their OWN GPU (a Ray actor holding one of
+# GPU_IDS) and training uses GPU_COUNT of the rest, so set GPU_IDS to
+# GPU_COUNT+1 devices. The models are loaded once and stay resident there.
+OPD2_DEDICATED_GPU="${OPD2_DEDICATED_GPU:-False}"
+OPD2_FLAGS=()
+RETURN_RAW_CHAT="${RETURN_RAW_CHAT:-False}"
+# Qwen3 chat_template switch for the student's prompt. null = template default
+# (every non-Qwen3 arm); False = non-thinking mode.
+ENABLE_THINKING="${ENABLE_THINKING:-null}"
+# Each dataloader worker holds a full copy of the dataset (~0.8GB RSS here).
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
+case "${OPD2_ENABLED,,}" in
+  1|true|yes|on) OPD2_ON=1 ;;
+  0|false|no|off|"") OPD2_ON=0 ;;
+  *) echo "PREFLIGHT FAIL: OPD2_ENABLED must be 0/1, got '$OPD2_ENABLED'" >&2; exit 2 ;;
+esac
 OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
+# AdamW weight decay. fsdp_workers defaults to 1e-2 when unset; HuggingFace
+# TrainingArguments (and therefore every trl recipe that does not set it)
+# defaults to 0.0, so recipe-faithful runs must pass it explicitly. Muon has its
+# own MUON_WEIGHT_DECAY and ignores this.
+ADAMW_WEIGHT_DECAY="${ADAMW_WEIGHT_DECAY:-1e-2}"
+# How the per-token PPO loss is reduced to a scalar (verl/trainer/ppo/core_algos.py):
+#   token-mean              -- one mean over every response token in the batch.
+#                              verl's historical reduction; long responses carry
+#                              proportionally more weight. DEFAULT: every existing
+#                              GRPO/SFPO/GXPO arm keeps exactly this.
+#   seq-mean-token-mean     -- mean within each sequence, then across sequences,
+#                              so every response counts equally. This is trl's
+#                              GRPOConfig loss_type="grpo", which the OPD^2 recipe
+#                              pins -- use it for paper-faithful OPD^2 runs.
+#   seq-mean-token-sum-norm -- trl's loss_type="dr_grpo".
+# Verified by tools/opd2/test_loss_agg.py, which also checks that
+# seq-mean-token-mean composes correctly across gradient accumulation.
+LOSS_AGG_MODE="${LOSS_AGG_MODE:-token-mean}"
+case "$LOSS_AGG_MODE" in
+  token-mean|seq-mean-token-mean|seq-mean-token-sum-norm) ;;
+  *) echo "PREFLIGHT FAIL: LOSS_AGG_MODE must be token-mean, seq-mean-token-mean or seq-mean-token-sum-norm, got '$LOSS_AGG_MODE'" >&2; exit 2 ;;
+esac
 USE_KL_LOSS="${USE_KL_LOSS:-False}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.0}"
 MUON_MOMENTUM="${MUON_MOMENTUM:-0.95}"
@@ -296,6 +387,20 @@ fi
 if [[ "${GXPO_DYNAMIC_FILTERING,,}" == "true" && "$RUN_NAME" != *_dynfilt ]]; then
   RUN_NAME="${RUN_NAME}_dynfilt"
 fi
+# OPD^2 changes what the advantage MEANS, so it must never resume a reward-RL
+# run's wandb id, checkpoints or result dir. Same guard pattern as above.
+if [[ "$OPD2_ON" -eq 1 && "$RUN_NAME" != *_opd2* ]]; then
+  RUN_NAME="${RUN_NAME}_opd2"
+fi
+# A non-default loss reduction is a different objective, not a different setting.
+# Tag it so it cannot resume a token-mean run's wandb id or checkpoints.
+if [[ "$LOSS_AGG_MODE" != "token-mean" && "$RUN_NAME" != *_seqmean* && "$RUN_NAME" != *_drgrpo* ]]; then
+  if [[ "$LOSS_AGG_MODE" == "seq-mean-token-mean" ]]; then
+    RUN_NAME="${RUN_NAME}_seqmean"
+  else
+    RUN_NAME="${RUN_NAME}_drgrpo"
+  fi
+fi
 RESULT_ROOT="${GXPO_RESULTS_ROOT:-$REPO_ROOT/results/gxpo_efficiency}"
 RUN_DIR="$RESULT_ROOT/$RUN_NAME"
 mkdir -p "$RUN_DIR"
@@ -361,10 +466,82 @@ fi
 TRAIN_FILES="['$DAPO_TRAIN','$LIGHTEVAL_TRAIN']"
 VAL_FILES="['$MATH500','$AIME24','$AIME25','$AMC23','$MINERVA','$OLYMPIAD']"
 
+if [[ "$OPD2_ON" -eq 1 ]]; then
+  for _m in "$OPD2_TEACHER" "$OPD2_TEACHER_BASE"; do
+    if [[ -z "$_m" ]]; then
+      echo "PREFLIGHT FAIL: OPD2_ENABLED=1 requires OPD2_TEACHER and OPD2_TEACHER_BASE" >&2
+      exit 2
+    fi
+    if [[ ! -f "$_m/config.json" ]]; then
+      echo "PREFLIGHT FAIL: OPD^2 model not found at $_m (no config.json)" >&2
+      exit 2
+    fi
+  done
+  unset _m
+  # OPD^2 assumes teacher, teacher_base and student share the base BPE vocab --
+  # the student's sampled ids are scored directly by both frozen models. The
+  # special-token block above the base vocab is allowed to differ in MEANING
+  # (that is what the teacher chat-template render is for), but a differing base
+  # vocab would silently score the wrong tokens.
+  python - "$MODEL_ID" "$OPD2_TEACHER" "$OPD2_TEACHER_BASE" <<'PY' || exit 2
+import json, sys
+
+def base_vocab(path):
+    with open(f"{path}/tokenizer.json", encoding="utf-8") as f:
+        return json.load(f)["model"]["vocab"]
+
+student, teacher, teacher_base = sys.argv[1:4]
+sv = base_vocab(student)
+for name, path in (("teacher", teacher), ("teacher_base", teacher_base)):
+    v = base_vocab(path)
+    if v != sv:
+        raise SystemExit(
+            f"PREFLIGHT FAIL: {name} base BPE vocab differs from the student "
+            f"({len(v)} vs {len(sv)} entries or differing ids); OPD^2 needs a shared vocab.")
+print(f"OPD^2 vocab check OK: {len(sv)} shared base BPE entries")
+PY
+  if [[ "${USE_KL_LOSS,,}" != "false" || "$KL_LOSS_COEF" != "0.0" ]]; then
+    echo "PREFLIGHT FAIL: OPD^2 runs with the reference KL disabled (the paper's beta=0);" >&2
+    echo "  set USE_KL_LOSS=False and KL_LOSS_COEF=0.0 (got $USE_KL_LOSS / $KL_LOSS_COEF)." >&2
+    exit 2
+  fi
+  # Fail unless explicitly allowed: an entropy bonus's scale is not portable
+  # from reward-RL to OPD^2. OPD^2's advantages are unnormalized (the reference
+  # hardcodes disable_adv_norm) and land at std ~0.014, ~70x smaller than a
+  # normalized GRPO advantage -- so entropy_loss*ENTROPY_COEFF becomes the
+  # dominant term in policy_loss and the run just maximizes entropy. At 0.001
+  # it drove gxpo-opd2 l4zbui0k / 4rwyfa3w from entropy 0.07 to 3.9 (gibberish).
+  if [[ "$ENTROPY_COEFF" != "0" && "$ENTROPY_COEFF" != "0.0" ]]; then
+    if [[ "${OPD2_ALLOW_ENTROPY:-0}" != "1" ]]; then
+      echo "PREFLIGHT FAIL: ENTROPY_COEFF=$ENTROPY_COEFF with OPD^2 (reference uses 0)." >&2
+      echo "  Set ENTROPY_COEFF=0, or OPD2_ALLOW_ENTROPY=1 to run it as a deliberate ablation." >&2
+      exit 2
+    fi
+    echo "PREFLIGHT WARN: ENTROPY_COEFF=$ENTROPY_COEFF with OPD^2 (OPD2_ALLOW_ENTROPY=1)." >&2
+  fi
+  RETURN_RAW_CHAT=True
+  OPD2_FLAGS+=(
+    +actor_rollout_ref.actor.use_opd2=True
+    +actor_rollout_ref.actor.opd2_teacher="$OPD2_TEACHER"
+    +actor_rollout_ref.actor.opd2_teacher_base="$OPD2_TEACHER_BASE"
+    +actor_rollout_ref.actor.opd2_topk="$OPD2_TOPK"
+    +actor_rollout_ref.actor.opd2_gen_loss_weight="$OPD2_GEN_LOSS_WEIGHT"
+    +actor_rollout_ref.actor.opd2_rewards_bias="$OPD2_REWARDS_BIAS"
+    +actor_rollout_ref.actor.opd2_teacher_template="$OPD2_TEACHER_TEMPLATE"
+    +actor_rollout_ref.actor.opd2_micro_batch_size="$OPD2_MICRO_BATCH_SIZE"
+    +actor_rollout_ref.actor.opd2_chunk_tokens="$OPD2_CHUNK_TOKENS"
+    +actor_rollout_ref.actor.opd2_keep_on_gpu="$OPD2_KEEP_ON_GPU"
+    +actor_rollout_ref.actor.opd2_dedicated_gpu="$OPD2_DEDICATED_GPU"
+  )
+fi
+
 METHOD_FLAGS=()
 OPTIMIZER_FLAGS=()
 case "${OPTIMIZER_NAME,,}" in
   adamw)
+    OPTIMIZER_FLAGS+=(
+      +actor_rollout_ref.actor.optim.weight_decay="$ADAMW_WEIGHT_DECAY"
+    )
     ;;
   muon)
     OPTIMIZER_FLAGS+=(
@@ -446,6 +623,7 @@ case "$METHOD" in
       +actor_rollout_ref.actor.zscore_w=0
       +actor_rollout_ref.actor.gxpo_k="$K"
       +actor_rollout_ref.actor.gxpo_alpha="$REPOSITION_ALPHA"
+      +actor_rollout_ref.actor.gxpo_min_effective_multiplier="$GXPO_MIN_EFFECTIVE_MULTIPLIER"
       +actor_rollout_ref.actor.gxpo_delta=1e-8
       +actor_rollout_ref.actor.gxpo_tau="$GXPO_TAU"
       +actor_rollout_ref.actor.gxpo_zscore_w="$GXPO_ZSCORE_W"
@@ -480,6 +658,9 @@ train_seed=$TRAIN_SEED
 train_batch_size=$TRAIN_BATCH_SIZE
 rollout_n=$ROLLOUT_N
 learning_rate=$LR
+lr_schedule=$LR_WARMUP_STYLE (warmup_ratio=$LR_WARMUP_RATIO, min_lr_ratio=$LR_MIN_RATIO)
+opd2_enabled=$OPD2_ON$( [[ "$OPD2_ON" -eq 1 ]] && echo " (teacher=$OPD2_TEACHER, teacher_base=$OPD2_TEACHER_BASE, topk=$OPD2_TOPK, gen_loss_weight=$OPD2_GEN_LOSS_WEIGHT, teacher_template=$OPD2_TEACHER_TEMPLATE, micro_bsz=$OPD2_MICRO_BATCH_SIZE)" )
+loss_agg_mode=$LOSS_AGG_MODE
 use_kl_loss=$USE_KL_LOSS
 kl_loss_coef=$KL_LOSS_COEF
 max_steps=$MAX_STEPS
@@ -496,6 +677,7 @@ gxpo_shutoff_mode=$GXPO_SHUTOFF_MODE
 gxpo_optimizer_state_mode=$GXPO_OPTIMIZER_STATE_MODE
 gxpo_retention_space=$GXPO_RETENTION_SPACE (run-name tag='${RETENTION_TAG:-none}')
 optimizer=$OPTIMIZER_NAME
+adamw_weight_decay=$ADAMW_WEIGHT_DECAY
 muon_momentum=$MUON_MOMENTUM
 muon_ns_steps=$MUON_NS_STEPS
 muon_nesterov=$MUON_NESTEROV
@@ -506,13 +688,14 @@ gxpo_trigger_min_obs=${GXPO_TRIGGER_MIN_OBS:-0}
 gxpo_max_active_steps=${GXPO_MAX_ACTIVE_STEPS:-0}
 gxpo_trigger_patience=$GXPO_TRIGGER_PATIENCE
 gxpo_fallback_mode=$GXPO_FALLBACK_MODE
+gxpo_min_effective_multiplier=$GXPO_MIN_EFFECTIVE_MULTIPLIER
 gxpo_fallback_window=$GXPO_FALLBACK_WINDOW
 gxpo_actor_duty_cycle=$GXPO_ACTOR_DUTY_CYCLE
 gxpo_diag_freq=$GXPO_DIAG_FREQ
 gxpo_trigger_granularity=outer
 dynamic_filtering=$GXPO_DYNAMIC_FILTERING (strategy=$GXPO_DYNAMIC_FILTERING_STRATEGY, p_easy=$GXPO_P_EASY, p_hard=$GXPO_P_HARD, target_zero_variance=$GXPO_TARGET_ZERO_VARIANCE, sampling_batch_size=$GXPO_SAMPLING_BATCH_SIZE)
 validation_interval=5
-validation_decoding=sampled temperature=0.7 do_sample=true n=1
+validation_decoding=sampled temperature=0.7 do_sample=true n=$VAL_N
 if [[ "$FINAL_EVAL_ENABLED" == "True" ]]; then
   final_decoding=stochastic temperature=1.0 top_p=0.7 do_sample=true n=4 seeds=$FINAL_EVAL_SEEDS
 else
@@ -544,12 +727,18 @@ python -u -m verl.trainer.main_ppo \
   data.truncation=error \
   +data.seed="$TRAIN_SEED" \
   data.system_prompt="$SYSTEM_PROMPT" \
+  data.return_raw_chat="$RETURN_RAW_CHAT" \
+  +data.enable_thinking="$ENABLE_THINKING" \
+  +data.dataloader_num_workers="$DATALOADER_NUM_WORKERS" \
   actor_rollout_ref.model.path="$MODEL_ID" \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.model.enable_gradient_checkpointing="$ENABLE_GRADIENT_CHECKPOINTING" \
   actor_rollout_ref.model.attn_implementation="$ATTN_IMPL" \
   +actor_rollout_ref.model.use_liger="$USE_LIGER" \
   actor_rollout_ref.actor.optim.lr="$LR" \
+  actor_rollout_ref.actor.optim.warmup_style="$LR_WARMUP_STYLE" \
+  actor_rollout_ref.actor.optim.lr_warmup_steps_ratio="$LR_WARMUP_RATIO" \
+  actor_rollout_ref.actor.optim.min_lr_ratio="$LR_MIN_RATIO" \
   +actor_rollout_ref.actor.optim.name="$OPTIMIZER_NAME" \
   "${OPTIMIZER_FLAGS[@]}" \
   +actor_rollout_ref.actor.optim.fused="$OPTIM_FUSED" \
@@ -559,6 +748,8 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}" \
   actor_rollout_ref.actor.clip_ratio=0.2 \
+  actor_rollout_ref.actor.entropy_coeff="$ENTROPY_COEFF" \
+  +actor_rollout_ref.actor.loss_agg_mode="$LOSS_AGG_MODE" \
   actor_rollout_ref.actor.grad_clip=1.0 \
   actor_rollout_ref.actor.use_kl_loss="$USE_KL_LOSS" \
   actor_rollout_ref.actor.kl_loss_coef="$KL_LOSS_COEF" \
@@ -578,7 +769,7 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.n="$ROLLOUT_N" \
   actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE:-1.0}" \
   actor_rollout_ref.rollout.top_p="${ROLLOUT_TOP_P:-1.0}" \
-  actor_rollout_ref.rollout.val_kwargs.n=1 \
+  actor_rollout_ref.rollout.val_kwargs.n="$VAL_N" \
   actor_rollout_ref.rollout.val_kwargs.do_sample=True \
   actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
@@ -606,6 +797,7 @@ python -u -m verl.trainer.main_ppo \
   trainer.total_training_steps="$MAX_STEPS" \
   trainer.total_epochs=100 \
   "${METHOD_FLAGS[@]}" \
+  ${OPD2_FLAGS[@]+"${OPD2_FLAGS[@]}"} \
   | tee "$RUN_DIR/train.log"
 
 if [[ "$FINAL_EVAL_ENABLED" == "True" ]]; then

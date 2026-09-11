@@ -90,7 +90,8 @@ class RLHFDataset(Dataset):
                  system_prompt: Optional[str] = None,
                  return_raw_chat=False,
                  truncation='error',
-                 filter_overlong_prompts=False):
+                 filter_overlong_prompts=False,
+                 enable_thinking=None):
         if not isinstance(parquet_files, (List, ListConfig)):
             parquet_files = [parquet_files]
 
@@ -110,6 +111,9 @@ class RLHFDataset(Dataset):
         self.system_prompt = system_prompt or ''
         self.truncation = truncation
         self.filter_overlong_prompts = filter_overlong_prompts
+        # Qwen3's template reads enable_thinking (False appends an empty
+        # <think></think> block); other templates ignore the variable. None = omit.
+        self.template_kwargs = {} if enable_thinking is None else {'enable_thinking': bool(enable_thinking)}
 
         # whether to store the dataset in state_dict()
         # default not store
@@ -153,7 +157,8 @@ class RLHFDataset(Dataset):
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
             self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
-                tokenizer.apply_chat_template(self._prepare_chat(doc[prompt_key]), add_generation_prompt=True)) <= self.max_prompt_length,
+                tokenizer.apply_chat_template(self._prepare_chat(doc[prompt_key]), add_generation_prompt=True,
+                                              **self.template_kwargs)) <= self.max_prompt_length,
                                                                  axis=1)]
 
             print(f'filter dataset len: {len(self.dataframe)}')
@@ -178,7 +183,8 @@ class RLHFDataset(Dataset):
 
         chat = self._prepare_chat(row_dict.pop(self.prompt_key))
 
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
+        prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False,
+                                                                       **self.template_kwargs)
 
         is_multi_modal = self.image_key in row_dict
         if is_multi_modal:  # expand image token

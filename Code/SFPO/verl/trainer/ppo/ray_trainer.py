@@ -436,6 +436,14 @@ class RayPPOTrainer(object):
         # fractions do not partition VRAM; the launcher must leave headroom.
         # See teacher_kd.py.
         self.use_kd = bool(config.actor_rollout_ref.actor.get('use_kd', False))
+        # OPD^2 (arXiv:2607.15161): the per-token delta signal REPLACES the
+        # verifier advantage. The reward manager still runs -- token_level_scores
+        # feed GXPO's degenerate-batch guard and every reward dashboard -- but it
+        # no longer drives the update. See verl/workers/actor/opd2_signal.py.
+        self.use_opd2 = bool(config.actor_rollout_ref.actor.get('use_opd2', False))
+        if self.use_opd2:
+            print('[OPD2] advantages come from the teacher-delta signal; '
+                  'verifier reward is metrics-only')
         # Off-policy KD: fixed responses + cached teacher targets ride in the
         # dataloader rows, so no teacher group is built and no vLLM generation
         # runs. The rollout engine still initializes (idle, tiny KV reservation
@@ -619,6 +627,7 @@ class RayPPOTrainer(object):
                                              filter_prompts=True,
                                              system_prompt=self.config.data.get('system_prompt', None),
                                              return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                           enable_thinking=self.config.data.get('enable_thinking', None),
                                              truncation='error',
                                              filter_overlong_prompts=self.config.data.filter_overlong_prompts)
         # use sampler for better ckpt resume
@@ -637,7 +646,7 @@ class RayPPOTrainer(object):
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
                                                    batch_size=self.config.data.train_batch_size,
-                                                   num_workers=8,
+                                                   num_workers=int(self.config.data.get('dataloader_num_workers', 8)),
                                                    drop_last=True,
                                                    collate_fn=collate_fn,
                                                    sampler=sampler)
@@ -653,6 +662,7 @@ class RayPPOTrainer(object):
                                            filter_prompts=True,
                                            system_prompt=self.config.data.get('system_prompt', None),
                                            return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                           enable_thinking=self.config.data.get('enable_thinking', None),
                                            truncation='error',
                                            filter_overlong_prompts=self.config.data.filter_overlong_prompts)
             self.val_dataloader = StatefulDataLoader(
@@ -660,7 +670,7 @@ class RayPPOTrainer(object):
                 # Validation datasets are sent to inference engines as a whole batch,
                 # which will schedule the memory themselves.
                 batch_size=len(self.val_dataset),
-                num_workers=8,
+                num_workers=int(self.config.data.get('dataloader_num_workers', 8)),
                 shuffle=False,
                 drop_last=False,
                 collate_fn=collate_fn)
@@ -1877,6 +1887,48 @@ class RayPPOTrainer(object):
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
+                        # OPD^2: swap the (degenerate at rollout.n=1) GRPO advantage
+                        # for the dense per-token teacher-delta signal. returns /
+                        # reward / token_level_scores are deliberately left alone.
+                        if self.use_opd2:
+                            with _timer('opd2_signal', timing_raw):
+                                opd2_out = self.actor_rollout_wg.compute_opd2_signal(batch)
+                            batch = batch.union(opd2_out)
+                            gen_w = float(self.config.actor_rollout_ref.actor.get(
+                                'opd2_gen_loss_weight', 0.1))
+                            sig = batch.batch['opd2_signal']
+                            resp_mask = batch.batch['attention_mask'][:, -sig.shape[1]:].bool()
+                            batch.batch['advantages'] = sig * gen_w
+                            # Metrics are emitted only on steps where the scorer ran
+                            # (omit, never zero -- see the gxpo metrics convention).
+                            live = sig[resp_mask]
+                            if live.numel() > 0:
+                                metrics['opd2/signal_mean'] = live.mean().item()
+                                metrics['opd2/signal_absmax'] = live.abs().max().item()
+                                if live.numel() > 1:
+                                    metrics['opd2/signal_std'] = live.std().item()
+                                metrics['opd2/gated_frac'] = (live == 0).float().mean().item()
+                            # Signal on the EOS token of rows that terminated (a row
+                            # filling the whole budget was truncated, it has no EOS).
+                            # Negative = the teacher delta is teaching the student
+                            # not to stop, which is what precedes a length runaway.
+                            r_lens = resp_mask.sum(-1)
+                            ended = (r_lens > 0) & (r_lens < sig.shape[1])
+                            if ended.any():
+                                rows = ended.nonzero(as_tuple=True)[0]
+                                metrics['opd2/eos_signal_mean'] = (
+                                    sig[rows, r_lens[rows] - 1].mean().item())
+                            metrics['opd2/invalid_frac'] = (
+                                1.0 - batch.batch['opd2_valid'].float().mean().item())
+                            # Response tokens whose id has no teacher counterpart and
+                            # were therefore zeroed. Expect 0.000; anything else means
+                            # the student started emitting control tokens.
+                            if 'opd2_unmapped' in batch.batch:
+                                n_resp = int(resp_mask.sum().item())
+                                metrics['opd2/unmapped_frac'] = (
+                                    batch.batch['opd2_unmapped'].sum().item() / max(n_resp, 1))
+                            del opd2_out, sig, resp_mask, live
+
                     # per-prompt group views must see pre-balance row order
                     reward_flat = _restore_group_order(batch.batch['token_level_scores'].sum(-1), inv_balance_perm)
                     reward_metrics = compute_reward_metrics_grouped(reward_flat, self.config)
@@ -2332,6 +2384,20 @@ class RayPPOTrainer(object):
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
                 self._write_efficiency_rows(metrics, did_validate)
+
+                # OPD^2 has no task reward and nothing that penalizes truncation, so
+                # a length runaway never recovers: gxpo-opd2 l4zbui0k / 4rwyfa3w sat
+                # at clip_ratio 1.0 from step 13 and burned ~9 more hours. Abort
+                # after N consecutive steps above 0.5 (OPD2_CLIP_ABORT_STEPS=0 disables).
+                if self.use_opd2:
+                    abort_after = int(os.environ.get('OPD2_CLIP_ABORT_STEPS', '3'))
+                    clipped = metrics.get('response_length/clip_ratio', 0.0) > 0.5
+                    self._opd2_clip_streak = (getattr(self, '_opd2_clip_streak', 0) + 1) if clipped else 0
+                    if abort_after > 0 and self._opd2_clip_streak >= abort_after:
+                        raise RuntimeError(
+                            f'OPD^2 length runaway: response_length/clip_ratio > 0.5 for '
+                            f'{self._opd2_clip_streak} consecutive steps (step {self.global_steps}). '
+                            'Check opd2/eos_signal_mean and actor/entropy_loss.')
 
                 if is_last_step:
                     write_json(os.path.join(self._efficiency_run_dir, 'summary.json'), {

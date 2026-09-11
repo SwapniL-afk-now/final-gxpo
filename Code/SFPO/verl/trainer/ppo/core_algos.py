@@ -270,7 +270,38 @@ def compute_rewards(token_level_scores, old_log_prob, ref_log_prob, kl_ratio):
     return token_level_scores - kl * kl_ratio
 
 
-def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange):
+# Loss aggregation modes for compute_policy_loss.
+#   token-mean            -- one mean over every response token in the batch.
+#                            verl's historical behavior and the default; long
+#                            responses carry proportionally more weight.
+#   seq-mean-token-mean   -- mean within each sequence, then mean across
+#                            sequences. Every response counts equally regardless
+#                            of length. This is trl's GRPOConfig
+#                            `loss_type="grpo"`, which the OPD^2 recipe pins.
+#   seq-mean-token-sum-norm -- sum over tokens divided by (batch x max response
+#                            length), i.e. trl's `loss_type="dr_grpo"`; removes
+#                            the length bias entirely at the cost of a
+#                            length-dependent gradient scale.
+#
+# Under `use_dynamic_bsz`, dp_actor scales each micro-batch by
+# `len(data) / ppo_mini_batch_size` -- a SEQUENCE-count weight -- so
+# seq-mean-token-mean composes exactly across gradient accumulation.
+LOSS_AGG_MODES = ('token-mean', 'seq-mean-token-mean', 'seq-mean-token-sum-norm')
+
+
+def agg_loss(loss_mat: torch.Tensor, mask: torch.Tensor, mode: str = 'token-mean') -> torch.Tensor:
+    """Reduce a per-token [bs, response_length] loss to a scalar. See LOSS_AGG_MODES."""
+    if mode == 'token-mean':
+        return verl_F.masked_mean(loss_mat, mask)
+    if mode == 'seq-mean-token-mean':
+        return ((loss_mat * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
+    if mode == 'seq-mean-token-sum-norm':
+        return (loss_mat * mask).sum() / (loss_mat.size(0) * loss_mat.size(-1))
+    raise ValueError(f'loss_agg_mode must be one of {LOSS_AGG_MODES}, got {mode!r}')
+
+
+def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange,
+                        loss_agg_mode: str = 'token-mean'):
     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
 
     Args:
@@ -284,6 +315,11 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
             shape: (bs, response_length)
         cliprange: (float)
             The clip range used in PPO. See https://arxiv.org/abs/1707.06347
+        loss_agg_mode: (str)
+            How the per-token loss is reduced to a scalar; see LOSS_AGG_MODES.
+            Defaults to verl's historical 'token-mean'. Only the returned
+            `pg_loss` is affected -- the clipfrac/KL diagnostics stay token-mean
+            so they remain comparable across modes.
 
     Returns:
         pg_loss: `a scalar torch.Tensor`
@@ -299,7 +335,7 @@ def compute_policy_loss(old_log_prob, log_prob, advantages, eos_mask, cliprange)
     pg_losses = -advantages * ratio
     pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
 
-    pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), eos_mask)
+    pg_loss = agg_loss(torch.max(pg_losses, pg_losses2), eos_mask, loss_agg_mode)
     pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses).float(), eos_mask)
     return pg_loss, pg_clipfrac, ppo_kl
 

@@ -391,7 +391,8 @@ class ActorRolloutRefWorker(Worker):
 
         # TODO: add more optimizer args into config
         if role == 'actor' and optim_config is not None:
-            from verl.utils.torch_functional import get_constant_schedule_with_warmup
+            from verl.utils.torch_functional import (get_constant_schedule_with_warmup,
+                                                      get_cosine_schedule_with_warmup)
             if use_muon:
                 from verl.workers.muon import build_muon
                 actor_optimizer = build_muon(
@@ -429,10 +430,30 @@ class ActorRolloutRefWorker(Worker):
                 num_warmup_steps_ratio = optim_config.get('lr_warmup_steps_ratio', 0.)
                 num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
 
-            print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
+            # `warmup_style` and `min_lr_ratio` are declared in ppo_trainer.yaml but
+            # used to be dead: this branch hardcoded the constant schedule, so a
+            # launcher asking for cosine silently got constant. OPD^2 reproduces the
+            # paper's cosine_with_min_lr(min_lr_rate=0.1), so honour them.
+            warmup_style = str(optim_config.get('warmup_style', 'constant') or 'constant').lower()
+            min_lr_ratio = float(optim_config.get('min_lr_ratio', 0.0) or 0.0)
+            print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}, '
+                  f'warmup_style: {warmup_style}, min_lr_ratio: {min_lr_ratio}')
 
-            actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer,
-                                                                   num_warmup_steps=num_warmup_steps)
+            if warmup_style == 'cosine':
+                if total_steps <= 0:
+                    raise ValueError(
+                        'optim.warmup_style=cosine needs a positive total_training_steps; '
+                        f'got {total_steps}. Set trainer.total_training_steps.')
+                actor_lr_scheduler = get_cosine_schedule_with_warmup(
+                    optimizer=actor_optimizer,
+                    num_warmup_steps=num_warmup_steps,
+                    num_training_steps=total_steps,
+                    min_lr_ratio=min_lr_ratio)
+            elif warmup_style == 'constant':
+                actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer,
+                                                                       num_warmup_steps=num_warmup_steps)
+            else:
+                raise ValueError(f"optim.warmup_style must be constant or cosine, got {warmup_style!r}")
         else:
             actor_optimizer = None
             actor_lr_scheduler = None
@@ -551,6 +572,40 @@ class ActorRolloutRefWorker(Worker):
             with open_dict(self.config.ref):
                 self.config.ref.use_remove_padding = use_remove_padding
             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+
+        # OPD^2: frozen teacher + teacher_base live in the actor worker (the
+        # student's top-K index tensor is far too large to ship to a separate Ray
+        # actor at K=1024). They start parked on CPU; compute_opd2_signal wakes
+        # them for its phase only -- the same residency discipline as the KD
+        # teacher group in verl/trainer/ppo/teacher_kd.py.
+        self.opd2_scorer = None
+        if self._is_actor and self.config.actor.get('use_opd2', False):
+            from verl.workers.actor.opd2_signal import OPD2Scorer
+            acfg = self.config.actor
+            teacher = acfg.get('opd2_teacher', None)
+            teacher_base = acfg.get('opd2_teacher_base', None)
+            if not teacher or not teacher_base:
+                raise ValueError('use_opd2=True requires actor.opd2_teacher and '
+                                 'actor.opd2_teacher_base')
+            if self.rank == 0:
+                print(f'  [opd2] teacher={teacher}\n  [opd2] teacher_base={teacher_base}', flush=True)
+            self.opd2_scorer = OPD2Scorer(
+                teacher_path=teacher,
+                teacher_base_path=teacher_base,
+                dtype=acfg.get('opd2_dtype', 'bfloat16'),
+                # Plain HF models, not the FSDP actor: flash_attention_2 regardless
+                # of the actor's ATTN_IMPL (transformers has no FA3 backend for a
+                # bare AutoModelForCausalLM). Same choice teacher_kd.py makes.
+                attn_implementation=acfg.get('opd2_attn_implementation', 'flash_attention_2'),
+                chunk_tokens=int(acfg.get('opd2_chunk_tokens', 512)),
+                use_teacher_template=bool(acfg.get('opd2_teacher_template', True)),
+                keep_on_gpu=bool(acfg.get('opd2_keep_on_gpu', False)),
+                verbose=(self.rank == 0),
+                student_tokenizer=self.tokenizer,
+            )
+            if self.rank == 0:
+                print('  [opd2] teacher + teacher_base load disk->GPU per scoring phase '
+                      '(0 host RAM between phases)', flush=True)
 
         if self._is_actor:
             self.flops_counter = FlopsCounter(self.actor_model_config)
@@ -896,6 +951,160 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_opd2_signal(self, data: DataProto):
+        """OPD^2 dense per-token advantage signal for this rank's shard.
+
+        Three teacher-forced forwards per response -- student (top-K columns),
+        teacher, teacher_base -- combined by
+        ``verl.workers.actor.opd2_signal.combine_opd2_signal``. Only a [B, R]
+        float32 signal crosses back to the driver; the [B, R, K] index tensor
+        never leaves this process.
+
+        Rows are streamed in micro-batches: student forward, both frozen
+        forwards, combine, free. A two-phase version (all students, then all
+        teachers) would have to hold a whole-shard ``[B, R, K]`` index tensor --
+        8.6TB at the paper's 256 x 8192 with K=1024. The frozen models are woken
+        ONCE for the whole loop rather than per micro-batch, so they are
+        co-resident with the student here (the vLLM engine is already asleep).
+        """
+        from verl.workers.actor.opd2_signal import combine_opd2_signal
+
+        assert self._is_actor and self.opd2_scorer is not None, \
+            'compute_opd2_signal called without use_opd2=True'
+        if self.ulysses_sequence_parallel_size > 1:
+            raise NotImplementedError(
+                'OPD^2 scoring uses the dense (non-sequence-parallel) student forward; '
+                'set actor.ulysses_sequence_parallel_size=1.')
+
+        acfg = self.config.actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(torch.cuda.current_device())
+        temperature = self.config.rollout.temperature
+        top_k = int(acfg.get('opd2_topk', 1024))
+        chunk_tokens = int(acfg.get('opd2_chunk_tokens', 512))
+        mb = max(1, int(acfg.get('opd2_micro_batch_size', 1)))
+        bias = float(acfg.get('opd2_rewards_bias', 0.0))
+
+        input_ids = data.batch['input_ids']
+        attention_mask = data.batch['attention_mask']
+        responses = data.batch['responses']
+        device = responses.device
+        B, R = responses.shape
+        prompt_len = input_ids.shape[1] - R
+        raw_prompts = data.non_tensor_batch.get('raw_prompt', None)
+        if raw_prompts is None and self.opd2_scorer.teacher_tokenizer is not None:
+            raise ValueError(
+                "opd2_teacher_template=True needs data.return_raw_chat=True "
+                "(non_tensor_batch['raw_prompt'] is missing).")
+
+        # A response id at or above the teacher's vocabulary would gather garbage.
+        # Both Qwen2.5-1.5B and the DeepSeek-R1-Distill family pad to 151936, so
+        # this is a guard, not a routine clamp.
+        v_min = self.opd2_scorer.vocab_size
+        if int(responses.max().item()) >= v_min:
+            raise ValueError(f'response id >= teacher vocab {v_min}; teacher/student '
+                             'vocabularies are not compatible.')
+
+        # --- 1. per-row teacher sequences (cheap; no forwards yet)
+        rows = []  # (batch_row, resp_len, teacher_sequence_ids, teacher_response_ids)
+        signals = torch.zeros(B, R, dtype=torch.float32, device=device)
+        valid = torch.zeros(B, dtype=torch.bool, device=device)
+        unmapped = torch.zeros(B, dtype=torch.int32, device=device)
+        for i in range(B):
+            r_len = int(attention_mask[i, prompt_len:].sum().item())
+            if r_len <= 1:
+                # Degenerate row: leave its signal at zero (advantage 0 => no
+                # gradient), mirroring the reference's NaN'd rows.
+                continue
+            p_mask = attention_mask[i, :prompt_len].bool()
+            student_prompt_ids = input_ids[i, :prompt_len][p_mask].tolist()
+            chat = raw_prompts[i] if raw_prompts is not None else None
+            t_prompt_ids = self.opd2_scorer.render_teacher_prompt_ids(chat, student_prompt_ids)
+            # Student control ids do not all mean the same thing to the teacher --
+            # notably EOS. Splice the REMAPPED response so the teacher scores the
+            # token the student actually meant (OPD2Scorer._build_id_contract).
+            t_resp = self.opd2_scorer.remap_response_ids(responses[i, :r_len])
+            rows.append((i, r_len, list(t_prompt_ids) + t_resp.tolist(), t_resp))
+            valid[i] = True
+
+        # --- 2. stream micro-batches: student -> teacher + teacher_base -> combine
+        if rows:
+            # Length-sorted so a micro-batch of >1 wastes little right padding.
+            order = sorted(range(len(rows)), key=lambda j: len(rows[j][2]))
+            # Dedicated scoring GPU (opd2_dedicated_gpu): the frozen models live in
+            # the 'opd2_scorer' actor created by main_ppo; only the student side
+            # runs here. Otherwise they are loaded onto this GPU for the phase.
+            remote = None
+            if acfg.get('opd2_dedicated_gpu', False):
+                import ray
+                remote = ray.get_actor('opd2_scorer')
+            else:
+                self.opd2_scorer.to_gpu()
+            try:
+                for start in range(0, len(order), mb):
+                    js = order[start:start + mb]
+                    row_idx = torch.tensor([rows[j][0] for j in js], dtype=torch.long,
+                                           device=device)
+                    micro = data.batch[row_idx]
+                    b_gt, b_tk, idx = self.actor.compute_opd2_student(
+                        micro, temperature=temperature, top_k=top_k,
+                        chunk_tokens=chunk_tokens)
+                    lens = [rows[j][1] for j in js]
+                    seqs_mb = [rows[j][2] for j in js]
+                    gts_mb = [rows[j][3] for j in js]
+                    # gt ids and the student's top-K COLUMNS both index the
+                    # teacher's vocabulary here, so both are remapped; leaving the
+                    # columns raw would let E_base[.] gather teacher column 151645
+                    # (<|Assistant|>) at every EOS position.
+                    idx_mb = [self.opd2_scorer.remap_response_ids(idx[local, :lens[local]])
+                              for local in range(len(js))]
+                    if remote is not None:
+                        sigs = ray.get(remote.score_and_combine.remote(
+                            seqs_mb, lens, [g.cpu() for g in gts_mb],
+                            [t.to(torch.int32).cpu() for t in idx_mb],
+                            [b_gt[local, :lens[local]].cpu() for local in range(len(js))],
+                            [b_tk[local, :lens[local]].cpu() for local in range(len(js))],
+                            temperature=temperature, rewards_bias=bias))
+                        sigs = [s.to(device) for s in sigs]
+                    else:
+                        scored = self.opd2_scorer.score_rows(seqs_mb, lens, gts_mb, idx_mb,
+                                                             temperature=temperature)
+                        sigs = [combine_opd2_signal(b_gt[local, :lens[local]],
+                                                    b_tk[local, :lens[local]],
+                                                    *scored[local], bias)
+                                for local in range(len(js))]
+                        del scored
+                    for local, j in enumerate(js):
+                        i, r_len = rows[j][0], rows[j][1]
+                        sig = sigs[local]
+                        # Positions whose sampled id has no honest teacher
+                        # counterpart contribute no advantage rather than a
+                        # confidently wrong one.
+                        drop = self.opd2_scorer.unmapped_mask(responses[i, :r_len])
+                        if drop.any():
+                            sig = sig.masked_fill(drop, 0.0)
+                            unmapped[i] = int(drop.sum().item())
+                        signals[i, :r_len] = sig
+                    del sigs, b_gt, b_tk, idx, micro, row_idx
+            finally:
+                self.opd2_scorer.to_cpu()
+
+        output = DataProto.from_dict(tensors={'opd2_signal': signals,
+                                              'opd2_valid': valid,
+                                              'opd2_unmapped': unmapped})
+        output = output.to('cpu')
+
+        actor_handle = self.actor.actor_module._handle
+        if self.world_size > 1 and getattr(actor_handle, "uses_sharded_strategy", False):
+            actor_handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        log_gpu_memory_usage('After compute_opd2_signal', logger=logger)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

@@ -195,6 +195,28 @@ def main_task(config):
         max_colocate_count=int(configured_colocate),
     )
 
+    # OPD^2 with a dedicated scoring GPU: the frozen teacher + teacher_base live
+    # in ONE Ray actor holding its own GPU, loaded once disk->GPU (never host RAM).
+    # Actor workers stream micro-batches to it by name. Created before the
+    # training pool so it claims the first visible GPU; kept alive by this frame.
+    acfg = config.actor_rollout_ref.actor
+    opd2_scorer = None
+    if acfg.get('use_opd2', False) and acfg.get('opd2_dedicated_gpu', False):
+        from verl.workers.actor.opd2_signal import OPD2Scorer
+        opd2_scorer = ray.remote(num_gpus=1)(OPD2Scorer).options(name='opd2_scorer').remote(
+            teacher_path=acfg.opd2_teacher,
+            teacher_base_path=acfg.opd2_teacher_base,
+            dtype=acfg.get('opd2_dtype', 'bfloat16'),
+            attn_implementation=acfg.get('opd2_attn_implementation', 'flash_attention_2'),
+            chunk_tokens=int(acfg.get('opd2_chunk_tokens', 512)),
+            use_teacher_template=bool(acfg.get('opd2_teacher_template', True)),
+            keep_on_gpu=True,
+            verbose=True,
+            student_tokenizer=tokenizer)
+        ray.get(opd2_scorer.to_gpu.remote())  # fail fast (OOM, bad path) before training
+        print('[main_ppo] OPD^2 scorer resident on its own GPU; training pool gets '
+              f'{config.trainer.n_gpus_per_node} GPU(s)', flush=True)
+
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,
                             processor=processor,

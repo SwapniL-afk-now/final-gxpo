@@ -41,6 +41,7 @@ from verl.workers.actor.optimizer_transaction import snapshot_optimizer_state
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.workers.actor.kd_loss import KD_TOPK_CHUNK_TOKENS, compute_forward_kl_topk_chunked, compute_reverse_kl_topk_chunked
+from verl.workers.actor.opd2_signal import OPD2_CHUNK_TOKENS, topk_from_logits
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
@@ -794,6 +795,73 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
+    def _forward_opd2_micro_batch(self, micro_batch) -> torch.Tensor:
+        """Dense RESPONSE-ONLY logits for OPD^2 (no rmpad, no temperature scaling).
+
+        Differs from ``_forward_kd_micro_batch`` in one way that matters at OPD^2's
+        length budget: ``logits_to_keep`` makes the model apply ``lm_head`` only to
+        the positions we actually consume, instead of over the whole prompt+response
+        and slicing afterwards. At 1024 prompt + 8192 response that skips a
+        [b, 9216, V] intermediate -- ~2.8GB bf16 per row -- which is what caps
+        ``opd2_micro_batch_size``. Same trick verl already uses in
+        ``_get_per_token_logps``.
+
+        Returns RAW logits (bsz, response_length, vocab); the caller divides by the
+        temperature in fp32 (see topk_from_logits).
+        """
+        response_length = micro_batch['responses'].size(-1)
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            position_ids = micro_batch['position_ids']
+            if position_ids.dim() == 3:  # qwen2vl mrope
+                position_ids = position_ids.transpose(0, 1)
+            output = self.actor_module(input_ids=micro_batch['input_ids'],
+                                       attention_mask=micro_batch['attention_mask'],
+                                       position_ids=position_ids,
+                                       logits_to_keep=response_length + 1,
+                                       use_cache=False)
+            # logits_to_keep=R+1 returns the last R+1 positions; position j predicts
+            # token j+1, so the R rows that predict the response are all but the last.
+            return output.logits[:, :-1, :]
+
+    def compute_opd2_student(self, micro_batch, temperature: float, top_k: int,
+                             chunk_tokens: int = OPD2_CHUNK_TOKENS):
+        """Student side of the OPD^2 signal for ONE micro-batch of rows.
+
+        OPD^2 weights its expectation corrections by the STUDENT's probability
+        and truncates them to the STUDENT's top-K, so the columns every model is
+        later gathered at are chosen here (see
+        ``verl.workers.actor.opd2_signal`` for the formula).
+
+        Deliberately per-micro-batch, not per-shard: a whole-shard
+        ``[B, R, K]`` index tensor is 8.6TB at the paper's 256x8192 with K=1024.
+        The caller consumes each group's columns against the teacher and frees
+        them before moving on.
+
+        Returns ``(base_gt [b, R], base_topk [b, R, K], topk_idx [b, R, K])`` --
+        full-vocab-normalized log-probs at the rollout temperature, i.e. exactly
+        what ``compute_log_prob`` produces for ``old_log_probs``.
+        """
+        self.actor_module.eval()
+        responses = micro_batch['responses']
+        b, r = responses.shape
+        with torch.no_grad():
+            # ponytail: dense [b, R, V] logits (~2.5GB bf16 at R=8192, V=152k,
+            # b=1) -- the binding constraint on opd2_micro_batch_size. Upgrade
+            # path if the length budget grows again: FSDP-safe hidden-state
+            # forward + chunked lm_head, as the teacher side already does.
+            #
+            # The forward returns RAW logits: the temperature division happens in
+            # FP32 inside topk_from_logits, because bf16's spacing at a logit of
+            # ~30 is ~0.25 -- the same order as the OPD^2 signal itself.
+            logits = self._forward_opd2_micro_batch(micro_batch=micro_batch)
+            gt, lp, idx = topk_from_logits(logits.reshape(b * r, -1),
+                                           responses.reshape(b * r),
+                                           top_k, temperature=temperature,
+                                           chunk_tokens=chunk_tokens)
+            del logits
+        k = lp.size(-1)
+        return gt.view(b, r), lp.view(b, r, k), idx.view(b, r, k)
+
     def _make_minibatch_iterator(self, data: DataProto):
         """Select PPO keys and split the batch into mini-batches (shared by all update paths)."""
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
@@ -969,11 +1037,18 @@ class DataParallelPPOActor(BasePPOActor):
                                                             temperature=temperature,
                                                             need_entropy=False)
 
-                pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                              log_prob=log_prob,
-                                                                              advantages=advantages,
-                                                                              eos_mask=response_mask,
-                                                                              cliprange=clip_ratio)
+                pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
+                    old_log_prob=old_log_prob,
+                    log_prob=log_prob,
+                    advantages=advantages,
+                    eos_mask=response_mask,
+                    cliprange=clip_ratio,
+                    # 'token-mean' is verl's historical reduction and stays the
+                    # default, so GRPO/SFPO/GXPO arms are untouched.
+                    # 'seq-mean-token-mean' is trl's loss_type="grpo", which the
+                    # OPD^2 recipe pins. Shared by all three GXPO passes, so the
+                    # extrapolated update sees the same objective as the probes.
+                    loss_agg_mode=self.config.get('loss_agg_mode', 'token-mean'))
                 # compute entropy loss from entropy. A skipped entropy implies
                 # entropy_coeff == 0, so the zero placeholder keeps policy_loss (and its
                 # gradients) bit-identical.
