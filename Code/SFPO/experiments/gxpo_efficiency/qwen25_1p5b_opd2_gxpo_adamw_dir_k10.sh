@@ -2,8 +2,8 @@
 #
 # qwen25_1p5b_opd2_gxpo_adamw_dir_k10.sh
 #
-# Qwen2.5-1.5B-Instruct (student) | OPD^2 delta distillation | GXPO + AdamW |
-# TRANSACTIONAL optimizer state | OPTIMIZER-DIRECTION retention | K=10 | alpha=0.3
+# Qwen2.5-3B-Instruct (student) | OPD^2 delta distillation | GXPO + AdamW |
+# TRANSACTIONAL optimizer state | OPTIMIZER-DIRECTION retention | K=5 | alpha=0.1
 #
 # OPD^2 (On-Policy Delta Distillation, arXiv:2607.15161, NAVER AI Lab) replaces
 # the verifier advantage with a DENSE PER-TOKEN signal built from the delta
@@ -19,7 +19,7 @@
 # correct below the loss). They compose with zero changes to either: the PPO
 # clip, the retention estimator and the trigger gate are untouched.
 #
-#   student      : Qwen/Qwen2.5-1.5B-Instruct
+#   student      : Qwen/Qwen2.5-3B-Instruct
 #   teacher      : Qwen/Qwen2.5-Math-1.5B-Instruct
 #   teacher_base : Qwen/Qwen2.5-Math-1.5B     (the teacher's pre-instruct base)
 #
@@ -105,8 +105,8 @@ export KL_LOSS_COEF="0.0"
 export SAVE_FREQ="${SAVE_FREQ:-20}"
 
 # ---------------------------------------------------------------- GXPO cfg ---
-export K="${K:-10}"
-export REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.3}"
+export K="${K:-5}"
+export REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.1}"
 export OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
 export GXPO_OPTIMIZER_STATE_MODE="${GXPO_OPTIMIZER_STATE_MODE:-transactional}"
 # auto = AdamW optimizer-direction retention r = d1/d0 (see
@@ -128,14 +128,14 @@ export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.45}"
 # ------------------------------------------------------------- preflight -----
 MISSING=0
 GXPO_ASSET_ROOT="/office/dev_workspace/swapnil/gradient-extrapolation-based-policy-optimization-gxpo-speed-audit"
-MODEL_DIR="${STUDENT_MODEL:-/office/shared_cache/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306}"
+MODEL_DIR="${STUDENT_MODEL:-/office/shared_cache/.cache/huggingface/hub/models--Qwen--Qwen2.5-3B-Instruct/snapshots/aa8e72537993ba99e69dfaafa59ed015b17504d1}"
 DATA_ROOT="${GXPO_DATA_ROOT:-$GXPO_ASSET_ROOT/Code/SFPO/data}"
-export MODEL_QWEN25_1P5B_INSTRUCT="$MODEL_DIR"
+export MODEL_QWEN25_3B_INSTRUCT="$MODEL_DIR"
 export GXPO_DATA_ROOT="$DATA_ROOT"
 
 if [[ ! -f "$MODEL_DIR/config.json" ]]; then
   echo "PREFLIGHT FAIL: student weights not found at $MODEL_DIR" >&2
-  echo "  (point STUDENT_MODEL at a local Qwen2.5-1.5B-Instruct copy)" >&2
+  echo "  (point STUDENT_MODEL at a local Qwen2.5-3B-Instruct copy)" >&2
   MISSING=1
 fi
 for _label in TEACHER:"$OPD2_TEACHER" TEACHER_BASE:"$OPD2_TEACHER_BASE"; do
@@ -205,7 +205,7 @@ EOT
 fi
 
 # ---------------------------------------------------------------- launch -----
-MODEL_ALIAS="${MODEL_ALIAS:-qwen25-1p5b-qmath}"
-MODEL_ID="$MODEL_QWEN25_1P5B_INSTRUCT"
+MODEL_ALIAS="${MODEL_ALIAS:-qwen25-3b-qmath}"
+MODEL_ID="$MODEL_QWEN25_3B_INSTRUCT"
 METHOD="gxpo"
 source "$SCRIPT_DIR/common.sh"

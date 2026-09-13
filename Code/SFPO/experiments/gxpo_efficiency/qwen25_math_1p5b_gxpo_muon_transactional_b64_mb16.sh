@@ -3,7 +3,7 @@
 # qwen25_math_1p5b_gxpo_muon_transactional_b64_mb16.sh
 #
 # Complete entrypoint: Qwen2.5-Math-1.5B-Instruct | GXPO + Muon | batch 256 |
-# minibatch 64 | K=3 | alpha=0.8 | GPUs 1,2 (FSDP 2), entropy trigger.
+# minibatch 64 | K=5 | alpha=0.5 | GPUs 1,2 (FSDP 2, TP 1), entropy trigger.
 #
 # Optimizer-state mode: TRANSACTIONAL -- probe optimizer moments are
 # snapshotted before the two probe steps and rolled back after repositioning,
@@ -47,8 +47,8 @@ fi
 # ------------------------------------------------------------ gate config ----
 # Experiment settings owned by this entrypoint.  The downstream common.sh chain
 # must preserve these inherited values instead of overriding them.
-export K="3"
-export REPOSITION_ALPHA="0.8"
+export K="5"
+export REPOSITION_ALPHA="0.5"
 export TRAIN_BATCH_SIZE="256"
 export PPO_MINI_BATCH_SIZE="64"
 export GPU_IDS="1,2"
@@ -100,6 +100,7 @@ export GXPO_RESET_ENTROPY_AFTER_WARMUP="False"
 export ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 export PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-24576}"
 export LOG_PROB_MICRO_BATCH_SIZE="${LOG_PROB_MICRO_BATCH_SIZE:-8}"
+export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
 export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-1024}"
 export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-98304}"
 export VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASHINFER}"
@@ -162,7 +163,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   repo_root          : $REPO_ROOT
   model              : $MODEL_DIR
   data_root          : $DATA_ROOT
-  method             : gxpo + ${OPTIMIZER_NAME:-muon} (K=${K:-3}, alpha=${REPOSITION_ALPHA:-0.8})
+  method             : gxpo + ${OPTIMIZER_NAME:-muon} (K=${K:-5}, alpha=${REPOSITION_ALPHA:-0.5})
   batch / minibatch  : ${TRAIN_BATCH_SIZE:-256} / ${PPO_MINI_BATCH_SIZE:-64}
   gpus               : ${GPU_COUNT:-2}  (ids ${GPU_IDS:-1,2}, FSDP_SIZE=${FSDP_SIZE:-2})
   max_steps          : ${MAX_STEPS:-400}   save_freq ${SAVE_FREQ:-20}

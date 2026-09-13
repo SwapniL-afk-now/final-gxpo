@@ -444,6 +444,20 @@ class RayPPOTrainer(object):
         if self.use_opd2:
             print('[OPD2] advantages come from the teacher-delta signal; '
                   'verifier reward is metrics-only')
+        # GRPO+SLED-Delta: the SLED token signal is an AUXILIARY loss, not an
+        # advantage replacement -- GRPO advantages from compute_advantage stay
+        # exactly as they are. Scoring is skipped entirely at sled_loss_coef=0,
+        # which reduces this mode to ordinary GRPO bit-for-bit.
+        self.use_sled_delta = bool(config.actor_rollout_ref.actor.get('use_sled_delta', False)
+                                   and float(config.actor_rollout_ref.actor.get(
+                                       'sled_loss_coef', 1.0)) != 0.0)
+        if self.use_sled_delta:
+            if self.use_opd2:
+                raise ValueError('use_sled_delta=True cannot be combined with use_opd2=True: '
+                                 'SLED-Delta composes with the GRPO advantage, which OPD^2 '
+                                 'replaces. Run one delta method at a time.')
+            print('[SLED] auxiliary sign-gated self-distillation loss is on; '
+                  'GRPO advantage and ratio are unchanged')
         # Off-policy KD: fixed responses + cached teacher targets ride in the
         # dataloader rows, so no teacher group is built and no vLLM generation
         # runs. The rollout engine still initializes (idle, tiny KV reservation
@@ -1928,6 +1942,42 @@ class RayPPOTrainer(object):
                                 metrics['opd2/unmapped_frac'] = (
                                     batch.batch['opd2_unmapped'].sum().item() / max(n_resp, 1))
                             del opd2_out, sig, resp_mask, live
+
+                        # GRPO+SLED-Delta: attach the FROZEN target-side tensors
+                        # once per step. The GRPO advantages above are NOT
+                        # modified -- both signals consume the SAME rollout.
+                        if self.use_sled_delta:
+                            with _timer('sled_signal', timing_raw):
+                                sled_out = self.actor_rollout_wg.compute_sled_delta_signal(batch)
+                            batch = batch.union(sled_out)
+                            sresp = batch.batch['attention_mask'][:, -batch.batch[
+                                'sled_a_delta'].shape[1]:].bool()
+                            ad = batch.batch['sled_a_delta']
+                            live_tok = ad[sresp]
+                            if live_tok.numel() > 0:
+                                metrics['sled/frozen_adv_mean'] = live_tok.mean().item()
+                                metrics['sled/frozen_adv_abs_mean'] = live_tok.abs().mean().item()
+                                if live_tok.numel() > 1:
+                                    metrics['sled/frozen_adv_std'] = live_tok.std().item()
+                                metrics['sled/p_entropy'] = batch.batch[
+                                    'sled_ent_p'][sresp].mean().item()
+                                metrics['sled/q_entropy'] = batch.batch[
+                                    'sled_ent_q'][sresp].mean().item()
+                                metrics['sled/kl_q_p'] = batch.batch[
+                                    'sled_kl_q_p'][sresp].mean().item()
+                                metrics['sled/kl_p_q'] = batch.batch[
+                                    'sled_kl_p_q'][sresp].mean().item()
+                                # Same-snapshot check: the scoring forward must
+                                # reproduce the rollout log-probs it was built
+                                # from. Large values mean q/p came from weights
+                                # that moved relative to the rollout.
+                                metrics['sled/snapshot_mae'] = (
+                                    batch.batch['sled_logp_gt'][sresp]
+                                    - batch.batch['old_log_probs'][sresp]
+                                ).abs().mean().item()
+                            metrics['sled/frozen_rows_frac'] = (
+                                batch.batch['sled_valid'].float().mean().item())
+                            del sled_out, sresp, ad, live_tok
 
                     # per-prompt group views must see pre-balance row order
                     reward_flat = _restore_group_order(batch.batch['token_level_scores'].sum(-1), inv_balance_perm)

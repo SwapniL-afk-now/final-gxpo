@@ -6,8 +6,7 @@
 # opd2_gxpo run. Fires when EITHER finish indicator holds:
 #   A) no compute processes on GPU 1 or 2 (2 consecutive 60s polls), OR
 #   B) 0% utilization on both GPUs for 15 consecutive minutes.
-# Then it SIGTERMs leftovers on GPUs 1,2 ONLY (never touches 3,4), verifies
-# the GPUs are free, and launches tmux session opd2_gxpo_a03.
+# Then it verifies the GPUs are free and launches tmux session opd2_gxpo_a03.
 #
 # Run inside tmux; the training log attaches to the new session AND to
 # runs_opd2_opd2_gxpo_a03.log:
@@ -62,29 +61,15 @@ while true; do
   fi
 done
 
-# ---- free GPUs 1,2 (leftover PIDs on THESE GPUs only) ----
+# ---- fail closed: never kill another queue's processes ----
 leftovers="$(gpu_pids)"
-if [[ -n "$leftovers" ]]; then
-  log "SIGTERM leftovers on GPUs $GPUS: $(echo "$leftovers" | tr '\n' ' ')"
-  # shellcheck disable=SC2086
-  kill -TERM $leftovers 2>/dev/null || true
-  sleep 15
-  leftovers="$(gpu_pids)"
-  if [[ -n "$leftovers" ]]; then
-    log "SIGKILL stragglers: $(echo "$leftovers" | tr '\n' ' ')"
-    # shellcheck disable=SC2086
-    kill -KILL $leftovers 2>/dev/null || true
-    sleep 5
-    leftovers="$(gpu_pids)"
-  fi
-fi
 if [[ -n "$leftovers" ]]; then
   log "REFUSING to launch: GPUs $GPUS still busy: $(echo "$leftovers" | tr '\n' ' ')" >&2
   exit 1
 fi
 log "GPUs $GPUS free"
 
-if tmux has-session -t "$SESSION" 2>/dev/null; then
+if tmux has-session -t "=$SESSION" 2>/dev/null; then
   log "tmux session '$SESSION' already exists - not relaunching" >&2
   exit 1
 fi

@@ -67,7 +67,7 @@ stop_current_training() {
   local pid
   pid="$(main_training_pid || true)"
   log "requesting current GXPO tmux job to stop (pid=${pid:-unknown})"
-  if tmux has-session -t "$TRAIN_SESSION" 2>/dev/null; then
+  if tmux has-session -t "=$TRAIN_SESSION" 2>/dev/null; then
     tmux send-keys -t "$TRAIN_SESSION" C-c
   elif [[ -n "$pid" ]]; then
     kill -INT "$pid" 2>/dev/null || true
@@ -124,7 +124,7 @@ done
 stop_current_training
 log "GXPO driver stopped; forcing permanent GXPO shutoff for the continuation"
 
-if tmux has-session -t "$CONT_SESSION" 2>/dev/null; then
+if tmux has-session -t "=$CONT_SESSION" 2>/dev/null; then
   log "continuation session $CONT_SESSION already exists; refusing to start a duplicate"
   exit 2
 fi

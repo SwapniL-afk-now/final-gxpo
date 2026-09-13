@@ -224,6 +224,11 @@ ROLLOUT_N="${ROLLOUT_N:-8}"
 # Responses per prompt for periodic/final VALIDATION decoding (val_kwargs.n).
 # Independent of ROLLOUT_N above, which is the training-time num_generations.
 VAL_N="${VAL_N:-1}"
+# Validation sampling. Defaults preserve the historical arms (sampled, temp
+# 0.7): VAL_DO_SAMPLE=False selects true greedy (temperature 0, n=1) via the
+# rollout's do_sample=False branch.
+VAL_DO_SAMPLE="${VAL_DO_SAMPLE:-True}"
+VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.7}"
 LR="${LR:-1e-6}"
 # LR schedule. `warmup_style` and `min_lr_ratio` are declared in
 # verl/trainer/config/ppo_trainer.yaml but used to be DEAD -- fsdp_workers.py
@@ -273,6 +278,54 @@ case "${OPD2_ENABLED,,}" in
   0|false|no|off|"") OPD2_ON=0 ;;
   *) echo "PREFLIGHT FAIL: OPD2_ENABLED must be 0/1, got '$OPD2_ENABLED'" >&2; exit 2 ;;
 esac
+# ------------------------------------------------------- GRPO+SLED-Delta ---
+# Auxiliary token-level self-distillation on top of unchanged GRPO:
+#   L = grpo_coef * L_grpo + sled_loss_coef * L_sled,
+# where L_sled is the OPD^2-style sign-gated SLED-Delta loss
+# (verl/workers/actor/sled_delta.py). The GRPO advantage, ratio and clip are
+# untouched; the gate acts only on the SLED term. Everything defaults off:
+# with SLED_ENABLED unset, every existing entrypoint resolves to exactly the
+# config it resolved to before. Parsed here (next to OPD2) so SLED_ON is
+# defined before the RUN_NAME tags below (set -u would fail otherwise).
+SLED_ENABLED="${SLED_ENABLED:-0}"
+SLED_LOSS_COEF="${SLED_LOSS_COEF:-1.0}"
+SLED_GRPO_COEF="${SLED_GRPO_COEF:-1.0}"
+SLED_ALPHA="${SLED_ALPHA:-0.5}"
+SLED_EARLY_LAYER="${SLED_EARLY_LAYER:--1}"
+SLED_TOPK="${SLED_TOPK:-1024}"
+SLED_MICRO_BATCH_SIZE="${SLED_MICRO_BATCH_SIZE:-2}"
+SLED_CHUNK_TOKENS="${SLED_CHUNK_TOKENS:-512}"
+SLED_FLAGS=()
+case "${SLED_ENABLED,,}" in
+  1|true|yes|on) SLED_ON=1 ;;
+  0|false|no|off|"") SLED_ON=0 ;;
+  *) echo "PREFLIGHT FAIL: SLED_ENABLED must be 0/1, got '$SLED_ENABLED'" >&2; exit 2 ;;
+esac
+if [[ "$SLED_ON" -eq 1 ]]; then
+  if [[ "$OPD2_ON" -eq 1 ]]; then
+    echo "PREFLIGHT FAIL: SLED_ENABLED=1 cannot be combined with OPD2_ENABLED=1:" >&2
+    echo "  SLED-Delta composes with the GRPO advantage, which OPD^2 replaces." >&2
+    exit 2
+  fi
+  python - "$SLED_LOSS_COEF" "$SLED_GRPO_COEF" "$SLED_ALPHA" "$SLED_TOPK" <<'PY' || exit 2
+import sys
+coef, gcoef, alpha, topk = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3]), int(sys.argv[4])
+assert coef >= 0.0, f'SLED_LOSS_COEF must be >= 0, got {coef}'
+assert gcoef >= 0.0, f'SLED_GRPO_COEF must be >= 0, got {gcoef}'
+assert alpha >= 0.0, f'SLED_ALPHA must be >= 0, got {alpha}'
+assert topk > 0, f'SLED_TOPK must be > 0, got {topk}'
+PY
+  SLED_FLAGS+=(
+    +actor_rollout_ref.actor.use_sled_delta=True
+    +actor_rollout_ref.actor.sled_loss_coef="$SLED_LOSS_COEF"
+    +actor_rollout_ref.actor.sled_grpo_coef="$SLED_GRPO_COEF"
+    +actor_rollout_ref.actor.sled_alpha="$SLED_ALPHA"
+    +actor_rollout_ref.actor.sled_early_layer="$SLED_EARLY_LAYER"
+    +actor_rollout_ref.actor.sled_topk="$SLED_TOPK"
+    +actor_rollout_ref.actor.sled_micro_batch_size="$SLED_MICRO_BATCH_SIZE"
+    +actor_rollout_ref.actor.sled_chunk_tokens="$SLED_CHUNK_TOKENS"
+  )
+fi
 OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
 # AdamW weight decay. fsdp_workers defaults to 1e-2 when unset; HuggingFace
 # TrainingArguments (and therefore every trl recipe that does not set it)
@@ -391,6 +444,12 @@ fi
 # run's wandb id, checkpoints or result dir. Same guard pattern as above.
 if [[ "$OPD2_ON" -eq 1 && "$RUN_NAME" != *_opd2* ]]; then
   RUN_NAME="${RUN_NAME}_opd2"
+fi
+# SLED adds an auxiliary loss, so it must never resume a plain-GRPO run's
+# wandb id, checkpoints or result dir (trainer.resume_mode=auto would
+# otherwise splice new metrics into an old run). Same guard pattern.
+if [[ "$SLED_ON" -eq 1 && "$RUN_NAME" != *_sledsig* ]]; then
+  RUN_NAME="${RUN_NAME}_sledsig"
 fi
 # A non-default loss reduction is a different objective, not a different setting.
 # Tag it so it cannot resume a token-mean run's wandb id or checkpoints.
@@ -669,6 +728,7 @@ rollout_n=$ROLLOUT_N
 learning_rate=$LR
 lr_schedule=$LR_WARMUP_STYLE (warmup_ratio=$LR_WARMUP_RATIO, min_lr_ratio=$LR_MIN_RATIO)
 opd2_enabled=$OPD2_ON$( [[ "$OPD2_ON" -eq 1 ]] && echo " (teacher=$OPD2_TEACHER, teacher_base=$OPD2_TEACHER_BASE, topk=$OPD2_TOPK, gen_loss_weight=$OPD2_GEN_LOSS_WEIGHT, teacher_template=$OPD2_TEACHER_TEMPLATE, micro_bsz=$OPD2_MICRO_BATCH_SIZE)" )
+sled_enabled=$SLED_ON$( [[ "$SLED_ON" -eq 1 ]] && echo " (loss_coef=$SLED_LOSS_COEF, grpo_coef=$SLED_GRPO_COEF, alpha=$SLED_ALPHA, early_layer=$SLED_EARLY_LAYER, topk=$SLED_TOPK, micro_bsz=$SLED_MICRO_BATCH_SIZE)" )
 loss_agg_mode=$LOSS_AGG_MODE
 use_kl_loss=$USE_KL_LOSS
 kl_loss_coef=$KL_LOSS_COEF
@@ -779,8 +839,8 @@ python -u -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE:-1.0}" \
   actor_rollout_ref.rollout.top_p="${ROLLOUT_TOP_P:-1.0}" \
   actor_rollout_ref.rollout.val_kwargs.n="$VAL_N" \
-  actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-  actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
+  actor_rollout_ref.rollout.val_kwargs.do_sample="$VAL_DO_SAMPLE" \
+  actor_rollout_ref.rollout.val_kwargs.temperature="$VAL_TEMPERATURE" \
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE:-8}" \
   actor_rollout_ref.ref.fsdp_config.param_offload=True \
@@ -807,6 +867,7 @@ python -u -m verl.trainer.main_ppo \
   trainer.total_epochs=100 \
   "${METHOD_FLAGS[@]}" \
   ${OPD2_FLAGS[@]+"${OPD2_FLAGS[@]}"} \
+  ${SLED_FLAGS[@]+"${SLED_FLAGS[@]}"} \
   | tee "$RUN_DIR/train.log"
 
 if [[ "$FINAL_EVAL_ENABLED" == "True" ]]; then

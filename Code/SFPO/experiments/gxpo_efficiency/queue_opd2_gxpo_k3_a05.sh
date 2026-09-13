@@ -2,10 +2,8 @@
 #
 # Queue the OPD^2+GXPO variant K=3 / alpha=0.5 behind the running K=3 / alpha=0.1 arm.
 #
-# Waits for GPUs 1,2 to be done, frees them if the finished run left memory pinned,
-# then launches. GPU 0 (opd2_only) and GPUs 3,4 (FOREIGN run - never touch) are
-# excluded from every kill by construction: only PIDs nvidia-smi reports on 1,2 are
-# signalled, and any PID that also holds memory on 0/3/4 is skipped.
+# Waits for GPUs 1,2 to be done, verifies they are free, then launches. It never
+# kills processes because those may belong to another queue.
 #
 # Finish is detected three ways, whichever lands first:
 #   1. the opd2_gxpo tmux session is gone          -> definitely done
@@ -38,7 +36,7 @@ say() { echo "[$(date +%H:%M:%S)] $*"; }
 # ---------------------------------------------------------------- wait --------
 idle=0
 while true; do
-  if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  if ! tmux has-session -t "=$SESSION" 2>/dev/null; then
     say "tmux session '$SESSION' is gone -- previous run finished."; break
   fi
   mapfile -t rows < <(nvidia-smi -i "$WATCH_GPUS" \
@@ -63,30 +61,12 @@ while true; do
 done
 
 # ---------------------------------------------------------------- free --------
-say "stopping '$SESSION' and releasing GPUs $WATCH_GPUS"
-tmux kill-session -t "$SESSION" 2>/dev/null && say "killed tmux session $SESSION"
-
-guarded() {  # true if $1 holds memory on a guarded GPU
-  nvidia-smi -i "$GUARD_GPUS" --query-compute-apps=pid --format=csv,noheader 2>/dev/null \
-    | tr -d ' ' | grep -qx "$1"
-}
-
-for sig in TERM KILL; do
-  pids=$(nvidia-smi -i "$WATCH_GPUS" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ' | sort -u)
-  [[ -z "$pids" ]] && break
-  for p in $pids; do
-    if guarded "$p"; then say "SKIP pid $p (also on GPU $GUARD_GPUS)"; continue; fi
-    kill "-$sig" "$p" 2>/dev/null && say "sent SIG$sig to $p"
-  done
-  sleep 30
-done
-
-for _ in $(seq 1 30); do
-  used=$(nvidia-smi -i "$WATCH_GPUS" --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ' | paste -sd+ | bc)
-  (( used < MEM_FREE_MIB * 2 )) && break
-  sleep 10
-done
-say "GPUs $WATCH_GPUS now at ${used}MiB total"
+pids=$(nvidia-smi -i "$WATCH_GPUS" --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d " " | sort -u)
+if [[ -n "$pids" ]]; then
+  say "REFUSING to launch: GPUs $WATCH_GPUS still have compute PIDs: $pids"
+  exit 1
+fi
+say "GPUs $WATCH_GPUS free; no processes were killed"
 
 # --------------------------------------------------------------- launch -------
 # Recipe values transcribed from launch_opd2_paper_pair.sh's PAPER array; only K,
@@ -114,6 +94,6 @@ tmux new-session -d -s "$NEW_SESSION" -c "$CODE_ROOT" \
        2>&1 | tee runs_opd2_opd2_gxpo_a05.log"
 
 sleep 5
-tmux has-session -t "$NEW_SESSION" 2>/dev/null \
+tmux has-session -t "=$NEW_SESSION" 2>/dev/null \
   && say "launched. attach: tmux attach -t $NEW_SESSION | log: runs_opd2_opd2_gxpo_a05.log" \
   || say "LAUNCH FAILED -- session '$NEW_SESSION' did not start"

@@ -130,7 +130,7 @@ bash experiments/gxpo_efficiency/$script 2>&1 | tee runs_opd2_$name.log"
 
 launch () {  # launch <session> <command>
   local session="$1"
-  if tmux has-session -t "$session" 2>/dev/null; then
+  if tmux has-session -t "=$session" 2>/dev/null; then
     echo "tmux session '$session' already exists - kill it first: tmux kill-session -t $session" >&2
     return 1
   fi

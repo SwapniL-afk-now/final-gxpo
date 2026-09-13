@@ -505,7 +505,8 @@ class ActorRolloutRefWorker(Worker):
                                                                inference_engine=rollout.inference_engine,
                                                                model_config=self.actor_model_config,
                                                                full_params='hf' in self.config.rollout.load_format,
-                                                               device_mesh=rollout_device_mesh)
+                                                               device_mesh=rollout_device_mesh,
+                                                               offload_actor_params=self._is_offload_param)
             log_gpu_memory_usage('After building sharding manager', logger=None)
 
         return rollout, rollout_sharding_manager
@@ -1105,6 +1106,89 @@ class ActorRolloutRefWorker(Worker):
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         log_gpu_memory_usage('After compute_opd2_signal', logger=logger)
+        return output
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_sled_delta_signal(self, data: DataProto):
+        """GRPO+SLED-Delta frozen scoring for this rank's shard (ONE rollout).
+
+        Runs the actor -- which still holds the rollout snapshot, because this
+        is called once per step BEFORE any update_policy pass -- with hidden
+        states and builds the early-exit SLED virtual teacher from that same
+        snapshot. Returns the frozen target-side tensors
+        (``sled_a_delta``, ``sled_logq_gt``, ``sled_logp_gt``,
+        ``sled_ep_logq``, entropies, KLs, top-K columns); the GRPO advantages
+        are left untouched. The train-time OPD gate and loss live in
+        ``dp_actor._backward_minibatch``.
+
+        Rows stream in micro-batches and only ``[B, R]`` / ``[B, R, K]``
+        tensors cross back -- never full-vocabulary distributions.
+        """
+        assert self._is_actor, 'compute_sled_delta_signal called on a non-actor worker'
+        acfg = self.config.actor
+        assert acfg.get('use_sled_delta', False), \
+            'compute_sled_delta_signal called without use_sled_delta=True'
+        if self.ulysses_sequence_parallel_size > 1:
+            raise NotImplementedError(
+                'SLED scoring uses the dense (non-sequence-parallel) forward; '
+                'set actor.ulysses_sequence_parallel_size=1.')
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+
+        data = data.to(torch.cuda.current_device())
+        temperature = self.config.rollout.temperature
+        alpha = float(acfg.get('sled_alpha', 0.5))
+        early_layer = int(acfg.get('sled_early_layer', -1))
+        top_k = max(1, int(acfg.get('sled_topk', 64)))
+        chunk_tokens = max(1, int(acfg.get('sled_chunk_tokens', 512)))
+        mb = max(1, int(acfg.get('sled_micro_batch_size', 2)))
+
+        input_ids = data.batch['input_ids']
+        attention_mask = data.batch['attention_mask']
+        responses = data.batch['responses']
+        device = responses.device
+        B, R = responses.shape
+        prompt_len = input_ids.shape[1] - R
+
+        keys_2d = ('sled_a_delta', 'sled_logp_gt', 'sled_logq_gt', 'sled_ep_logq',
+                   'sled_ent_p', 'sled_ent_q', 'sled_kl_q_p', 'sled_kl_p_q')
+        out_2d = {k: torch.zeros(B, R, dtype=torch.float32, device=device) for k in keys_2d}
+        out_topk_logp = torch.zeros(B, R, top_k, dtype=torch.float32, device=device)
+        out_topk_ids = torch.zeros(B, R, top_k, dtype=torch.int32, device=device)
+        valid = torch.zeros(B, dtype=torch.bool, device=device)
+        for start in range(0, B, mb):
+            idx = torch.arange(start, min(start + mb, B), dtype=torch.long, device=device)
+            # Degenerate rows (<=1 response token) keep zeros, mirroring the
+            # OPD^2 invalid-row convention (advantage 0 => no gradient).
+            r_lens = attention_mask[idx, prompt_len:].sum(-1)
+            good = r_lens > 1
+            if not bool(good.any().item()):
+                del idx
+                continue
+            good_idx = idx[good]
+            good_micro = data.batch[good_idx]
+            frozen = self.actor.compute_sled_delta_frozen(
+                good_micro, temperature=temperature, alpha=alpha,
+                early_layer=early_layer, top_k=top_k, chunk_tokens=chunk_tokens)
+            for k2 in keys_2d:
+                out_2d[k2][good_idx] = frozen[k2].to(device)
+            out_topk_logp[good_idx] = frozen['sled_topk_logp'].to(device)
+            out_topk_ids[good_idx] = frozen['sled_topk_ids'].to(device)
+            valid[good_idx] = True
+            del frozen, good_micro, idx, good_idx
+        tensors = dict(out_2d)
+        tensors.update({'sled_topk_logp': out_topk_logp,
+                        'sled_topk_ids': out_topk_ids,
+                        'sled_valid': valid})
+        output = DataProto.from_dict(tensors=tensors)
+        output = output.to('cpu')
+
+        actor_handle = self.actor.actor_module._handle
+        if self.world_size > 1 and getattr(actor_handle, "uses_sharded_strategy", False):
+            actor_handle.reshard(True)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        log_gpu_memory_usage('After compute_sled_delta_signal', logger=logger)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

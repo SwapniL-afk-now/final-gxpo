@@ -30,6 +30,7 @@ from verl.utils.debug import log_gpu_memory_usage
 from verl.third_party.vllm import vllm_version
 
 from verl.utils.lora_utils import merge_lora_state_dict
+from verl.utils.fsdp_utils import offload_fsdp_model_to_cpu
 
 from .base import BaseShardingManager
 
@@ -58,11 +59,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                  inference_engine: LLM,
                  model_config,
                  full_params: bool = False,
-                 device_mesh: DeviceMesh = None):
+                 device_mesh: DeviceMesh = None,
+                 offload_actor_params: bool = False):
         self.module = module
         self.inference_engine = inference_engine
         self.model_config = model_config
         self.device_mesh = device_mesh
+        self.offload_actor_params = offload_actor_params
         self.performance_events = {}
 
         # Full params
@@ -122,6 +125,16 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if vllm_version in ('0.4.2', '0.5.4', '0.6.3'):
             self.inference_engine.sync_model_weights(params, load_format=load_format)
         else:
+            # Materialize a CPU copy before waking vLLM. The actor and vLLM
+            # share this Ray worker, so leaving FSDP weights on CUDA here
+            # makes the wake-up allocation overlap with the training model.
+            if self.offload_actor_params:
+                params = {
+                    name: (param.full_tensor() if hasattr(param, "full_tensor") else param).detach().cpu()
+                    for name, param in params.items()
+                }
+                offload_fsdp_model_to_cpu(self.module)
+                torch.cuda.empty_cache()
             self.inference_engine.wake_up()
             world_size = torch.distributed.get_world_size()
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
@@ -206,7 +219,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3'):
             group = vllm_ps.get_tensor_model_parallel_group()
         else:
-            group = vllm_ps.get_tensor_model_parallel_group().device_group
+            group = vllm_ps.get_tp_group().device_group
 
         all_gather_data_proto(data=data, process_group=group)
         return data

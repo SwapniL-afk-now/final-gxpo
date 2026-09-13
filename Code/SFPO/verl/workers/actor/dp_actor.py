@@ -41,7 +41,9 @@ from verl.workers.actor.optimizer_transaction import snapshot_optimizer_state
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
 from verl.workers.actor.kd_loss import KD_TOPK_CHUNK_TOKENS, compute_forward_kl_topk_chunked, compute_reverse_kl_topk_chunked
-from verl.workers.actor.opd2_signal import OPD2_CHUNK_TOKENS, topk_from_logits
+from verl.workers.actor.opd2_signal import OPD2_CHUNK_TOKENS, gather_from_logits, topk_from_logits
+from verl.workers.actor.sled_delta import (SLED_CHUNK_TOKENS, sled_contrast_logits,
+                                           sled_truncated_frozen)
 from verl.utils.ulysses import ulysses_pad_and_slice_inputs, gather_outpus_and_unpad
 from verl.utils.seqlen_balancing import rearrange_micro_batches, get_reverse_idx
 import verl.utils.torch_functional as verl_F
@@ -862,6 +864,180 @@ class DataParallelPPOActor(BasePPOActor):
         k = lp.size(-1)
         return gt.view(b, r), lp.view(b, r, k), idx.view(b, r, k)
 
+    def _sled_resolve_early_layer(self, early_layer: int) -> int:
+        """0-based transformer-layer index for the SLED early exit.
+
+        ``-1`` (default) selects the middle layer. Anything else is a literal
+        0-based layer index. Raises a clear error when the depth cannot be
+        read and no explicit layer was given.
+        """
+        if int(early_layer) >= 0:
+            return int(early_layer)
+        cfg = getattr(self.actor_module, 'config', None)
+        n = None
+        if cfg is not None:
+            for attr in ('num_hidden_layers', 'n_layer', 'num_layers'):
+                if hasattr(cfg, attr):
+                    n = int(getattr(cfg, attr))
+                    break
+        if n is None:
+            raise ValueError('SLED early_layer=-1 needs the model depth (num_hidden_layers); '
+                             'pass an explicit +actor_rollout_ref.actor.sled_early_layer instead.')
+        return max(0, n // 2)
+
+    def _sled_norm_and_head(self):
+        """(norm, lm_head) for the early-exit projection (Qwen2/Llama layout)."""
+        mod = self.actor_module
+        base = getattr(mod, 'model', None) or getattr(mod, 'transformer', None) or mod
+        norm = getattr(base, 'norm', None) or getattr(base, 'final_layer_norm', None) \
+            or getattr(base, 'ln_f', None)
+        head = getattr(mod, 'lm_head', None) or getattr(mod, 'output_layer', None)
+        if norm is None or head is None:
+            raise ValueError('SLED early exit needs (model.norm, lm_head); '
+                             f'got norm={norm is not None}, head={head is not None}.')
+        return norm, head
+
+    def compute_sled_delta_frozen(self, micro_batch, temperature: float, alpha: float,
+                                  early_layer: int, top_k: int,
+                                  chunk_tokens: int = SLED_CHUNK_TOKENS):
+        """Frozen SLED-Delta statistics for ONE micro-batch of rows.
+
+        Runs the actor (which still holds the rollout snapshot: this is called
+        once per step BEFORE any update_policy pass) with hidden states, builds
+        the early-exit virtual teacher ``q`` from the SAME snapshot, and returns
+        frozen tensors -- ``A_delta``, ``log q(y)``, ``log p(y)``,
+        ``E_p[log q]``, entropies, KLs -- plus the student's top-K columns
+        (ids + log-probs) for the live OPD term at train time.
+
+        All expectations are truncated to the student's top-K columns (the
+        OPD^2 convention); no full-vocabulary fp32 matrix is ever held, only
+        the ``[C, V]`` transient inside the top-K/gather helpers.
+
+        Returns a dict of ``[b, R]`` (``[b, R, K]`` for top-K) fp32 tensors.
+        Everything is target-side (no grad). Prompt/pad positions are zeroed;
+        the caller masks them anyway.
+        """
+        was_training = self.actor_module.training
+        self.actor_module.eval()
+        responses = micro_batch['responses']
+        b, r = responses.shape
+        device = responses.device
+        early_idx = self._sled_resolve_early_layer(early_layer)
+        k = max(1, int(top_k))
+        chunk_tokens = max(1, int(chunk_tokens))
+        with torch.no_grad():
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                position_ids = micro_batch['position_ids']
+                if position_ids.dim() == 3:  # qwen2vl mrope
+                    position_ids = position_ids.transpose(0, 1)
+                output = self.actor_module(input_ids=micro_batch['input_ids'],
+                                           attention_mask=micro_batch['attention_mask'],
+                                           position_ids=position_ids,
+                                           output_hidden_states=True,
+                                           use_cache=False)
+                hiddens = output.hidden_states
+                # Response token t is predicted by the row at -R-1+t (same
+                # alignment as _forward_kd_micro_batch's logits slice).
+                early_h = hiddens[1 + early_idx][:, -r - 1:-1, :].reshape(b * r, -1)
+                final_h = hiddens[-1][:, -r - 1:-1, :].reshape(b * r, -1)
+                del output, hiddens
+                norm, head = self._sled_norm_and_head()
+                n_tokens = b * r
+                gt_ids = responses.reshape(n_tokens)
+                a_parts, logp_parts, logq_parts, ep_parts = [], [], [], []
+                ent_p_parts, ent_q_parts, kl_qp_parts, kl_pq_parts = [], [], [], []
+                tk_lp_parts, tk_idx_parts = [], []
+                for start in range(0, n_tokens, chunk_tokens):
+                    end = min(start + chunk_tokens, n_tokens)
+                    # RAW logits (temperature is divided in fp32 inside the
+                    # top-K/gather helpers, mirroring the OPD^2 precision
+                    # discipline). Full-vocabulary softmax happens only inside
+                    # those helpers; the reductions below see just K columns.
+                    with FSDP.summon_full_params(self.actor_module, writeback=False, recurse=False):
+                        e_raw = head(norm(early_h[start:end])).float()
+                        f_raw = head(norm(final_h[start:end])).float()
+                    s_raw = sled_contrast_logits(f_raw, e_raw, alpha)
+                    gt_c = gt_ids[start:end]
+                    logp_gt_c, tk_lp_c, tk_idx_c = topk_from_logits(
+                        f_raw, gt_c, k, temperature=temperature, chunk_tokens=chunk_tokens)
+                    logq_gt_c, tk_lq_c = gather_from_logits(
+                        s_raw, gt_c, tk_idx_c, temperature=temperature,
+                        chunk_tokens=chunk_tokens)
+                    stats_c = sled_truncated_frozen(tk_lp_c, tk_lq_c, logp_gt_c, logq_gt_c)
+                    a_parts.append(stats_c['a_delta'])
+                    logp_parts.append(logp_gt_c)
+                    logq_parts.append(logq_gt_c)
+                    ep_parts.append(stats_c['ep_logq'])
+                    ent_p_parts.append(stats_c['ent_p'])
+                    ent_q_parts.append(stats_c['ent_q'])
+                    kl_qp_parts.append(stats_c['kl_q_p'])
+                    kl_pq_parts.append(stats_c['kl_p_q'])
+                    tk_lp_parts.append(tk_lp_c)
+                    tk_idx_parts.append(tk_idx_c)
+                    del e_raw, f_raw, s_raw
+                del early_h, final_h
+            out = {
+                'sled_a_delta': torch.cat(a_parts, 0).view(b, r).to(device),
+                'sled_logp_gt': torch.cat(logp_parts, 0).view(b, r).to(device),
+                'sled_logq_gt': torch.cat(logq_parts, 0).view(b, r).to(device),
+                'sled_ep_logq': torch.cat(ep_parts, 0).view(b, r).to(device),
+                'sled_ent_p': torch.cat(ent_p_parts, 0).view(b, r).to(device),
+                'sled_ent_q': torch.cat(ent_q_parts, 0).view(b, r).to(device),
+                'sled_kl_q_p': torch.cat(kl_qp_parts, 0).view(b, r).to(device),
+                'sled_kl_p_q': torch.cat(kl_pq_parts, 0).view(b, r).to(device),
+                'sled_topk_logp': torch.cat(tk_lp_parts, 0).view(b, r, -1).to(device),
+                'sled_topk_ids': torch.cat(tk_idx_parts, 0).view(b, r, -1).to(torch.int32).to(device),
+            }
+            self.actor_module.train(was_training)
+            return out
+
+    @torch.no_grad()
+    def _forward_sled_live_topk(self, micro_batch, temperature: float, gather_ids,
+                                chunk_tokens: int = SLED_CHUNK_TOKENS):
+        """Live ``log pi_theta`` at the stored SLED top-K columns.
+
+        Dense response-span forward (same peak class as the GRPO forward that
+        just ran), fp32 temperature division, chunked gather. No grad: the
+        gate is target-side; only the sampled ``log_prob`` carries gradient.
+        Returns fp32 ``[b, R, K]``.
+        """
+        was_training = self.actor_module.training
+        self.actor_module.eval()
+        response_length = micro_batch['responses'].size(-1)
+        chunk_tokens = max(1, int(chunk_tokens))
+        b = micro_batch['responses'].size(0)
+        row_chunk = max(1, int(self.config.get('sled_micro_batch_size', 2)))
+        ids = gather_ids.long().reshape(b, response_length, -1)
+        row_parts = []
+        position_ids = micro_batch['position_ids']
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            position_ids = position_ids.transpose(0, 1)
+        for row_start in range(0, b, row_chunk):
+            row_end = min(row_start + row_chunk, b)
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                output = self.actor_module(
+                    input_ids=micro_batch['input_ids'][row_start:row_end],
+                    attention_mask=micro_batch['attention_mask'][row_start:row_end],
+                    position_ids=position_ids[row_start:row_end],
+                    use_cache=False)
+                logits = output.logits[:, -response_length - 1:-1, :]  # (b, R, V) RAW
+                del output
+            rb, rr, v = logits.shape
+            row_ids = ids[row_start:row_end].reshape(rb * rr, -1)
+            flat = logits.reshape(rb * rr, v)
+            parts = []
+            for start in range(0, rb * rr, chunk_tokens):
+                end = min(start + chunk_tokens, rb * rr)
+                lp = torch.nn.functional.log_softmax(
+                    flat[start:end].float() / temperature, dim=-1)
+                parts.append(lp.gather(-1, row_ids[start:end]))
+                del lp
+            row_parts.append(torch.cat(parts, 0).reshape(rb, rr, -1).float())
+            del logits, flat, row_ids, parts
+        out = torch.cat(row_parts, 0)
+        self.actor_module.train(was_training)
+        return out
+
     def _make_minibatch_iterator(self, data: DataProto):
         """Select PPO keys and split the batch into mini-batches (shared by all update paths)."""
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
@@ -873,6 +1049,14 @@ class DataParallelPPOActor(BasePPOActor):
             for kd_key in ('teacher_topk_log_probs', 'teacher_topk_ids'):
                 if kd_key in data.batch.keys() and kd_key not in select_keys:
                     select_keys.append(kd_key)
+        if self.config.get('use_sled_delta', False):
+            # GRPO+SLED-Delta: frozen target-side tensors attached once per step
+            # by compute_sled_delta_signal. Presence-checked so batches without
+            # them (sled_loss_coef=0, non-SLED runs) keep working untouched.
+            for sled_key in ('sled_a_delta', 'sled_logq_gt', 'sled_logp_gt', 'sled_ep_logq',
+                             'sled_topk_ids', 'sled_topk_logp'):
+                if sled_key in data.batch.keys() and sled_key not in select_keys:
+                    select_keys.append(sled_key)
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
@@ -1086,6 +1270,58 @@ class DataParallelPPOActor(BasePPOActor):
                         kd_loss = policy_loss.new_zeros(())
                     del kd_flat
                     policy_loss = policy_loss + kd_coef * kd_loss
+                # GRPO+SLED-Delta auxiliary loss (loss-level composition: the
+                # GRPO clip above never sees the SLED advantage, and the SLED
+                # sign gate below never touches the GRPO term).
+                sled_loss = None
+                sled_gate = None
+                sled_a_opd = None
+                sled_diag = None
+                if (self.config.get('use_sled_delta', False) and 'sled_a_delta' in data
+                        and float(self.config.get('sled_loss_coef', 1.0)) != 0.0):
+                    from verl.workers.actor.sled_delta import (live_opd_advantage,
+                                                               sled_gated_per_token_loss)
+                    sled_coef = float(self.config.get('sled_loss_coef', 1.0))
+                    sled_grpo_coef = float(self.config.get('sled_grpo_coef', 1.0))
+                    live_topk_lp = self._forward_sled_live_topk(
+                        micro_batch=data, temperature=temperature,
+                        gather_ids=data['sled_topk_ids'],
+                        chunk_tokens=int(self.config.get('sled_chunk_tokens',
+                                                         SLED_CHUNK_TOKENS)))
+                    a_delta_mb = data['sled_a_delta']
+                    sled_a_opd, sled_gate = live_opd_advantage(
+                        a_delta_mb, data['sled_logq_gt'], data['sled_ep_logq'],
+                        log_prob.detach(), live_topk_lp,
+                        data['sled_topk_logp'].float().exp())
+                    sled_tok = sled_gated_per_token_loss(log_prob, a_delta_mb, sled_gate)
+                    sled_loss = core_algos.agg_loss(
+                        sled_tok, response_mask,
+                        self.config.get('loss_agg_mode', 'token-mean'))
+                    policy_loss = sled_grpo_coef * policy_loss + sled_coef * sled_loss
+                    # Per-token dL/dlogpi weights for the cheap interaction
+                    # proxy (no extra backward passes): GRPO weight is -A*r on
+                    # unclipped tokens and 0 where the clip binds; SLED weight
+                    # is g*A_delta (times sled_coef downstream).
+                    with torch.no_grad():
+                        ratio_mb = torch.exp(log_prob.detach() - old_log_prob)
+                        pg1 = -advantages * ratio_mb
+                        pg2 = -advantages * torch.clamp(ratio_mb, 1.0 - clip_ratio,
+                                                        1.0 + clip_ratio)
+                        w_grpo = torch.where(pg2 > pg1, pg1.new_zeros(()), pg1)
+                    sled_diag = {
+                        'a_delta': a_delta_mb.detach(),
+                        'a_opd': sled_a_opd.detach(),
+                        'gate': sled_gate.detach(),
+                        'r_delta': (data['sled_logq_gt'] - data['sled_logp_gt']).detach(),
+                        'w_grpo': w_grpo.detach(),
+                        'w_sled': (sled_gate.detach() * a_delta_mb.detach()),
+                        'grpo_adv': advantages.detach(),
+                        'pg_loss': pg_loss.detach(),
+                        'policy_loss': policy_loss.detach(),
+                        'sled_loss': sled_loss.detach(),
+                        'sled_coef': sled_coef,
+                    }
+                    del live_topk_lp, sled_tok, ratio_mb, pg1, pg2, w_grpo
                 del log_prob
 
             if self.config.use_kl_loss:
@@ -1129,6 +1365,46 @@ class DataParallelPPOActor(BasePPOActor):
                         micro_metrics['actor/kd_student_mass'] = kd_student_mass
                     if kd_teacher_mass is not None:
                         micro_metrics['actor/kd_teacher_mass'] = kd_teacher_mass
+                if sled_diag is not None:
+                    # Loss-level composition, logged per component. The GRPO
+                    # term is untouched by the SLED gate (see _backward_minibatch).
+                    from verl.workers.actor.sled_delta import (agreement_quadrants,
+                                                               per_token_grad_weight_cosine)
+                    sd = sled_diag
+                    m = response_mask
+                    live = m.bool()
+                    micro_metrics['loss/grpo'] = sd['pg_loss']
+                    micro_metrics['loss/sled_delta'] = sd['sled_loss']
+                    micro_metrics['loss/sled_weighted'] = sd['sled_loss'] * sd['sled_coef']
+                    micro_metrics['loss/total'] = sd['policy_loss']
+                    micro_metrics['sled/loss_coef'] = torch.tensor(
+                        sd['sled_coef'], device=sd['sled_loss'].device)
+                    micro_metrics['sled/adv_mean'] = verl_F.masked_mean(sd['a_delta'], m).detach()
+                    micro_metrics['sled/adv_abs_mean'] = verl_F.masked_mean(
+                        sd['a_delta'].abs(), m).detach()
+                    micro_metrics['sled/adv_std'] = verl_F.masked_mean(
+                        (sd['a_delta'] - micro_metrics['sled/adv_mean'])**2, m).sqrt().detach()
+                    micro_metrics['sled/delta_mean'] = verl_F.masked_mean(sd['r_delta'], m).detach()
+                    micro_metrics['sled/delta_abs_mean'] = verl_F.masked_mean(
+                        sd['r_delta'].abs(), m).detach()
+                    micro_metrics['sled/delta_std'] = verl_F.masked_mean(
+                        (sd['r_delta'] - micro_metrics['sled/delta_mean'])**2, m).sqrt().detach()
+                    micro_metrics['sled/opd_adv_mean'] = verl_F.masked_mean(sd['a_opd'], m).detach()
+                    micro_metrics['sled/opd_adv_abs_mean'] = verl_F.masked_mean(
+                        sd['a_opd'].abs(), m).detach()
+                    micro_metrics['sled/opd_adv_std'] = verl_F.masked_mean(
+                        (sd['a_opd'] - micro_metrics['sled/opd_adv_mean'])**2, m).sqrt().detach()
+                    micro_metrics['sled/gate_keep_fraction'] = verl_F.masked_mean(
+                        sd['gate'], m).detach()
+                    quad = agreement_quadrants(sd['grpo_adv'], sd['a_delta'], m)
+                    for qk, qv in quad.items():
+                        micro_metrics[f'grpo_sled/{qk}'] = torch.tensor(
+                            qv, device=sd['sled_loss'].device)
+                    micro_metrics['grpo_sled/grad_weight_cosine'] = torch.tensor(
+                        per_token_grad_weight_cosine(sd['w_grpo'], sd['w_sled'], m),
+                        device=sd['sled_loss'].device)
+                    micro_metrics['grpo/adv_mean'] = verl_F.masked_mean(sd['grpo_adv'], m).detach()
+                    del sd, m, live
                 append_to_dict(metrics, micro_metrics)
 
         # FSDP 2.9 may leave a full flat gradient after the backward hooks in
@@ -1139,7 +1415,13 @@ class DataParallelPPOActor(BasePPOActor):
         # the previous per-micro-batch .item() conversions; list lengths unchanged.
         for key in ('actor/entropy_loss', 'actor/pg_loss', 'actor/pg_clipfrac', 'actor/ppo_kl',
                     'actor/kl_loss', 'actor/kd_loss', 'actor/kd_student_mass',
-                    'actor/kd_teacher_mass'):
+                    'actor/kd_teacher_mass', 'loss/grpo', 'loss/sled_delta', 'loss/sled_weighted',
+                    'loss/total', 'sled/loss_coef', 'sled/adv_mean', 'sled/adv_abs_mean',
+                    'sled/adv_std', 'sled/delta_mean', 'sled/delta_abs_mean', 'sled/delta_std',
+                    'sled/opd_adv_mean', 'sled/opd_adv_abs_mean', 'sled/opd_adv_std',
+                    'sled/gate_keep_fraction', 'grpo/adv_mean', 'grpo_sled/agree',
+                    'grpo_sled/disagree', 'grpo_sled/pp', 'grpo_sled/pn', 'grpo_sled/np',
+                    'grpo_sled/nn', 'grpo_sled/grad_weight_cosine'):
             vals = metrics.get(key)
             if vals and isinstance(vals[0], torch.Tensor):
                 metrics[key] = torch.stack(vals).tolist()
