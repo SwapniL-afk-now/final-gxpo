@@ -1,0 +1,145 @@
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -25,6 +25,7 @@
+ # limitations under the License.
+ """Inference-only Qwen2 model compatible with HuggingFace weights."""
+
++import os
+ from collections.abc import Iterable
+ from itertools import islice
+ from typing import Any
+@@ -73,6 +74,8 @@
+     maybe_prefix,
+ )
+
++SLED_VLLM_PATCH_VERSION = "qwen2-sled-v015-v2-all-layers"
++
+
+ class Qwen2MLP(nn.Module):
+     def __init__(
+@@ -411,6 +414,21 @@
+             self.norm = PPMissingLayer()
+
+         self.aux_hidden_state_layers = tuple[int, ...]()
++        self.sled_enabled = os.environ.get("SLED_VLLM_ENABLED", "0").lower() in (
++            "1", "true", "yes", "on"
++        )
++        if self.sled_enabled:
++            if len(get_pp_group().ranks) > 1:
++                raise NotImplementedError(
++                    "SLED vLLM generation currently requires pipeline parallel size 1"
++                )
++            requested_layers = os.environ.get("SLED_VLLM_EARLY_LAYERS")
++            if requested_layers is None:
++                requested_layers = os.environ.get("SLED_VLLM_EARLY_LAYER", "all")
++            if requested_layers.strip().lower() == "all":
++                # vLLM captures layer i before block i; 1..N-1 are all
++                # preceding transformer outputs for an N-block model.
++                self.sled_early_layers = tuple(range(1, config.num_hidden_layers))
++            else:
++                self.sled_early_layers = tuple(
++                    sorted({
++                        max(1, min(int(layer.strip()) + 1, config.num_hidden_layers - 1))
++                        for layer in requested_layers.split(",")
++                        if layer.strip()
++                    })
++                )
++            if not self.sled_early_layers:
++                raise ValueError("SLED_VLLM_EARLY_LAYERS must contain at least one layer")
++            self.aux_hidden_state_layers = self.sled_early_layers
++        else:
++            self.sled_early_layers = ()
+
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+@@ -540,6 +558,10 @@
+         self.config = config
+
+         self.quant_config = quant_config
++        self.sled_enabled = os.environ.get("SLED_VLLM_ENABLED", "0").lower() in (
++            "1", "true", "yes", "on"
++        )
++        self.sled_alpha = float(os.environ.get("SLED_VLLM_ALPHA", "2.0"))
++        self.sled_scale = int(os.environ.get("SLED_VLLM_SCALE", "10"))
++        self.sled_lower_bound = float(os.environ.get("SLED_VLLM_LOWER_BOUND", "-1000"))
+         self.model = Qwen2Model(
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
+@@ -583,12 +605,34 @@
+         hidden_states = self.model(
+             input_ids, positions, intermediate_tensors, inputs_embeds
+         )
++        if self.sled_enabled and isinstance(hidden_states, tuple):
++            final_hidden_states, aux_hidden_states = hidden_states
++            if len(aux_hidden_states) != len(self.model.sled_early_layers):
++                raise RuntimeError("SLED early hidden-state count does not match configured layers")
++            hidden_states = torch.cat((final_hidden_states, *aux_hidden_states), dim=-1)
+         return hidden_states
+
+     def compute_logits(
+         self,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor | None:
++        if self.sled_enabled:
++            hidden_size = self.config.hidden_size
++            expected_width = (1 + len(self.model.sled_early_layers)) * hidden_size
++            if hidden_states.shape[-1] != expected_width:
++                raise RuntimeError("SLED hidden-state width does not match configured layers")
++            hidden_parts = hidden_states.split(hidden_size, dim=-1)
++            final_hidden_states, early_hidden_states = hidden_parts[0], hidden_parts[1:]
++            final_logits = self.logits_processor(self.lm_head, final_hidden_states)
++            if final_logits is None:
++                return None
++            early_hidden_states = torch.stack(
++                [self.model.norm(early) for early in early_hidden_states], dim=0
++            )
++            early_logits = self.logits_processor(
++                self.lm_head, early_hidden_states.reshape(-1, hidden_size)
++            )
++            if early_logits is None:
++                return None
++            early_logits = early_logits.reshape(
++                len(early_hidden_states), final_logits.shape[0], final_logits.shape[-1]
++            ).float()
++            final_logits = final_logits.float()
++
++            # Paper SLED: use aligned early-layer directions to modify only
++            # final-layer top-k tokens, then let vLLM perform normal sampling.
++            k = min(self.sled_scale, final_logits.shape[-1])
++            _, topk_indices = torch.softmax(final_logits, dim=-1).topk(k, dim=-1)
++            early_probs = torch.softmax(early_logits, dim=-1)
++            divergence = early_logits - final_logits.unsqueeze(0)
++            dot = (early_probs * divergence).sum(dim=-1, keepdim=True)
++            divergence_norm = divergence.square().sum(dim=-1, keepdim=True).sqrt().clamp_min(1e-12)
++            early_topk_probs = early_probs.gather(
++                -1, topk_indices.unsqueeze(0).expand(early_probs.shape[0], -1, -1)
++            )
++            divergence_topk = divergence.gather(
++                -1, topk_indices.unsqueeze(0).expand(early_logits.shape[0], -1, -1)
++            )
++            direction_norm = (
++                early_probs.square().sum(dim=-1, keepdim=True) + 1
++                - 2 * early_topk_probs
++            ).clamp_min(1e-12).sqrt()
++            cosine = (dot - divergence_topk) / (divergence_norm * direction_norm)
++            selected_values, selected_positions = cosine.topk(k, dim=-1)
++            selected_values = selected_values.clamp_min(0).square()
++            layer_mass = selected_values.sum(dim=-1, keepdim=True)
++            selected_values = selected_values / layer_mass.clamp_min(1e-12)
++            layer_weights = layer_mass.squeeze(-1)
++            layer_weights = layer_weights / layer_weights.sum(dim=0, keepdim=True).clamp_min(1e-12)
++            selected_tokens = topk_indices.unsqueeze(0).expand(early_logits.shape[0], -1, -1).gather(
++                -1, selected_positions
++            )
++            delta = torch.zeros_like(final_logits)
++            for layer in range(selected_tokens.shape[0]):
++                delta.scatter_add_(
++                    -1, selected_tokens[layer],
++                    -(selected_values[layer] * layer_weights[layer].unsqueeze(-1)),
++                )
++            evolved = final_logits - self.sled_alpha * (torch.softmax(final_logits, dim=-1) + delta)
++            output = torch.full_like(evolved, self.sled_lower_bound)
++            output.scatter_(-1, topk_indices, evolved.gather(-1, topk_indices))
++            return output
+         logits = self.logits_processor(self.lm_head, hidden_states)
+         return logits

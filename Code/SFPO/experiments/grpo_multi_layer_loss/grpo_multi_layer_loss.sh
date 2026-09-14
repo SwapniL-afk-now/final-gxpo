@@ -2,8 +2,11 @@
 #
 # qwen25_math_1p5b_gxpo_adamw_transactional_dir_k10.sh
 #
-# Qwen2.5-Math-1.5B-Instruct | GXPO + AdamW |
+# Qwen2.5-Math-1.5B-Instruct | GRPO + AdamW | GXPO temporarily disabled |
 # batch 64 | minibatch 16.
+#
+# GXPO is disabled for now. The old GXPO settings below are retained only as
+# context for restoring this experiment later.
 #
 #   baseline (that script, GXPO_RETENTION_SPACE=grad)
 #       r_i = (c1 * g1_i) / (c0 * g0_i)        raw-gradient retention
@@ -55,8 +58,8 @@ fi
 # --------------------------------------------------------- experiment cfg ----
 # Deliberately identical to qwen25_math_1p5b_gxpo_k10.sh so the only substantive
 # difference between the two runs is the retention estimator.
-export K="${K:-3}"
-export REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.8}"
+export K="${K:-10}"
+export REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.3}"
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 
@@ -72,7 +75,7 @@ export GXPO_OPTIMIZER_STATE_MODE="transactional"
 # trainable parameter as ADAMW_DIRECTION. Set GXPO_RETENTION_SPACE=grad to
 # reproduce the legacy raw-gradient arm from this same entrypoint.
 # Keep the GRPO run name free of the optimizer-aware GXPO suffix.
-export GXPO_RETENTION_SPACE="${GXPO_RETENTION_SPACE:-auto}"
+export GXPO_RETENTION_SPACE="grad"
 # Keep mixed-response groups by enabling the pre-generation difficulty filter;
 # the sampler skips easy/all-correct and hard/all-zero candidates while filling
 # each training batch back to TRAIN_BATCH_SIZE.
@@ -135,16 +138,12 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   repo_root          : $REPO_ROOT
   model              : $MODEL_DIR
   data_root          : $DATA_ROOT
-  method             : ${METHOD:-gxpo} + adamw (GXPO enabled)
-  K / alpha          : $K / $REPOSITION_ALPHA
+  method             : grpo + adamw (GXPO disabled)
   batch / minibatch  : $TRAIN_BATCH_SIZE / $PPO_MINI_BATCH_SIZE
   gpus               : ${GPU_COUNT:-1}  (ids ${GPU_IDS:-<inherited>}, FSDP_SIZE=${FSDP_SIZE:-1})
   max_steps          : ${MAX_STEPS:-400}   save_freq $SAVE_FREQ
   optimizer          : $OPTIMIZER_NAME
-  optimizer_state    : $GXPO_OPTIMIZER_STATE_MODE
-  retention_space    : $GXPO_RETENTION_SPACE
   dynamic filtering  : $GXPO_DYNAMIC_FILTERING (mixed-response groups retained)
-  validation         : every ${TRAINER_TEST_FREQ:-5} steps, greedy n=${VAL_N:-1}
   attention          : train $ATTN_IMPL | vllm ${VLLM_ATTENTION_BACKEND:-FLASHINFER}
   wandb project      : ${WANDB_PROJECT:-gxpo-efficiency-final}
   A/B baseline       : qwen25_math_1p5b_gxpo_k10.sh (pinned GXPO_RETENTION_SPACE=grad)
@@ -156,5 +155,5 @@ fi
 # ---------------------------------------------------------------- launch -----
 MODEL_ALIAS="qwen25-math-1p5b"
 MODEL_ID="$MODEL_QWEN25_MATH_1P5B"
-METHOD="${METHOD:-gxpo}"
+METHOD="grpo"
 source "$SCRIPT_DIR/common.sh"

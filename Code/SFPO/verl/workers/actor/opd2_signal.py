@@ -157,6 +157,38 @@ def combine_opd2_signal(
     return torch.nan_to_num(signal, nan=0.0, posinf=0.0, neginf=0.0).float()
 
 
+def combine_opd2_advantages(
+    sig: torch.Tensor,
+    gen_w: float,
+    resp_mask: torch.Tensor,
+    token_level_scores: torch.Tensor,
+    outcome_w: float = 0.0,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """``advantages = gen_w * signal [+ outcome_w * (score - batch_mean_score)]``.
+
+    The offline audit (scratchpad/opd2_audit*, 2026-09-14) found the raw OPD^2
+    signal's within-prompt AUC for correct-vs-wrong response is ~0.48-0.52
+    (chance) for the Qwen2.5-3B student / Qwen2.5-Math-7B teacher pair: it
+    reshapes style, not correctness, because it is a pure teacher-imitation
+    reward with no outcome term. ``outcome_w`` anchors the update to the
+    verifier with a REINFORCE batch-mean baseline, broadcast onto every
+    response token so it works at rollout.n=1 (no extra sampling).
+
+    ``outcome_w=0.0`` (the default) reproduces ``sig * gen_w`` exactly -- the
+    paper's behaviour, where the verifier is metrics-only.
+
+    Returns ``(advantages [B, R], outcome_adv [B] or None)`` -- the second
+    value is only for the ``opd2/outcome_adv_std`` metric.
+    """
+    advantages = sig * gen_w
+    if outcome_w <= 0:
+        return advantages, None
+    scores = token_level_scores.sum(dim=-1)  # [B], sparse reward -> scalar per row
+    outcome_adv = scores - scores.mean()
+    advantages = advantages + (outcome_w * outcome_adv).unsqueeze(-1) * resp_mask.float()
+    return advantages, outcome_adv
+
+
 class OPD2Scorer:
     """Frozen teacher + teacher_base, parked on CPU between scoring phases.
 
@@ -562,6 +594,20 @@ def _self_check():
         pass
     else:
         raise AssertionError("wholesale vocab mismatch must raise")
+
+    # 7. combine_opd2_advantages: outcome_w=0 reproduces sig*gen_w exactly;
+    #    outcome_w>0 pushes rows above the batch-mean score up and below it down.
+    sig7 = torch.randn(4, 6)
+    mask7 = torch.ones(4, 6, dtype=torch.bool)
+    # token_level_scores is sparse like the real reward tensor: nonzero at one
+    # position per row (verifier reward at the last response token).
+    scores7 = torch.zeros(4, 6)
+    scores7[:, -1] = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    adv0, oa0 = combine_opd2_advantages(sig7, 0.1, mask7, scores7, outcome_w=0.0)
+    assert torch.allclose(adv0, sig7 * 0.1) and oa0 is None
+    adv1, oa1 = combine_opd2_advantages(sig7, 0.1, mask7, scores7, outcome_w=0.5)
+    assert torch.allclose(oa1, torch.tensor([0.5, -0.5, 0.5, -0.5]))
+    assert torch.allclose(adv1[0], sig7[0] * 0.1 + 0.25) and torch.allclose(adv1[1], sig7[1] * 0.1 - 0.25)
 
     print("opd2_signal self-check OK")
 

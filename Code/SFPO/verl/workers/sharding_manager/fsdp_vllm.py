@@ -134,7 +134,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                     for name, param in params.items()
                 }
                 offload_fsdp_model_to_cpu(self.module)
-                torch.cuda.empty_cache()
+            # vLLM's cumem allocator maps fresh VMM pages and cannot reuse
+            # PyTorch's cached blocks; without this, the actor update's freed
+            # activations stay reserved and wake_up OOMs on non-offload runs.
+            torch.cuda.empty_cache()
             self.inference_engine.wake_up()
             world_size = torch.distributed.get_world_size()
             model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model

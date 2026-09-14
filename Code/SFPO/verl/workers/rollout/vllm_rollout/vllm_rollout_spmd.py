@@ -42,6 +42,34 @@ from vllm.distributed import parallel_state as vllm_ps
 from vllm import LLM, SamplingParams
 from verl.third_party.vllm import vllm_version
 
+
+def _sled_vllm_enabled() -> bool:
+    return os.environ.get("SLED_VLLM_ENABLED", "0").lower() in (
+        "1", "true", "yes", "on"
+    )
+
+
+def _chosen_token_logprobs(completion) -> list[float]:
+    """Extract the generated-token log-probability from each vLLM position."""
+    if completion.logprobs is None:
+        raise RuntimeError("vLLM did not return logprobs for the SLED rollout")
+    token_ids = list(completion.token_ids)
+    if len(completion.logprobs) != len(token_ids):
+        raise RuntimeError(
+            "SLED rollout logprob length mismatch: "
+            f"{len(completion.logprobs)} vs {len(token_ids)}"
+        )
+    result = []
+    for token_id, position_logprobs in zip(token_ids, completion.logprobs):
+        chosen = position_logprobs.get(token_id)
+        if chosen is None:
+            raise RuntimeError(
+                f"vLLM logprobs omitted sampled token {token_id}; "
+                "cannot form the SLED behavior-policy denominator"
+            )
+        result.append(float(chosen.logprob))
+    return result
+
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -82,6 +110,24 @@ class vLLMRollout(BaseRollout):
             "disable CUDA graph (enforce_eager = False) if free cache engine"
 
         tensor_parallel_size = self.config.get('tensor_model_parallel_size', 1)
+        if _sled_vllm_enabled():
+            from vllm.model_executor.models import qwen2 as vllm_qwen2
+
+            if not hasattr(vllm_qwen2, "SLED_VLLM_PATCH_VERSION"):
+                raise RuntimeError(
+                    "SLED_VLLM_ENABLED=1 requires the versioned Qwen2 vLLM patch"
+                )
+            if tensor_parallel_size != 1:
+                raise NotImplementedError(
+                    "SLED vLLM generation currently requires tensor parallel size 1"
+                )
+            print(
+                "vLLM generation: SLED distribution enabled "
+                f"(alpha={os.environ.get('SLED_VLLM_ALPHA', '2.0')}, "
+                f"scale={os.environ.get('SLED_VLLM_SCALE', '10')}, "
+                f"layers={os.environ.get('SLED_VLLM_EARLY_LAYERS', 'all')})",
+                flush=True,
+            )
         assert tensor_parallel_size <= torch.distributed.get_world_size(), \
             "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get('max_num_batched_tokens', 8192)
@@ -126,7 +172,7 @@ class vLLMRollout(BaseRollout):
 
         kwargs = dict(
             n=1,
-            logprobs=0,  # can be set to 0 and let actor to recompute
+            logprobs=0,
             max_tokens=config.response_length,
         )
 
@@ -138,6 +184,10 @@ class vLLMRollout(BaseRollout):
         for k in config.keys():
             if hasattr(SamplingParams(), str(k)):
                 kwargs[k] = config.get(k)
+        if _sled_vllm_enabled():
+            # The SLED distribution is the behavior policy. Preserve its
+            # chosen-token logprobs so GRPO can use q_old in its denominator.
+            kwargs['logprobs'] = 1
 
         if os.environ.get('GXPO_CONCISE_LOGS') != '1': print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
@@ -239,12 +289,21 @@ class vLLMRollout(BaseRollout):
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
             response = []
+            response_log_probs = [] if _sled_vllm_enabled() else None
             for output in outputs:
                 for sample_id in range(len(output.outputs)):
-                    response.append(output.outputs[sample_id].token_ids)
+                    completion = output.outputs[sample_id]
+                    response.append(completion.token_ids)
+                    if response_log_probs is not None:
+                        response_log_probs.append(_chosen_token_logprobs(completion))
 
             response = pad_2d_list_to_length(response, self.pad_token_id,
                                              max_length=self.config.response_length).to(idx.device)
+            if response_log_probs is not None:
+                response_log_probs = pad_2d_list_to_length(
+                    response_log_probs, 0.0,
+                    max_length=self.config.response_length,
+                ).to(device=idx.device, dtype=torch.float32)
 
             if self.sampling_params.n > 1 and do_sample:
                 idx = _repeat_interleave(idx, self.sampling_params.n)
@@ -273,16 +332,16 @@ class vLLMRollout(BaseRollout):
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                'prompts': idx,
-                'responses': response,
-                'input_ids': seq,  # here input_ids become the whole sentences
-                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
-                'attention_mask': attention_mask,
-                'position_ids': position_ids
-            },
-            batch_size=batch_size)
+        batch_data = {
+            'prompts': idx,
+            'responses': response,
+            'input_ids': seq,  # here input_ids become the whole sentences
+            'attention_mask': attention_mask,
+            'position_ids': position_ids,
+        }
+        if response_log_probs is not None:
+            batch_data['old_log_probs'] = response_log_probs
+        batch = TensorDict(batch_data, batch_size=batch_size)
 
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:

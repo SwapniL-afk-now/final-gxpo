@@ -317,6 +317,27 @@ class DataParallelPPOActor(BasePPOActor):
             # only until the chunked KL below consumes it, then deletes it.
             return logits
 
+    def _pool_kd_loss(self, per_tok: torch.Tensor, b_sel: torch.Tensor, j_sel: torch.Tensor,
+                      response_mask: torch.Tensor) -> torch.Tensor:
+        """Scatter a flat [N] per-token KD loss back to [B, R] and pool with
+        ``loss_agg_mode``.
+
+        Root-caused 2026-09-14 (scratchpad/opd2_audit*, same mechanism as the
+        OPD^2 collapse): ``distillation_losses.mean()`` is a flat mean over
+        every response token in the micro-batch, so a long response gets
+        proportionally more gradient than a short one -- the same
+        length-reward-hacking path that blew up entropy in
+        ``qwen25-1p5b_onpolicy_kd_gxpo_k3_a0.1`` (entropy 0.84->4.2 by step 4,
+        val collapsed to ~0.03). ``loss_agg_mode='seq-mean-token-mean'`` (this
+        launcher's default going forward) means every response, long or
+        short, contributes one equal vote.
+        Default 'token-mean' reproduces the old flat mean exactly.
+        """
+        grid = torch.zeros_like(response_mask, dtype=per_tok.dtype)
+        grid[b_sel, j_sel] = per_tok
+        mode = self.config.get('loss_agg_mode', 'token-mean')
+        return core_algos.agg_loss(grid, response_mask, mode)
+
     def _forward_kd_flat(self, micro_batch, temperature, response_mask, has_multi_modal_inputs):
         """Response-filtered flat student logits with aligned teacher rows.
 
@@ -332,8 +353,10 @@ class DataParallelPPOActor(BasePPOActor):
         non-[B, R, K] teacher tensors). The first call cross-checks rmpad
         against dense and pins the safe path loudly instead of risking silent
         corruption. Disable via +actor_rollout_ref.actor.kd_rmpad=False.
-        Returns (flat_logits, t_logps, t_ids) or None when there are no real
-        response tokens.
+        Returns (flat_logits, t_logps, t_ids, b_sel, j_sel) or None when there
+        are no real response tokens. ``b_sel``/``j_sel`` are each flat token's
+        row/col in the [B, R] response grid, for scattering the per-token KD
+        loss back for ``loss_agg_mode`` pooling.
         """
         use_kd_tensors = ('teacher_topk_log_probs' in micro_batch and 'teacher_topk_ids' in micro_batch)
         t_logps_raw = micro_batch['teacher_topk_log_probs'] if use_kd_tensors else None
@@ -350,16 +373,20 @@ class DataParallelPPOActor(BasePPOActor):
             return self._forward_kd_flat_checked(micro_batch, temperature, response_mask,
                                                  t_logps_raw, t_ids_raw)
         if want_rmpad and getattr(self, '_kd_rmpad_ok', False):
-            out = self._forward_kd_flat_rmpad(micro_batch, temperature, response_mask,
-                                              t_logps_raw, t_ids_raw)
-            if out is not None:
-                return out[:3]
-            return None
+            return self._forward_kd_flat_rmpad(micro_batch, temperature, response_mask,
+                                               t_logps_raw, t_ids_raw)
         return self._forward_kd_flat_dense(micro_batch, temperature, response_mask)
 
     def _forward_kd_flat_dense(self, micro_batch, temperature, response_mask):
-        """Legacy dense path: full-sequence logits, then response mask."""
+        """Legacy dense path: full-sequence logits, then response mask.
+
+        Also returns (b_sel, j_sel) -- the [B, R] row/col each flat token came
+        from -- so the caller can scatter distillation_losses back into a
+        [B, R] grid and pool it with ``loss_agg_mode`` instead of a flat
+        token-mean (see the ``kd_loss`` comment at its call sites).
+        """
         kd_logits = self._forward_kd_micro_batch(micro_batch=micro_batch, temperature=temperature)
+        R = response_mask.size(-1)
         flat_mask = response_mask.bool().reshape(-1)
         if not bool(flat_mask.any().item()):
             del kd_logits
@@ -371,8 +398,11 @@ class DataParallelPPOActor(BasePPOActor):
             t_logps = t_logps.reshape(-1, t_logps.size(-1))[flat_mask]
         if torch.is_tensor(t_ids) and t_ids.dim() == 3:
             t_ids = t_ids.reshape(-1, t_ids.size(-1))[flat_mask]
+        flat_idx = flat_mask.nonzero(as_tuple=False).squeeze(-1)
+        b_sel = flat_idx // R
+        j_sel = flat_idx % R
         del kd_logits
-        return flat_logits, t_logps, t_ids
+        return flat_logits, t_logps, t_ids, b_sel, j_sel
 
     def _forward_kd_flat_rmpad(self, micro_batch, temperature, response_mask, t_logps_raw, t_ids_raw):
         """Rmpad KD forward. Returns (flat_logits, t_logps, t_ids, b_sel, j_sel) or None."""
@@ -452,7 +482,7 @@ class DataParallelPPOActor(BasePPOActor):
         print(f'[KD-RMPAD] cross-check vs dense: {"PASS" if ok else "FAIL"} ({detail}); '
               f'using {"rmpad" if ok else "dense"} KD forward henceforth.', flush=True)
         if ok:
-            return rmpad_out[:3]
+            return rmpad_out
         return self._forward_kd_flat_dense(micro_batch, temperature, response_mask)
 
     def _clip_grads(self):
@@ -1130,6 +1160,13 @@ class DataParallelPPOActor(BasePPOActor):
                       and 'teacher_topk_log_probs' in data
                       and 'teacher_topk_ids' in data)
             pure_kd = use_kd and not self.config.get('kd_use_pg', False)
+            # GRPO+SLED-Delta is PG-only (the else branch below); pure_kd never
+            # touches it. Pre-declared here so `if sled_diag is not None` after
+            # the branch doesn't UnboundLocalError on the pure-KD path.
+            sled_loss = None
+            sled_gate = None
+            sled_a_opd = None
+            sled_diag = None
             if recompute_old_log_probs and pure_kd:
                 # Pure KD never consumes old_log_probs.
                 old_log_prob = None
@@ -1179,7 +1216,7 @@ class DataParallelPPOActor(BasePPOActor):
                                                 response_mask=response_mask,
                                                 has_multi_modal_inputs=has_multi_modal_inputs)
                 if kd_flat is not None:
-                    flat_logits, t_logps, t_ids = kd_flat
+                    flat_logits, t_logps, t_ids, b_sel, j_sel = kd_flat
                     # On-policy runs set kd_reverse_kl=True: reverse KL is
                     # mode-seeking and will not pump entropy on the student's
                     # own uncertain prefixes the way forward KL does.
@@ -1195,10 +1232,11 @@ class DataParallelPPOActor(BasePPOActor):
                         chunk_tokens=int(self.config.get('kd_chunk_tokens',
                                                           KD_TOPK_CHUNK_TOKENS)),
                     )
-                    kd_loss = kd_out['distillation_losses'].mean()
+                    kd_loss = self._pool_kd_loss(kd_out['distillation_losses'], b_sel, j_sel,
+                                                 response_mask)
                     kd_student_mass = kd_out['student_mass'].mean().detach()
                     kd_teacher_mass = kd_out['teacher_mass'].mean().detach()
-                    del kd_out, flat_logits, t_logps, t_ids
+                    del kd_out, flat_logits, t_logps, t_ids, b_sel, j_sel
                 else:
                     kd_loss = torch.zeros((), device=response_mask.device)
                 # The helper frees the [tokens, vocab] logits before returning
@@ -1249,7 +1287,7 @@ class DataParallelPPOActor(BasePPOActor):
                                                     response_mask=response_mask,
                                                     has_multi_modal_inputs=has_multi_modal_inputs)
                     if kd_flat is not None:
-                        flat_logits, t_logps, t_ids = kd_flat
+                        flat_logits, t_logps, t_ids, b_sel, j_sel = kd_flat
                         kd_fn = (compute_reverse_kl_topk_chunked
                                  if self.config.get('kd_reverse_kl', False)
                                  else compute_forward_kl_topk_chunked)
@@ -1262,21 +1300,19 @@ class DataParallelPPOActor(BasePPOActor):
                             chunk_tokens=int(self.config.get('kd_chunk_tokens',
                                                               KD_TOPK_CHUNK_TOKENS)),
                         )
-                        kd_loss = kd_out['distillation_losses'].mean()
+                        kd_loss = self._pool_kd_loss(kd_out['distillation_losses'], b_sel, j_sel,
+                                                     response_mask)
                         kd_student_mass = kd_out['student_mass'].mean().detach()
                         kd_teacher_mass = kd_out['teacher_mass'].mean().detach()
-                        del kd_out, flat_logits, t_logps, t_ids
+                        del kd_out, flat_logits, t_logps, t_ids, b_sel, j_sel
                     else:
                         kd_loss = policy_loss.new_zeros(())
                     del kd_flat
                     policy_loss = policy_loss + kd_coef * kd_loss
                 # GRPO+SLED-Delta auxiliary loss (loss-level composition: the
                 # GRPO clip above never sees the SLED advantage, and the SLED
-                # sign gate below never touches the GRPO term).
-                sled_loss = None
-                sled_gate = None
-                sled_a_opd = None
-                sled_diag = None
+                # sign gate below never touches the GRPO term). sled_* already
+                # default to None above; only overwritten below if enabled.
                 if (self.config.get('use_sled_delta', False) and 'sled_a_delta' in data
                         and float(self.config.get('sled_loss_coef', 1.0)) != 0.0):
                     from verl.workers.actor.sled_delta import (live_opd_advantage,

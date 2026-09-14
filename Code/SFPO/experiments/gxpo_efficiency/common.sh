@@ -257,11 +257,17 @@ OPD2_TEACHER="${OPD2_TEACHER:-}"
 OPD2_TEACHER_BASE="${OPD2_TEACHER_BASE:-}"
 OPD2_TOPK="${OPD2_TOPK:-1024}"
 OPD2_GEN_LOSS_WEIGHT="${OPD2_GEN_LOSS_WEIGHT:-0.1}"
+# Offline audit (2026-09-14, scratchpad/opd2_audit*): the raw teacher-delta
+# signal's within-prompt correct-vs-wrong AUC is ~0.48-0.52 (chance) for the
+# 3B student / Math-7B pair -- see verl/trainer/ppo/ray_trainer.py near
+# opd2_outcome_weight. 0 = paper behaviour (signal only, verifier metrics-only).
+OPD2_OUTCOME_WEIGHT="${OPD2_OUTCOME_WEIGHT:-0.0}"
 OPD2_REWARDS_BIAS="${OPD2_REWARDS_BIAS:-0.0}"
 OPD2_TEACHER_TEMPLATE="${OPD2_TEACHER_TEMPLATE:-True}"
 OPD2_MICRO_BATCH_SIZE="${OPD2_MICRO_BATCH_SIZE:-1}"
 OPD2_CHUNK_TOKENS="${OPD2_CHUNK_TOKENS:-512}"
 OPD2_KEEP_ON_GPU="${OPD2_KEEP_ON_GPU:-False}"
+OPD2_ATTN_IMPL="${OPD2_ATTN_IMPL:-flash_attention_2}"
 # True = teacher + teacher_base get their OWN GPU (a Ray actor holding one of
 # GPU_IDS) and training uses GPU_COUNT of the rest, so set GPU_IDS to
 # GPU_COUNT+1 devices. The models are loaded once and stay resident there.
@@ -594,11 +600,13 @@ PY
     +actor_rollout_ref.actor.opd2_teacher_base="$OPD2_TEACHER_BASE"
     +actor_rollout_ref.actor.opd2_topk="$OPD2_TOPK"
     +actor_rollout_ref.actor.opd2_gen_loss_weight="$OPD2_GEN_LOSS_WEIGHT"
+    +actor_rollout_ref.actor.opd2_outcome_weight="$OPD2_OUTCOME_WEIGHT"
     +actor_rollout_ref.actor.opd2_rewards_bias="$OPD2_REWARDS_BIAS"
     +actor_rollout_ref.actor.opd2_teacher_template="$OPD2_TEACHER_TEMPLATE"
     +actor_rollout_ref.actor.opd2_micro_batch_size="$OPD2_MICRO_BATCH_SIZE"
     +actor_rollout_ref.actor.opd2_chunk_tokens="$OPD2_CHUNK_TOKENS"
     +actor_rollout_ref.actor.opd2_keep_on_gpu="$OPD2_KEEP_ON_GPU"
+    +actor_rollout_ref.actor.opd2_attn_implementation="$OPD2_ATTN_IMPL"
     +actor_rollout_ref.actor.opd2_dedicated_gpu="$OPD2_DEDICATED_GPU"
   )
 fi
@@ -727,7 +735,7 @@ train_batch_size=$TRAIN_BATCH_SIZE
 rollout_n=$ROLLOUT_N
 learning_rate=$LR
 lr_schedule=$LR_WARMUP_STYLE (warmup_ratio=$LR_WARMUP_RATIO, min_lr_ratio=$LR_MIN_RATIO)
-opd2_enabled=$OPD2_ON$( [[ "$OPD2_ON" -eq 1 ]] && echo " (teacher=$OPD2_TEACHER, teacher_base=$OPD2_TEACHER_BASE, topk=$OPD2_TOPK, gen_loss_weight=$OPD2_GEN_LOSS_WEIGHT, teacher_template=$OPD2_TEACHER_TEMPLATE, micro_bsz=$OPD2_MICRO_BATCH_SIZE)" )
+opd2_enabled=$OPD2_ON$( [[ "$OPD2_ON" -eq 1 ]] && echo " (teacher=$OPD2_TEACHER, teacher_base=$OPD2_TEACHER_BASE, topk=$OPD2_TOPK, gen_loss_weight=$OPD2_GEN_LOSS_WEIGHT, outcome_weight=$OPD2_OUTCOME_WEIGHT, teacher_template=$OPD2_TEACHER_TEMPLATE, micro_bsz=$OPD2_MICRO_BATCH_SIZE)" )
 sled_enabled=$SLED_ON$( [[ "$SLED_ON" -eq 1 ]] && echo " (loss_coef=$SLED_LOSS_COEF, grpo_coef=$SLED_GRPO_COEF, alpha=$SLED_ALPHA, early_layer=$SLED_EARLY_LAYER, topk=$SLED_TOPK, micro_bsz=$SLED_MICRO_BATCH_SIZE)" )
 loss_agg_mode=$LOSS_AGG_MODE
 use_kl_loss=$USE_KL_LOSS
@@ -868,7 +876,7 @@ python -u -m verl.trainer.main_ppo \
   "${METHOD_FLAGS[@]}" \
   ${OPD2_FLAGS[@]+"${OPD2_FLAGS[@]}"} \
   ${SLED_FLAGS[@]+"${SLED_FLAGS[@]}"} \
-  | tee "$RUN_DIR/train.log"
+  2>&1 | tee "$RUN_DIR/train.log"
 
 if [[ "$FINAL_EVAL_ENABLED" == "True" ]]; then
   TERMINAL_STEP="$MAX_STEPS"

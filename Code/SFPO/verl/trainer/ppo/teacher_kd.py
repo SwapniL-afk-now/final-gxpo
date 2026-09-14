@@ -126,6 +126,60 @@ def build_teacher_group(
     return handles
 
 
+def build_dedicated_teacher_group(
+    config: DictConfig,
+    num_replicas: int = 1,
+) -> List["ray.actor.ActorHandle"]:
+    """Spawn `num_replicas` TeacherScoringWorker actors on their OWN GPU(s),
+    additive to `trainer.n_gpus_per_node` -- same pattern as OPD^2's
+    dedicated-GPU scorer (see ``main_ppo.py`` / ``OPD2Scorer``), just for the
+    plain on-policy KD teacher instead of the OPD^2 signal.
+
+    Unlike ``build_teacher_group`` (packed onto the student's placement group,
+    CPU-parked between steps to avoid over-subscribing shared VRAM), these
+    actors get a whole GPU each and stay resident the entire run -- no
+    to_cpu/to_gpu round trip, no fractional-GPU lease. Launch with
+    ``GPU_IDS`` covering `trainer.n_gpus_per_node + num_replicas` devices.
+    """
+    kd_cfg = config.actor_rollout_ref.actor
+    teacher_cfg = kd_cfg.get("kd_teacher", {}) or {}
+
+    model_path = kd_cfg.get("kd_teacher_path", None) or teacher_cfg.get("path", None)
+    if not model_path:
+        raise ValueError("actor.kd_teacher_path (or actor.kd_teacher.path) must be set when actor.use_kd=True")
+    if num_replicas <= 0:
+        raise ValueError(f"kd_teacher.num_replicas must be positive, got {num_replicas}")
+
+    k = int(kd_cfg.get("kd_topk", 32))
+    dtype = teacher_cfg.get("dtype", "bfloat16")
+    student_vocab_size = int(teacher_cfg.get("student_vocab_size", 151936))
+    pad_token_id = int(teacher_cfg.get("pad_token_id", 0))
+    micro_batch_size = int(teacher_cfg.get("micro_batch_size", 4))
+    chunk_tokens = int(teacher_cfg.get("chunk_tokens", 1024))
+    attn_implementation = teacher_cfg.get("attn_implementation", "flash_attention_2")
+
+    handles = []
+    for i in range(num_replicas):
+        # TeacherScoringWorker is already a @ray.remote class (see
+        # teacher_scoring_worker.py); .options() overrides its resource
+        # request per instantiation, same as build_teacher_group above.
+        actor_cls = TeacherScoringWorker.options(num_gpus=1, name=f'kd_teacher_dedicated_{i}')
+        handle = actor_cls.remote(
+            model_path=model_path,
+            k=k,
+            dtype=dtype,
+            pad_token_id=pad_token_id,
+            student_vocab_size=student_vocab_size,
+            micro_batch_size=micro_batch_size,
+            chunk_tokens=chunk_tokens,
+            attn_implementation=attn_implementation,
+            start_on_cpu=False,  # resident: this GPU has no other tenant
+        )
+        handles.append(handle)
+    ray.get([h.is_on_gpu.remote() for h in handles])  # fail fast + block until loaded
+    return handles
+
+
 def sleep_teachers(handles: List["ray.actor.ActorHandle"]) -> None:
     """Park every teacher replica back on CPU and release its VRAM."""
     ray.get([h.to_cpu.remote() for h in handles])

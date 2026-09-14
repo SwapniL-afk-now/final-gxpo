@@ -2,7 +2,8 @@
 #
 # qwen25_1p5b_opd2_nogxpo_control.sh
 #
-# Qwen2.5-3B-Instruct (student) | OPD^2 delta distillation | plain AdamW, NO GXPO
+# Qwen2.5-3B-Instruct (student) + Qwen2.5-Math-7B-Instruct (teacher)
+# | OPD^2 delta distillation | plain AdamW, NO GXPO
 #
 # The A/B control for qwen25_1p5b_opd2_gxpo_adamw_dir_k10.sh: byte-identical
 # OPD^2 configuration and hyperparameters, with METHOD=grpo so the actor takes a
@@ -25,11 +26,11 @@
 # clip, the retention estimator and the trigger gate are untouched.
 #
 #   student      : Qwen/Qwen2.5-3B-Instruct
-#   teacher      : Qwen/Qwen2.5-Math-1.5B-Instruct
-#   teacher_base : Qwen/Qwen2.5-Math-1.5B     (the teacher's pre-instruct base)
+#   teacher      : Qwen/Qwen2.5-Math-7B-Instruct
+#   teacher_base : Qwen/Qwen2.5-7B-Instruct (the requested teacher base)
 #
-# All three share one tokenizer; the chat templates differ only in the default
-# system prompt, which SYSTEM_PROMPT overrides, so prompt ids are identical.
+# The teacher and teacher-base tokenizers share the same Qwen2.5 vocabulary.
+# OPD2 reuses the student prompt so the question is passed through once.
 #
 # Hyperparameters follow the paper's recipe
 # (on-policy-delta/opd2/recipes/Qwen3-1.7B/opd2/config_open_nvidia_100k.yaml):
@@ -62,29 +63,38 @@ fi
 
 # --------------------------------------------------------------- OPD^2 cfg ---
 export OPD2_ENABLED=1
-export OPD2_TEACHER="${OPD2_TEACHER:-/office/dev_workspace/swapnil/gradient-extrapolation-based-policy-optimization-gxpo-speed-audit/models/Qwen2.5-Math-1.5B-Instruct}"
-export OPD2_TEACHER_BASE="${OPD2_TEACHER_BASE:-$REPO_ROOT/models/Qwen2.5-Math-1.5B}"
+export ENTROPY_COEFF="${ENTROPY_COEFF:-0}"
+export OPD2_TEACHER="${OPD2_TEACHER:-$REPO_ROOT/models/Qwen2.5-Math-7B-Instruct}"
+export OPD2_TEACHER_BASE="${OPD2_TEACHER_BASE:-$REPO_ROOT/models/Qwen2.5-7B-Instruct}"
 # top-K truncation for the E_base[.] mean corrections. The weight is the
 # student's own probability, ~0 outside its own top-K, so this is near-lossless.
 # <=0 selects the exact full-vocabulary path through the same code.
 export OPD2_TOPK="${OPD2_TOPK:-1024}"
 export OPD2_GEN_LOSS_WEIGHT="${OPD2_GEN_LOSS_WEIGHT:-0.1}"
 export OPD2_REWARDS_BIAS="${OPD2_REWARDS_BIAS:-0.0}"
-# The teacher prompt is re-rendered with the teacher's own chat_template (the
-# reference's opd_no_think_teacher); teacher_base shares it. For this trio the
-# render is id-identical to the student's and the id contract is a no-op.
+# The teacher and student share the Qwen2.5 prompt format; re-rendering here
+# only duplicates the verbose chat prompt in the worker log.
 # ENABLE_THINKING only affects Qwen3 templates; Qwen2.5 ignores it.
-export OPD2_TEACHER_TEMPLATE="${OPD2_TEACHER_TEMPLATE:-True}"
+export OPD2_TEACHER_TEMPLATE="${OPD2_TEACHER_TEMPLATE:-False}"
 export ENABLE_THINKING="${ENABLE_THINKING:-False}"
 # Rows are scored one at a time by default, exactly like the reference trainer.
 # Raise for throughput once VRAM headroom is measured (rows are length-sorted and
 # right-padded, which is safe under causal attention).
 export OPD2_MICRO_BATCH_SIZE="${OPD2_MICRO_BATCH_SIZE:-1}"
 export OPD2_CHUNK_TOKENS="${OPD2_CHUNK_TOKENS:-512}"
-# Teacher + teacher_base are parked on CPU between scoring phases so they are
-# never co-resident with the vLLM rollout engine. Set True to keep ~7GB of bf16
-# weights resident and trade VRAM for the per-step transfer.
-export OPD2_KEEP_ON_GPU="${OPD2_KEEP_ON_GPU:-False}"
+# The dedicated scorer keeps both models resident on GPU 0; training/vLLM use 1,2.
+export OPD2_KEEP_ON_GPU="${OPD2_KEEP_ON_GPU:-True}"
+export OPD2_ATTN_IMPL="${OPD2_ATTN_IMPL:-flash_attention_2}"
+# GPU 0 is reserved for the resident OPD2 teacher/base scorer; training uses 1,2.
+export OPD2_DEDICATED_GPU="${OPD2_DEDICATED_GPU:-True}"
+export TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+export GPU_IDS="${GPU_IDS:-0,1,2}"
+export GPU_COUNT="${GPU_COUNT:-2}"
+export FSDP_SIZE="${FSDP_SIZE:-2}"
+# Keep host RAM below Ray's kill threshold; dataloader workers duplicate dataset state.
+export DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-0}"
+export RAY_memory_usage_threshold="${RAY_memory_usage_threshold:-0.85}"
+export RAY_OBJECT_STORE_MEMORY_GB="${RAY_OBJECT_STORE_MEMORY_GB:-8}"
 
 # ------------------------------------------------------- paper hyperparams ---
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-256}"
@@ -112,8 +122,8 @@ export SAVE_FREQ="${SAVE_FREQ:-20}"
 export OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
 
 export ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
-# Actor and vLLM are colocated in one worker; phase the actor state through CPU.
-export ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-True}"
+# Keep actor parameters on GPUs 1,2 and offload optimizer state to host RAM.
+export ACTOR_PARAM_OFFLOAD="${ACTOR_PARAM_OFFLOAD:-False}"
 export ACTOR_OPTIMIZER_OFFLOAD="${ACTOR_OPTIMIZER_OFFLOAD:-True}"
 # The three frozen/student forwards per response are on top of the usual RL step,
 # and responses run to 3072 tokens. Leave vLLM more headroom than the reward-RL
@@ -138,9 +148,9 @@ for _label in TEACHER:"$OPD2_TEACHER" TEACHER_BASE:"$OPD2_TEACHER_BASE"; do
   if [[ ! -f "$_path/config.json" ]]; then
     echo "PREFLIGHT FAIL: OPD^2 $_name weights not found at $_path" >&2
     if [[ "$_name" == "TEACHER_BASE" ]]; then
-      echo "  hf download Qwen/Qwen2.5-Math-1.5B --local-dir $_path" >&2
+      echo "  hf download Qwen/Qwen2.5-7B-Instruct --local-dir $_path" >&2
     else
-      echo "  hf download Qwen/Qwen2.5-Math-1.5B-Instruct --local-dir $_path" >&2
+      echo "  hf download Qwen/Qwen2.5-Math-7B-Instruct --local-dir $_path" >&2
     fi
     MISSING=1
   fi
@@ -183,7 +193,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   max_response_len   : $MAX_RESPONSE_LENGTH   temperature $ROLLOUT_TEMPERATURE
   lr                 : $LR ($LR_WARMUP_STYLE, warmup $LR_WARMUP_RATIO, min_lr_ratio $LR_MIN_RATIO)
   ref KL             : disabled (use_kl_loss=$USE_KL_LOSS, coef=$KL_LOSS_COEF)
-  gpus               : ${GPU_COUNT:-1}  (ids ${GPU_IDS:-<inherited>}, FSDP_SIZE=${FSDP_SIZE:-1})
+  gpus               : ${GPU_COUNT:-2} training GPUs (IDs ${GPU_IDS:-0,1,2}; OPD2 scorer reserves visible GPU 0; FSDP_SIZE=${FSDP_SIZE:-2})
   max_steps          : $MAX_STEPS   save_freq $SAVE_FREQ
   optimizer          : $OPTIMIZER_NAME
   attention          : train $ATTN_IMPL | vllm ${VLLM_ATTENTION_BACKEND:-FLASHINFER} (util $VLLM_GPU_MEMORY_UTILIZATION)

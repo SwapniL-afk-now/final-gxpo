@@ -49,6 +49,7 @@ from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
 from verl.utils.dataset.offpolicy_kd_dataset import OffPolicyKDDataset
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.workers.actor.opd2_signal import combine_opd2_advantages
 from torch.utils.data import RandomSampler, SequentialSampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from .presampling_selector import DataProfiler
@@ -473,6 +474,7 @@ class RayPPOTrainer(object):
                     f"(got {rollout_name!r})"
                 )
         self.teacher_handles = None
+        self.kd_teacher_dedicated = False
         self.data_profiler = DataProfiler()
         self.start_epoch = 0
         self.current_epoch = 0
@@ -1007,12 +1009,19 @@ class RayPPOTrainer(object):
         # the same GPU placement group as actor_rollout, asleep by default.
         # Skipped for cached off-policy KD (targets already in the batch).
         if self.use_kd and not self.kd_teacher_cached:
-            from verl.trainer.ppo.teacher_kd import build_teacher_group
-            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            from verl.trainer.ppo.teacher_kd import build_dedicated_teacher_group, build_teacher_group
             kd_teacher_cfg = self.config.actor_rollout_ref.actor.get('kd_teacher', {}) or {}
             num_teacher_replicas = int(kd_teacher_cfg.get('num_replicas', 2))
-            self.teacher_handles = build_teacher_group(
-                self.config, teacher_resource_pool, num_replicas=num_teacher_replicas)
+            self.kd_teacher_dedicated = bool(kd_teacher_cfg.get('dedicated_gpu', False))
+            if self.kd_teacher_dedicated:
+                # Own GPU(s), additive to trainer.n_gpus_per_node, resident for
+                # the whole run -- see teacher_kd.build_dedicated_teacher_group.
+                self.teacher_handles = build_dedicated_teacher_group(
+                    self.config, num_replicas=num_teacher_replicas)
+            else:
+                teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+                self.teacher_handles = build_teacher_group(
+                    self.config, teacher_resource_pool, num_replicas=num_teacher_replicas)
 
     def _best_ckpt_score(self, val_metrics):
         """Checkpoint-selection score: macro-mean val pass@1 across val sources (seed-mean).
@@ -1853,16 +1862,27 @@ class RayPPOTrainer(object):
                         inv_balance_perm = _make_inverse_perm(balance_perm)
 
                         batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
-                        # recompute old_log_probs while rewards are scored concurrently.
+                        # SLED vLLM rollouts carry the actual behavior-policy
+                        # logprobs in the batch. Use them as q_old. Legacy
+                        # rollouts do not carry this key and retain the actor
+                        # recomputation fallback.
                         # NOTE: union of the result into `batch` is deferred until after
                         # reward_thread.join() - union mutates batch.batch in place.
-                        try:
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        except BaseException:
-                            # never abandon the scoring thread on driver failure: join it
-                            # (bounded) before propagating, then re-raise unchanged.
-                            reward_thread.join(timeout=60)
-                            raise
+                        old_log_prob = None
+                        if 'old_log_probs' not in batch.batch:
+                            try:
+                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            except BaseException:
+                                # never abandon the scoring thread on driver failure: join it
+                                # (bounded) before propagating, then re-raise unchanged.
+                                reward_thread.join(timeout=60)
+                                raise
+                        else:
+                            # SLED rollouts already carry q_old log-probs, so the
+                            # usual compute_log_prob path does not populate this
+                            # actor-update metadata.
+                            batch.meta_info.setdefault(
+                                "temperature", self.config.actor_rollout_ref.rollout.temperature)
 
                     # collect the concurrent reward result; by now most of its
                     # wall-clock was absorbed by the GPU forward above.
@@ -1870,7 +1890,8 @@ class RayPPOTrainer(object):
                         reward_thread.join()
                     if _reward_error:
                         raise _reward_error[0]
-                    batch = batch.union(old_log_prob)
+                    if old_log_prob is not None:
+                        batch = batch.union(old_log_prob)
                     reward_tensor = _reward_result[0]
                     # The reward thread scored the PRE-balance snapshot: reorder()
                     # rebinds batch.batch instead of mutating tensors, so the
@@ -1912,7 +1933,19 @@ class RayPPOTrainer(object):
                                 'opd2_gen_loss_weight', 0.1))
                             sig = batch.batch['opd2_signal']
                             resp_mask = batch.batch['attention_mask'][:, -sig.shape[1]:].bool()
-                            batch.batch['advantages'] = sig * gen_w
+                            # Offline audit (scratchpad/opd2_audit*, 2026-09-14): the raw
+                            # signal's within-prompt AUC for correct-vs-wrong is
+                            # ~0.48-0.52 (chance) for the 3B/Math-7B pair -- it reshapes
+                            # style, not correctness. opd2_outcome_weight anchors the
+                            # update to the verifier with a REINFORCE batch-mean
+                            # baseline (see opd2_signal.combine_opd2_advantages).
+                            outcome_w = float(self.config.actor_rollout_ref.actor.get(
+                                'opd2_outcome_weight', 0.0))
+                            advantages, outcome_adv = combine_opd2_advantages(
+                                sig, gen_w, resp_mask, batch.batch['token_level_scores'], outcome_w)
+                            if outcome_adv is not None:
+                                metrics['opd2/outcome_adv_std'] = outcome_adv.std().item()
+                            batch.batch['advantages'] = advantages
                             # Metrics are emitted only on steps where the scorer ran
                             # (omit, never zero -- see the gxpo metrics convention).
                             live = sig[resp_mask]
@@ -2067,7 +2100,11 @@ class RayPPOTrainer(object):
                                 )
                                 print(f"[KD] step={self.global_steps} teacher_score_done")
                             finally:
-                                sleep_teachers(self.teacher_handles)
+                                # Dedicated-GPU teachers have no other tenant to
+                                # free VRAM for; parking them to CPU would only
+                                # buy back a reload next step.
+                                if not self.kd_teacher_dedicated:
+                                    sleep_teachers(self.teacher_handles)
 
                     # Compute generation time
                     generation_time += time.time() - generation_start
