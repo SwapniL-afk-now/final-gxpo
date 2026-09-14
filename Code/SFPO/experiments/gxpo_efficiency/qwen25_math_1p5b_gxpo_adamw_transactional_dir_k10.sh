@@ -80,10 +80,10 @@ export GXPO_DYNAMIC_FILTERING="True"
 export GXPO_DYNAMIC_FILTERING_STRATEGY="all_probabilistic"
 export GXPO_SAMPLING_BATCH_SIZE="${GXPO_SAMPLING_BATCH_SIZE:-$TRAIN_BATCH_SIZE}"
 
-# Roll out from the SLED-modified distribution, but update the ordinary base
-# model. vLLM attaches SLED token logprobs as old_log_probs, while the actor
-# computes the numerator from its unmodified final-layer logits.
-export SLED_VLLM_ENABLED="1"
+# SLED is disabled for this launcher. Keep rollout and loss paths off so future
+# runs cannot re-enable SLED implicitly through this entrypoint.
+export SLED_VLLM_ENABLED="0"
+export SLED_ENABLED="0"
 export SLED_VLLM_EARLY_LAYERS="${SLED_VLLM_EARLY_LAYERS:-14,18,22,26}"
 export SLED_VLLM_ALPHA="${SLED_VLLM_ALPHA:-2.0}"
 export SLED_VLLM_SCALE="${SLED_VLLM_SCALE:-10}"
