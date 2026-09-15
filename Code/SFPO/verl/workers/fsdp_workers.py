@@ -935,8 +935,14 @@ class ActorRolloutRefWorker(Worker):
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output, entropy = self.actor.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'old_log_probs': output, 'entropy': entropy},
+            tensors = {}
+            if self.actor.selected_policy_layers and self.actor._multilayer_loss == 'grpo':
+                # Multi-layer GRPO: pi_old^(l) for every selected layer, same no-grad pass.
+                output, entropy, tensors['old_log_probs_layers'] = self.actor.compute_log_prob(
+                    data=data, with_layers=True)
+            else:
+                output, entropy = self.actor.compute_log_prob(data=data)
+            output = DataProto.from_dict(tensors={'old_log_probs': output, 'entropy': entropy, **tensors},
                                          meta_info={'temperature': self.config.rollout.temperature})
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
@@ -1236,7 +1242,14 @@ class ActorRolloutRefWorker(Worker):
 
         torch.distributed.barrier()
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            # Finish checkpoint transfers before returning to the vLLM
+            # sleep/wake cycle. Non-blocking FSDP offload otherwise leaves
+            # CUDA work in flight when vLLM remaps its CuMem pages.
+            torch.cuda.synchronize()
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp, empty_cache=False)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, path, del_local_after_load=False):
@@ -1524,7 +1537,11 @@ class CriticWorker(Worker):
 
         torch.distributed.barrier()
         if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.critic_module)
+            torch.cuda.synchronize()
+            offload_fsdp_model_to_cpu(self.critic_module, empty_cache=False)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        torch.distributed.barrier()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, path, del_local_after_load=True):

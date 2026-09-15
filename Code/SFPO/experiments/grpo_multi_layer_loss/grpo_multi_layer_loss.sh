@@ -1,44 +1,32 @@
 #!/usr/bin/env bash
 #
-# qwen25_math_1p5b_gxpo_adamw_transactional_dir_k10.sh
+# grpo_multi_layer_loss.sh
 #
-# Qwen2.5-Math-1.5B-Instruct | GRPO + AdamW | GXPO temporarily disabled |
+# Qwen2.5-Math-1.5B-Instruct | GRPO + AdamW | multi-layer policy loss |
 # batch 64 | minibatch 16.
 #
-# GXPO is disabled for now. The old GXPO settings below are retained only as
-# context for restoring this experiment later.
+# The ONLY change vs plain GRPO is the policy loss. For the selected layers S
+# (1-based decoder blocks; l = output of block l, l = 28 is the final layer):
 #
-#   baseline (that script, GXPO_RETENTION_SPACE=grad)
-#       r_i = (c1 * g1_i) / (c0 * g0_i)        raw-gradient retention
+#     log pi^(l)(y_t) = log_softmax(lm_head(norm(h_t^(l))) / T)[y_t]
+#     r_t^(l)         = exp(log pi_theta^(l) - log pi_old^(l))
+#     L_policy        = (1/|S|) * sum_{l in S} L_GRPO(r^(l), A)
 #
-#   this script (GXPO_RETENTION_SPACE=auto)
-#       d_t = ((1 - lr*wd) * theta_t - theta_{t+1}) / lr
-#       r_i = d1_i / d0_i                      AdamW optimizer-direction retention
-#
-# AdamW does not move the parameters along the gradient; it moves them along
-# m_hat / (sqrt(v_hat) + eps). Reconstructing d_t from the real probe
-# displacement makes the retention signal carry AdamW's moments, its bias
-# correction, its epsilon convention and the clipped gradient it actually
-# consumed. Everything else -- GRPO loss, PPO clipping, rollout, K, alpha, LR,
-# batch sizes, the trigger/gate, the corrective pass -- is identical to the
-# baseline, so the two are a controlled A/B on the retention signal alone.
-#
-# Optimizer-state mode: TRANSACTIONAL. The probe trajectory s0 -> s1 -> s2 is
-# rolled back to s0 before the corrective pass, so the retained AdamW step
-# counter advances exactly ONCE per PPO minibatch:
-#     (theta_next, s_next) = AdamW(theta_tilde, s0, g_corrective)
-#
-# Run name: common.sh appends "_adamwdir" for adamw+auto, so this can never
-# resume the baseline's wandb id, checkpoints or result directory.
-#     qwen25-math-1p5b_gxpo_k10_seed3407_adamwdir
+# Shared lm_head + final norm (no new parameters), same advantages, mask, clip
+# and loss_agg_mode, one backward and one optimizer step per mini-batch.
+# pi_old^(l) comes from the actor's usual no-grad old-log-prob pass, which is
+# why SLED vLLM rollouts are OFF here (they would bypass that pass).
 #
 # Usage:
-#   bash qwen25_math_1p5b_gxpo_adamw_transactional_dir_k10.sh            # launch
-#   bash qwen25_math_1p5b_gxpo_adamw_transactional_dir_k10.sh --dry-run  # print
-#                                                       # resolved config, no launch
+#   bash grpo_multi_layer_loss.sh                                  # final (28) + 12,14,16
+#   SELECTED_POLICY_LAYERS=12,14,16 bash grpo_multi_layer_loss.sh  # intermediate layers only
+#   SELECTED_POLICY_LAYERS=14 bash grpo_multi_layer_loss.sh        # single layer
+#   SELECTED_POLICY_LAYERS=null bash grpo_multi_layer_loss.sh      # plain-GRPO control
+#   bash grpo_multi_layer_loss.sh --dry-run                        # print config, no launch
 #
+# Run name gets _ml<layers> (e.g. _ml12-14-16) so it never resumes a GRPO run.
 # Every setting below is overridable from the environment, e.g.:
-#   MAX_STEPS=200 GPU_COUNT=2 bash qwen25_math_1p5b_gxpo_adamw_transactional_dir_k10.sh
+#   MAX_STEPS=200 GPU_IDS=0 bash grpo_multi_layer_loss.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,15 +44,27 @@ if [[ -f "$REPO_ROOT/.env" ]]; then
 fi
 
 # --------------------------------------------------------- experiment cfg ----
-# Deliberately identical to qwen25_math_1p5b_gxpo_k10.sh so the only substantive
-# difference between the two runs is the retention estimator.
+# 1-based decoder layers; empty or null = original GRPO (control arm).
+# 28 = num_hidden_layers of Qwen2.5-Math-1.5B = the legacy final-layer GRPO loss
+# (it reuses the ordinary final log-probs, no extra projection). The update is
+#     L = (L_12 + L_14 + L_16 + L_28) / 4
+# Change 28 if MODEL_QWEN25_MATH_1P5B points at a model with a different depth.
+export SELECTED_POLICY_LAYERS="${SELECTED_POLICY_LAYERS-12,14,16,28}"
+
 export K="${K:-10}"
 export REPOSITION_ALPHA="${REPOSITION_ALPHA:-0.3}"
 export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
+export MAX_STEPS="${MAX_STEPS:-300}"
+export SAVE_FREQ="${SAVE_FREQ:-5}"
+export TRAINER_TEST_FREQ="${TRAINER_TEST_FREQ:-5}"
+export TRAINER_RESUME_MODE="${TRAINER_RESUME_MODE:-disable}"
+export FINAL_EVAL_ENABLED="${FINAL_EVAL_ENABLED:-False}"
 
 # Optimizer: plain fp32 AdamW (no Muon parameters at all in this run).
 export OPTIMIZER_NAME="adamw"
+# Plain GRPO control: no entropy bonus and no GXPO repositioning.
+export ENTROPY_COEFF="0"
 
 # Transactional GXPO: the two probe steps' moments and step counter are
 # snapshotted before probe 1 and rolled back after repositioning, so the
@@ -83,17 +83,27 @@ export GXPO_DYNAMIC_FILTERING="True"
 export GXPO_DYNAMIC_FILTERING_STRATEGY="all_probabilistic"
 export GXPO_SAMPLING_BATCH_SIZE="${GXPO_SAMPLING_BATCH_SIZE:-$TRAIN_BATCH_SIZE}"
 
-# Roll out from the SLED-modified distribution, but update the ordinary base
-# model. vLLM attaches SLED token logprobs as old_log_probs, while the actor
-# computes the numerator from its unmodified final-layer logits.
+# Plain vLLM sampling. SLED rollouts attach their own old_log_probs and skip
+# the actor pass that computes pi_old^(l); forced off so an inherited env
+# cannot turn it back on.
 export SLED_VLLM_ENABLED="0"
-export SLED_VLLM_EARLY_LAYERS="${SLED_VLLM_EARLY_LAYERS:-14,18,22,26}"
-export SLED_VLLM_ALPHA="${SLED_VLLM_ALPHA:-2.0}"
-export SLED_VLLM_SCALE="${SLED_VLLM_SCALE:-10}"
-export SLED_VLLM_LOWER_BOUND="${SLED_VLLM_LOWER_BOUND:--1000}"
+export ACTOR_PARAM_OFFLOAD="True"
+export ACTOR_OPTIMIZER_OFFLOAD="False"
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.5}"
+export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-49152}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-256}"
+
+# Greedy validation, one response per prompt; training keeps eight rollouts.
+export ROLLOUT_N="${ROLLOUT_N:-8}"
+export VAL_N="${VAL_N:-1}"
+export VAL_DO_SAMPLE="False"
+export VAL_TEMPERATURE="0"
+
+export SLED_ENABLED="0"
+export OPD2_ENABLED="0"
 
 export ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
-export SAVE_FREQ="${SAVE_FREQ:-20}"
+export SAVE_FREQ="${SAVE_FREQ:-5}"
 
 # ------------------------------------------------------------- preflight -----
 MISSING=0
@@ -139,14 +149,15 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   model              : $MODEL_DIR
   data_root          : $DATA_ROOT
   method             : grpo + adamw (GXPO disabled)
+  policy layers      : ${SELECTED_POLICY_LAYERS:-null}  (1-based; null = plain GRPO)
   batch / minibatch  : $TRAIN_BATCH_SIZE / $PPO_MINI_BATCH_SIZE
   gpus               : ${GPU_COUNT:-1}  (ids ${GPU_IDS:-<inherited>}, FSDP_SIZE=${FSDP_SIZE:-1})
-  max_steps          : ${MAX_STEPS:-400}   save_freq $SAVE_FREQ
+  max_steps          : ${MAX_STEPS:-300}   save_freq $SAVE_FREQ
   optimizer          : $OPTIMIZER_NAME
   dynamic filtering  : $GXPO_DYNAMIC_FILTERING (mixed-response groups retained)
   attention          : train $ATTN_IMPL | vllm ${VLLM_ATTENTION_BACKEND:-FLASHINFER}
   wandb project      : ${WANDB_PROJECT:-gxpo-efficiency-final}
-  A/B baseline       : qwen25_math_1p5b_gxpo_k10.sh (pinned GXPO_RETENTION_SPACE=grad)
+  A/B baseline       : SELECTED_POLICY_LAYERS=null bash grpo_multi_layer_loss.sh
 [dry-run] preflight OK - would launch now.
 EOT
   exit 0
@@ -156,4 +167,4 @@ fi
 MODEL_ALIAS="qwen25-math-1p5b"
 MODEL_ID="$MODEL_QWEN25_MATH_1P5B"
 METHOD="grpo"
-source "$SCRIPT_DIR/common.sh"
+source "$SCRIPT_DIR/../gxpo_efficiency/common.sh"

@@ -61,6 +61,11 @@ export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-64}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 
 # Optimizer: plain fp32 AdamW (no Muon parameters at all in this run).
+export MAX_STEPS="${MAX_STEPS:-300}"
+export SAVE_FREQ="${SAVE_FREQ:-5}"
+export TRAINER_TEST_FREQ="${TRAINER_TEST_FREQ:-5}"
+export TRAINER_RESUME_MODE="${TRAINER_RESUME_MODE:-disable}"
+export FINAL_EVAL_ENABLED="${FINAL_EVAL_ENABLED:-False}"
 export OPTIMIZER_NAME="adamw"
 
 # Transactional GXPO: the two probe steps' moments and step counter are
@@ -86,11 +91,20 @@ export SLED_VLLM_ENABLED="0"
 export SLED_ENABLED="0"
 export SLED_VLLM_EARLY_LAYERS="${SLED_VLLM_EARLY_LAYERS:-14,18,22,26}"
 export SLED_VLLM_ALPHA="${SLED_VLLM_ALPHA:-2.0}"
+export VLLM_MAX_NUM_BATCHED_TOKENS="${VLLM_MAX_NUM_BATCHED_TOKENS:-49152}"
+export VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-256}"
 export SLED_VLLM_SCALE="${SLED_VLLM_SCALE:-10}"
 export SLED_VLLM_LOWER_BOUND="${SLED_VLLM_LOWER_BOUND:--1000}"
+export ACTOR_PARAM_OFFLOAD="True"
+export ACTOR_OPTIMIZER_OFFLOAD="False"
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.5}"
+export ROLLOUT_N="${ROLLOUT_N:-8}"
+export VAL_N="${VAL_N:-1}"
+export VAL_DO_SAMPLE="False"
+export VAL_TEMPERATURE="0"
 
 export ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
-export SAVE_FREQ="${SAVE_FREQ:-20}"
+export SAVE_FREQ="${SAVE_FREQ:-5}"
 
 # ------------------------------------------------------------- preflight -----
 MISSING=0

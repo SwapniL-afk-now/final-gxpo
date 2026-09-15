@@ -1892,6 +1892,10 @@ class RayPPOTrainer(object):
                         raise _reward_error[0]
                     if old_log_prob is not None:
                         batch = batch.union(old_log_prob)
+                    # The actor's use_kl_loss reads ref_log_prob; nothing else here does.
+                    if self.use_reference_policy and self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                        with _timer('ref', timing_raw):
+                            batch = batch.union(self.ref_policy_wg.compute_ref_log_prob(batch))
                     reward_tensor = _reward_result[0]
                     # The reward thread scored the PRE-balance snapshot: reorder()
                     # rebinds batch.batch instead of mutating tensors, so the

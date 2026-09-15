@@ -35,6 +35,19 @@ actor_rollout_ref:
     grad_clip: 1.0
     clip_ratio: 0.2
     entropy_coeff: 0.001
+    # Multi-layer GRPO policy loss. null = original GRPO/Dr.GRPO, exactly.
+    # A list, e.g. [12, 14, 16], averages the unchanged GRPO loss over those layers:
+    # L = mean_l L_GRPO(pi^(l)/pi_old^(l), A), pi^(l) = softmax(lm_head(norm(h_l)) / T).
+    # Layers are 1-BASED decoder blocks (HF hidden_states[l] = model.layers[l-1]);
+    # l = num_hidden_layers is the ordinary final-layer policy.
+    selected_policy_layers: null
+    # null = plain mean over selected layers. A float c (requires the final layer in the list):
+    # L = L_final + c * mean(L_intermediate), e.g. 0.33 or 0.1.
+    multilayer_aux_coef: null
+    # grpo = the above. kl = L_GRPO(final) + multilayer_aux_coef * mean_l KL(sg[pi_final] || pi_l),
+    # KL estimated on sampled tokens with kl_loss_type (low_var_kl = k3), like the reference KL;
+    # selected_policy_layers must then list intermediate layers only.
+    multilayer_loss: grpo
     use_kl_loss: False # True for GRPO
     use_torch_compile: True # False to disable torch compile
     kl_loss_coef: 0.001 # for grpo

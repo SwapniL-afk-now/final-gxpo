@@ -332,6 +332,44 @@ PY
     +actor_rollout_ref.actor.sled_chunk_tokens="$SLED_CHUNK_TOKENS"
   )
 fi
+# ---------------------------------------------------- multi-layer GRPO ---
+# SELECTED_POLICY_LAYERS=12,14,16 averages the unchanged GRPO loss over those
+# 1-based decoder layers (see actor.selected_policy_layers in ppo_trainer.yaml;
+# range/duplicate validation happens in the actor). Unset/empty/null = the
+# exact same command as before.
+SELECTED_POLICY_LAYERS="${SELECTED_POLICY_LAYERS:-}"
+[[ "${SELECTED_POLICY_LAYERS,,}" == "null" ]] && SELECTED_POLICY_LAYERS=""
+SELECTED_POLICY_LAYERS="${SELECTED_POLICY_LAYERS// /}"
+ML_FLAGS=()
+if [[ -n "$SELECTED_POLICY_LAYERS" ]]; then
+  if [[ ! "$SELECTED_POLICY_LAYERS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "PREFLIGHT FAIL: SELECTED_POLICY_LAYERS must be comma-separated ints, got '$SELECTED_POLICY_LAYERS'" >&2
+    exit 2
+  fi
+  ML_FLAGS+=(actor_rollout_ref.actor.selected_policy_layers="[$SELECTED_POLICY_LAYERS]")
+fi
+# MULTILAYER_AUX_COEF=c: L = L_final + c * mean(L_intermediate). Unset = plain mean.
+MULTILAYER_AUX_COEF="${MULTILAYER_AUX_COEF:-}"
+if [[ -n "$MULTILAYER_AUX_COEF" ]]; then
+  if [[ -z "$SELECTED_POLICY_LAYERS" || ! "$MULTILAYER_AUX_COEF" =~ ^[0-9]*\.?[0-9]+$ ]]; then
+    echo "PREFLIGHT FAIL: MULTILAYER_AUX_COEF needs SELECTED_POLICY_LAYERS and a non-negative number, got '$MULTILAYER_AUX_COEF'" >&2
+    exit 2
+  fi
+  ML_FLAGS+=(actor_rollout_ref.actor.multilayer_aux_coef="$MULTILAYER_AUX_COEF")
+fi
+# MULTILAYER_LOSS=kl: L = L_GRPO(final) + MULTILAYER_AUX_COEF * mean_l KL(sg[pi_final] || pi_l).
+MULTILAYER_LOSS="${MULTILAYER_LOSS:-grpo}"
+if [[ "$MULTILAYER_LOSS" != "grpo" && "$MULTILAYER_LOSS" != "kl" ]]; then
+  echo "PREFLIGHT FAIL: MULTILAYER_LOSS must be grpo or kl, got '$MULTILAYER_LOSS'" >&2
+  exit 2
+fi
+if [[ "$MULTILAYER_LOSS" == "kl" ]]; then
+  if [[ -z "$SELECTED_POLICY_LAYERS" || -z "$MULTILAYER_AUX_COEF" ]]; then
+    echo "PREFLIGHT FAIL: MULTILAYER_LOSS=kl needs SELECTED_POLICY_LAYERS and MULTILAYER_AUX_COEF" >&2
+    exit 2
+  fi
+  ML_FLAGS+=(actor_rollout_ref.actor.multilayer_loss=kl)
+fi
 OPTIMIZER_NAME="${OPTIMIZER_NAME:-adamw}"
 # AdamW weight decay. fsdp_workers defaults to 1e-2 when unset; HuggingFace
 # TrainingArguments (and therefore every trl recipe that does not set it)
@@ -456,6 +494,16 @@ fi
 # otherwise splice new metrics into an old run). Same guard pattern.
 if [[ "$SLED_ON" -eq 1 && "$RUN_NAME" != *_sledsig* ]]; then
   RUN_NAME="${RUN_NAME}_sledsig"
+fi
+# Multi-layer GRPO is a different objective: never resume a plain-GRPO run.
+if [[ -n "$SELECTED_POLICY_LAYERS" && "$RUN_NAME" != *_ml[0-9]* ]]; then
+  RUN_NAME="${RUN_NAME}_ml${SELECTED_POLICY_LAYERS//,/-}"
+fi
+if [[ "$MULTILAYER_LOSS" == "kl" && "$RUN_NAME" != *_kl_aux* ]]; then
+  RUN_NAME="${RUN_NAME}_kl"
+fi
+if [[ -n "$MULTILAYER_AUX_COEF" && "$RUN_NAME" != *_aux[0-9.]* ]]; then
+  RUN_NAME="${RUN_NAME}_aux${MULTILAYER_AUX_COEF}"
 fi
 # A non-default loss reduction is a different objective, not a different setting.
 # Tag it so it cannot resume a token-mean run's wandb id or checkpoints.
@@ -737,6 +785,9 @@ learning_rate=$LR
 lr_schedule=$LR_WARMUP_STYLE (warmup_ratio=$LR_WARMUP_RATIO, min_lr_ratio=$LR_MIN_RATIO)
 opd2_enabled=$OPD2_ON$( [[ "$OPD2_ON" -eq 1 ]] && echo " (teacher=$OPD2_TEACHER, teacher_base=$OPD2_TEACHER_BASE, topk=$OPD2_TOPK, gen_loss_weight=$OPD2_GEN_LOSS_WEIGHT, outcome_weight=$OPD2_OUTCOME_WEIGHT, teacher_template=$OPD2_TEACHER_TEMPLATE, micro_bsz=$OPD2_MICRO_BATCH_SIZE)" )
 sled_enabled=$SLED_ON$( [[ "$SLED_ON" -eq 1 ]] && echo " (loss_coef=$SLED_LOSS_COEF, grpo_coef=$SLED_GRPO_COEF, alpha=$SLED_ALPHA, early_layer=$SLED_EARLY_LAYER, topk=$SLED_TOPK, micro_bsz=$SLED_MICRO_BATCH_SIZE)" )
+selected_policy_layers=${SELECTED_POLICY_LAYERS:-null}
+multilayer_aux_coef=${MULTILAYER_AUX_COEF:-null}
+multilayer_loss=$MULTILAYER_LOSS
 loss_agg_mode=$LOSS_AGG_MODE
 use_kl_loss=$USE_KL_LOSS
 kl_loss_coef=$KL_LOSS_COEF
@@ -876,6 +927,7 @@ python -u -m verl.trainer.main_ppo \
   "${METHOD_FLAGS[@]}" \
   ${OPD2_FLAGS[@]+"${OPD2_FLAGS[@]}"} \
   ${SLED_FLAGS[@]+"${SLED_FLAGS[@]}"} \
+  ${ML_FLAGS[@]+"${ML_FLAGS[@]}"} \
   2>&1 | tee "$RUN_DIR/train.log"
 
 if [[ "$FINAL_EVAL_ENABLED" == "True" ]]; then

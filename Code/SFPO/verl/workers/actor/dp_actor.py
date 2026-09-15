@@ -15,17 +15,19 @@
 Single Process Actor
 """
 
+import contextlib
 import itertools
 import os
 import time
 import weakref
-from typing import Iterable, Tuple
+from typing import Iterable
 
 # Power-throttle chunk size for full-model diagnostic norm waves (see
 # fsdp_workers._SFPO_FOREACH_CHUNK); values unchanged, scheduling only.
 _GXPO_NORM_CHUNK = max(1, int(os.environ.get('GXPO_NORM_CHUNK', '32')))
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -89,6 +91,11 @@ def _merge_metrics(dst: dict, src: dict):
             dst[key] = val
 
 
+# Token chunk for the checkpointed selected-layer lm_head projection: the
+# per-chunk transient is chunk * vocab (bf16 logits + the log-prob kernel).
+LAYER_LOG_PROB_CHUNK_TOKENS = 4096
+
+
 class DataParallelPPOActor(BasePPOActor):
 
     def __init__(
@@ -105,6 +112,8 @@ class DataParallelPPOActor(BasePPOActor):
         print(f'Actor use_remove_padding={self.use_remove_padding}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+
+        self.selected_policy_layers = self._resolve_selected_policy_layers()
 
         self.compute_entropy_from_logits = (
             torch.compile(verl_F.entropy_from_logits, dynamic=True)
@@ -179,11 +188,141 @@ class DataParallelPPOActor(BasePPOActor):
             )
             self._gxpo_diag_freq = int(self.config.get('gxpo_diag_freq', 10))
 
-    def _forward_micro_batch(self, micro_batch, temperature, need_entropy=True) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _resolve_selected_policy_layers(self):
+        """Validate ``selected_policy_layers``. ``None`` (default) = original GRPO.
+
+        Indexing is 1-BASED over decoder blocks: ``l`` is the output of the l-th
+        block, i.e. HF ``hidden_states[l]`` / ``model.layers[l - 1]``, valid range
+        ``1..num_hidden_layers``. Each selected layer is projected by the shared
+        ``lm_head`` after the model's final norm, so ``l = num_hidden_layers`` is
+        exactly the ordinary policy. (``sled_early_layer`` is 0-based -- different
+        knob, different convention.) Returned sorted so old/current log-prob
+        columns always line up.
+        """
+        layers = self.config.get('selected_policy_layers', None)
+        self._num_hidden_layers = None
+        self._intermediate_policy_layers = ()
+        self._multilayer_aux_coef = None
+        self._multilayer_loss = 'grpo'
+        if layers is None:
+            return None
+        if isinstance(layers, str) or not hasattr(layers, '__iter__'):
+            raise ValueError(f'selected_policy_layers must be null or a list of ints, got {layers!r}')
+        layers = list(layers)
+        if not layers:
+            raise ValueError('selected_policy_layers=[] selects nothing; use null for original GRPO')
+        if any(isinstance(l, bool) or not isinstance(l, int) for l in layers):
+            raise ValueError(f'selected_policy_layers must contain ints, got {layers!r}')
+        if len(set(layers)) != len(layers):
+            raise ValueError(f'selected_policy_layers has duplicates: {layers!r}')
+        n = getattr(getattr(self.actor_module, 'config', None), 'num_hidden_layers', None)
+        if n is None:
+            raise ValueError('selected_policy_layers needs the model depth (config.num_hidden_layers)')
+        bad = [l for l in layers if not 1 <= l <= int(n)]
+        if bad:
+            raise ValueError(f'selected_policy_layers {bad} out of range: layers are 1-based, '
+                             f'valid 1..{int(n)}')
+        for flag in ('use_gxpo', 'use_sfpo', 'use_kd', 'use_sled_delta', 'use_opd2'):
+            if self.config.get(flag, False):
+                raise ValueError(f'selected_policy_layers is only wired for plain GRPO/Dr.GRPO; '
+                                 f'it cannot be combined with {flag}=True')
+        self._num_hidden_layers = int(n)
+        self._intermediate_policy_layers = tuple(sorted(l for l in layers if l != int(n)))
+        # null = plain mean over layers; a float c = L_final + c * mean(L_intermediate).
+        coef = self.config.get('multilayer_aux_coef', None)
+        if coef is not None:
+            coef = float(coef)
+            if coef < 0:
+                raise ValueError(f'multilayer_aux_coef must be >= 0, got {coef}')
+            if ((self.config.get('multilayer_loss', 'grpo') or 'grpo') == 'grpo'
+                    and (int(n) not in layers or not self._intermediate_policy_layers)):
+                raise ValueError(f'multilayer_aux_coef needs the final layer {int(n)} and at least one '
+                                 f'intermediate layer in selected_policy_layers, got {layers!r}')
+        self._multilayer_aux_coef = coef
+        mode = self.config.get('multilayer_loss', 'grpo') or 'grpo'
+        if mode not in ('grpo', 'kl'):
+            raise ValueError(f"multilayer_loss must be 'grpo' or 'kl', got {mode!r}")
+        if mode == 'kl':
+            # L = L_GRPO(final) + c * mean_l KL(sg[pi_final] || pi_l): intermediates only.
+            if coef is None:
+                raise ValueError('multilayer_loss=kl needs multilayer_aux_coef (the KL weight)')
+            if int(n) in layers:
+                raise ValueError(f'multilayer_loss=kl distills into intermediate layers only; '
+                                 f'drop the final layer {int(n)} from selected_policy_layers')
+        self._multilayer_loss = mode
+        return tuple(sorted(layers))
+
+    @contextlib.contextmanager
+    def _multilayer_log_prob_hooks(self, labels, temperature):
+        """Compute selected-layer token log-probs inside the model's own forward.
+
+        Forward hooks capture ONLY the selected blocks' outputs ``h_l``. A forward
+        hook on the root (FSDP-wrapped) module then computes
+        ``log_softmax(lm_head(norm(h_l)) / T)[labels]`` per layer and returns the
+        ``labels``-shaped results in ``output.hidden_states`` (unused otherwise).
+        Being part of the root forward's output, they get FSDP's pre-backward
+        hooks, so the root's shared ``norm``/``lm_head`` params follow the normal
+        unshard / gradient-reduction path even when the final logits are not in
+        the loss. Each layer is projected in token chunks under non-reentrant
+        checkpointing, so no ``[tokens, vocab]`` tensor is held for backward.
+        Hooks are removed before the caller's backward, so gradient-checkpoint
+        recompute cannot re-fire them.
+        """
+        norm, head = self._sled_norm_and_head()
+        layers = self.actor_module.model.layers
+        root = getattr(self.actor_module, '_fsdp_wrapped_module', self.actor_module)
+        captured = {}
+        flat_labels = labels.reshape(-1)
+
+        def capture(layer):
+            def hook(module, args, output):
+                captured[layer] = output[0] if isinstance(output, tuple) else output
+            return hook
+
+        def token_log_probs(hidden, chunk_labels):
+            return logprobs_from_logits(head(norm(hidden)).div(temperature), chunk_labels)
+
+        def attach(module, args, output):
+            outs = []
+            for layer in self._intermediate_policy_layers:
+                h = captured.pop(layer)
+                flat = h.reshape(-1, h.size(-1))
+                parts = []
+                for h_c, y_c in zip(flat.split(LAYER_LOG_PROB_CHUNK_TOKENS),
+                                    flat_labels.split(LAYER_LOG_PROB_CHUNK_TOKENS)):
+                    if torch.is_grad_enabled():
+                        parts.append(torch.utils.checkpoint.checkpoint(token_log_probs, h_c, y_c,
+                                                                       use_reentrant=False))
+                    else:
+                        parts.append(token_log_probs(h_c, y_c))
+                outs.append(torch.cat(parts).view(h.shape[:-1]))
+            output.hidden_states = tuple(outs)
+            return output
+
+        handles = []
+        if self._intermediate_policy_layers:
+            handles = [layers[l - 1].register_forward_hook(capture(l)) for l in self._intermediate_policy_layers]
+            handles.append(root.register_forward_hook(attach))
+        try:
+            yield
+        finally:
+            for handle in handles:
+                handle.remove()
+            captured.clear()
+
+    def _stack_layer_log_probs(self, log_probs, layer_parts):
+        """``[bs, R, K]`` with column k = ``selected_policy_layers[k]``."""
+        parts = iter(layer_parts)
+        return torch.stack([log_probs if l == self._num_hidden_layers else next(parts)
+                            for l in self.selected_policy_layers], dim=-1)
+
+    def _forward_micro_batch(self, micro_batch, temperature, need_entropy=True, with_layers=False):
         """
         Returns:
             entropy: # (bs, response_len); ``None`` when ``need_entropy=False``
             log_probs: # (bs, response_len)
+            layer_log_probs: # (bs, response_len, K), only when ``with_layers``;
+                column k is ``selected_policy_layers[k]``
         """
         response_length = micro_batch['responses'].size(-1)
         multi_modal_inputs = {}
@@ -228,11 +367,13 @@ class DataParallelPPOActor(BasePPOActor):
                 input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
 
                 # only pass input_ids and position_ids to enable flash_attn_varlen
-                output = self.actor_module(input_ids=input_ids_rmpad,
-                                           attention_mask=None,
-                                           position_ids=position_ids_rmpad,
-                                           **multi_modal_inputs,
-                                           use_cache=False)  # prevent model thinks we are generating
+                with (self._multilayer_log_prob_hooks(input_ids_rmpad_rolled, temperature)
+                      if with_layers else contextlib.nullcontext()):
+                    output = self.actor_module(input_ids=input_ids_rmpad,
+                                               attention_mask=None,
+                                               position_ids=position_ids_rmpad,
+                                               **multi_modal_inputs,
+                                               use_cache=False)  # prevent model thinks we are generating
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
 
                 logits_rmpad.div_(temperature)
@@ -269,17 +410,36 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy = None
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
+                if with_layers:
+                    # Same (sp gather) -> pad -> response slice as the final log-probs.
+                    parts = []
+                    for part_lp in (output.hidden_states if self._intermediate_policy_layers else ()):
+                        part_lp = part_lp.squeeze(0)
+                        if self.use_ulysses_sp:
+                            part_lp = gather_outpus_and_unpad(part_lp, gather_dim=0, unpad_dim=0,
+                                                              padding_size=pad_size)
+                        part_lp = pad_input(hidden_states=part_lp.unsqueeze(-1), indices=indices,
+                                            batch=batch_size, seqlen=seqlen)
+                        parts.append(part_lp.squeeze(-1)[:, -response_length - 1:-1])
+                    return entropy, log_probs, self._stack_layer_log_probs(log_probs, parts)
+
             else:  # not using rmpad and no ulysses sp
-                output = self.actor_module(input_ids=input_ids,
-                                           attention_mask=attention_mask,
-                                           position_ids=position_ids,
-                                           **multi_modal_inputs,
-                                           use_cache=False)  # prevent model thinks we are generating
+                with (self._multilayer_log_prob_hooks(torch.roll(input_ids, shifts=-1, dims=1), temperature)
+                      if with_layers else contextlib.nullcontext()):
+                    output = self.actor_module(input_ids=input_ids,
+                                               attention_mask=attention_mask,
+                                               position_ids=position_ids,
+                                               **multi_modal_inputs,
+                                               use_cache=False)  # prevent model thinks we are generating
                 logits = output.logits
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1, :]  # (bsz, response_length, vocab_size)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
                 entropy = verl_F.entropy_from_logits(logits) if need_entropy else None  # (bsz, response_length)
+                if with_layers:
+                    parts = [part[:, -response_length - 1:-1]
+                             for part in (output.hidden_states if self._intermediate_policy_layers else ())]
+                    return entropy, log_probs, self._stack_layer_log_probs(log_probs, parts)
 
             return entropy, log_probs
 
@@ -765,7 +925,7 @@ class DataParallelPPOActor(BasePPOActor):
         return final_entropy
 
 
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, with_layers: bool = False):
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -781,7 +941,8 @@ class DataParallelPPOActor(BasePPOActor):
                 ``responses``:  tensor of shape [batch_size, response_length]. torch.int64.
 
         Returns:
-            torch.Tensor: the log_prob tensor
+            ``(log_probs, entropys)``; with ``with_layers`` also the
+            ``[bs, response_length, K]`` per-selected-layer log-probs.
         """
         # set to eval
         self.actor_module.eval()
@@ -807,16 +968,20 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        layer_lst = []
         for micro_batch in micro_batches:
             if isinstance(micro_batch, DataProto):
                 micro_batch = {**micro_batch.batch, **micro_batch.non_tensor_batch}
 
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
+                entropy, log_probs, *layer_log_probs = self._forward_micro_batch(
+                    micro_batch, temperature=temperature, with_layers=with_layers)
             log_probs_lst.append(log_probs)
             entropy_lst.append(entropy)
+            layer_lst.extend(layer_log_probs)
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = torch.concat(entropy_lst, dim=0)
+        layer_log_probs = torch.concat(layer_lst, dim=0) if with_layers else None
 
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
@@ -824,7 +989,11 @@ class DataParallelPPOActor(BasePPOActor):
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
             entropys = entropys[revert_indices]
+            if with_layers:
+                layer_log_probs = layer_log_probs[revert_indices]
 
+        if with_layers:
+            return log_probs, entropys, layer_log_probs
         return log_probs, entropys
 
     def _forward_opd2_micro_batch(self, micro_batch) -> torch.Tensor:
@@ -1068,11 +1237,69 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train(was_training)
         return out
 
+    def _multilayer_policy_loss(self, layer_log_prob, old_layer_log_prob, advantages, response_mask,
+                                clip_ratio, loss_agg_mode, collect_metrics=True):
+        """``L = (1/K) * sum_l L_GRPO(r^(l), A)``, ``r^(l) = exp(logpi^(l) - logpi_old^(l))``.
+
+        Each layer goes through the repository's unchanged ``compute_policy_loss``
+        (same advantages, mask, clip and ``loss_agg_mode``). Column k of both
+        ``[bs, R, K]`` inputs is ``selected_policy_layers[k]``. Returns
+        ``(pg_loss, mean clipfrac, mean approx-KL, per-layer metrics)``.
+        """
+        losses, clipfracs, kls, metrics = [], [], [], {}
+        for k, layer in enumerate(self.selected_policy_layers):
+            log_prob_l = layer_log_prob[..., k]
+            old_l = old_layer_log_prob[..., k].detach()
+            loss_l, clipfrac_l, kl_l = core_algos.compute_policy_loss(
+                old_log_prob=old_l, log_prob=log_prob_l, advantages=advantages,
+                eos_mask=response_mask, cliprange=clip_ratio, loss_agg_mode=loss_agg_mode)
+            losses.append(loss_l)
+            clipfracs.append(clipfrac_l)
+            kls.append(kl_l)
+            if collect_metrics:
+                metrics[f'policy_loss/layer_{layer}'] = loss_l.detach()
+                metrics[f'policy_ratio/layer_{layer}'] = verl_F.masked_mean(
+                    torch.exp(log_prob_l.detach() - old_l), response_mask)
+                metrics[f'clip_fraction/layer_{layer}'] = clipfrac_l.detach()
+                metrics[f'approx_kl/layer_{layer}'] = kl_l.detach()
+        if self._multilayer_aux_coef is None:
+            pg_loss = torch.stack(losses).mean()
+        else:  # final layer is last (layers sorted); intermediates are auxiliary
+            aux = torch.stack(losses[:-1]).mean()
+            pg_loss = losses[-1] + self._multilayer_aux_coef * aux
+            if collect_metrics:
+                metrics['policy_loss/aux_mean'] = aux.detach()
+        if collect_metrics:
+            metrics['policy_loss/multilayer'] = pg_loss.detach()
+        return pg_loss, torch.stack(clipfracs).mean(), torch.stack(kls).mean(), metrics
+
+    def _layer_distill_loss(self, pg_loss, log_prob, layer_log_prob, response_mask, collect_metrics=True):
+        """``pg_loss + c * mean_l masked_mean(k3(sg[log pi_final], log pi_l))`` on sampled tokens.
+
+        Same estimator as the reference KL (``kl_loss_type``, default low_var_kl):
+        ``r = pi_l / pi_final``, ``k3 = r - log r - 1``, an estimate of
+        KL(pi_final || pi_l) for tokens sampled from the (old) final policy.
+        Column k of ``layer_log_prob`` is ``selected_policy_layers[k]``.
+        """
+        kl_type = self.config.get('kl_loss_type', 'low_var_kl')
+        target = log_prob.detach()
+        kls = [verl_F.masked_mean(core_algos.kl_penalty(logprob=target, ref_logprob=layer_log_prob[..., k],
+                                                        kl_penalty=kl_type), response_mask)
+               for k in range(len(self.selected_policy_layers))]
+        aux = torch.stack(kls).mean()
+        metrics = {}
+        if collect_metrics:
+            metrics = {f'distill_kl/layer_{l}': kl.detach() for l, kl in zip(self.selected_policy_layers, kls)}
+            metrics['policy_loss/aux_mean'] = aux.detach()
+        return pg_loss + self._multilayer_aux_coef * aux, metrics
+
     def _make_minibatch_iterator(self, data: DataProto):
         """Select PPO keys and split the batch into mini-batches (shared by all update paths)."""
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        if self.selected_policy_layers and self._multilayer_loss == 'grpo':
+            select_keys.append('old_log_probs_layers')
         if self.config.get('use_kd', False):
             # Offline KD teacher cache (dense per response position). Keys are
             # appended only when present so non-KD batches keep working.
@@ -1167,6 +1394,7 @@ class DataParallelPPOActor(BasePPOActor):
             sled_gate = None
             sled_a_opd = None
             sled_diag = None
+            layer_metrics = None
             if recompute_old_log_probs and pure_kd:
                 # Pure KD never consumes old_log_probs.
                 old_log_prob = None
@@ -1251,26 +1479,50 @@ class DataParallelPPOActor(BasePPOActor):
                 ppo_kl = kd_loss.new_zeros(())
                 policy_loss = kd_coef * kd_loss
             else:
-                # all return: (bsz, response_length)
-                if need_entropy:
-                    entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                if self.selected_policy_layers and self._multilayer_loss == 'kl':
+                    # Final-layer GRPO + c * mean_l k3 KL(sg[pi_final] || pi_l) on the
+                    # sampled tokens; the entropy/reference-KL terms below stay final-layer.
+                    entropy, log_prob, layer_log_prob = self._forward_micro_batch(
+                        micro_batch=data, temperature=temperature, need_entropy=need_entropy,
+                        with_layers=True)
+                    pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
+                        old_log_prob=old_log_prob, log_prob=log_prob, advantages=advantages,
+                        eos_mask=response_mask, cliprange=clip_ratio,
+                        loss_agg_mode=self.config.get('loss_agg_mode', 'token-mean'))
+                    pg_loss, layer_metrics = self._layer_distill_loss(pg_loss, log_prob, layer_log_prob,
+                                                                      response_mask, collect_metrics)
+                    del layer_log_prob
+                elif self.selected_policy_layers:
+                    # Multi-layer GRPO: mean of the unchanged GRPO loss over the
+                    # selected layers; entropy/KL terms below stay final-layer.
+                    entropy, log_prob, layer_log_prob = self._forward_micro_batch(
+                        micro_batch=data, temperature=temperature, need_entropy=need_entropy,
+                        with_layers=True)
+                    pg_loss, pg_clipfrac, ppo_kl, layer_metrics = self._multilayer_policy_loss(
+                        layer_log_prob, data['old_log_probs_layers'], advantages, response_mask,
+                        clip_ratio, self.config.get('loss_agg_mode', 'token-mean'), collect_metrics)
+                    del layer_log_prob
                 else:
-                    _, log_prob = self._forward_micro_batch(micro_batch=data,
-                                                            temperature=temperature,
-                                                            need_entropy=False)
+                    # all return: (bsz, response_length)
+                    if need_entropy:
+                        entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
+                    else:
+                        _, log_prob = self._forward_micro_batch(micro_batch=data,
+                                                                temperature=temperature,
+                                                                need_entropy=False)
 
-                pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
-                    old_log_prob=old_log_prob,
-                    log_prob=log_prob,
-                    advantages=advantages,
-                    eos_mask=response_mask,
-                    cliprange=clip_ratio,
-                    # 'token-mean' is verl's historical reduction and stays the
-                    # default, so GRPO/SFPO/GXPO arms are untouched.
-                    # 'seq-mean-token-mean' is trl's loss_type="grpo", which the
-                    # OPD^2 recipe pins. Shared by all three GXPO passes, so the
-                    # extrapolated update sees the same objective as the probes.
-                    loss_agg_mode=self.config.get('loss_agg_mode', 'token-mean'))
+                    pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        eos_mask=response_mask,
+                        cliprange=clip_ratio,
+                        # 'token-mean' is verl's historical reduction and stays the
+                        # default, so GRPO/SFPO/GXPO arms are untouched.
+                        # 'seq-mean-token-mean' is trl's loss_type="grpo", which the
+                        # OPD^2 recipe pins. Shared by all three GXPO passes, so the
+                        # extrapolated update sees the same objective as the probes.
+                        loss_agg_mode=self.config.get('loss_agg_mode', 'token-mean'))
                 # compute entropy loss from entropy. A skipped entropy implies
                 # entropy_coeff == 0, so the zero placeholder keeps policy_loss (and its
                 # gradients) bit-identical.
@@ -1358,7 +1610,6 @@ class DataParallelPPOActor(BasePPOActor):
                         'sled_coef': sled_coef,
                     }
                     del live_topk_lp, sled_tok, ratio_mb, pg1, pg2, w_grpo
-                del log_prob
 
             if self.config.use_kl_loss:
                 ref_log_prob = data['ref_log_prob']
@@ -1373,6 +1624,8 @@ class DataParallelPPOActor(BasePPOActor):
                     # deferred D2H sync: converted to python floats once per mini-batch below
                     append_to_dict(metrics, {'actor/kl_loss': kl_loss.detach()})
                     metrics['actor/kl_coef'] = self.config.kl_loss_coef
+
+            log_prob = None  # released after the reference-KL term, which reads it
 
             if self.config.use_dynamic_bsz:
                 # relative to the dynamic bsz
@@ -1395,6 +1648,11 @@ class DataParallelPPOActor(BasePPOActor):
                     'actor/pg_clipfrac': pg_clipfrac.detach(),
                     'actor/ppo_kl': ppo_kl.detach(),
                 }
+                if need_entropy:
+                    micro_metrics['actor/entropy_token_sum'] = (entropy * response_mask).sum().detach()
+                    micro_metrics['actor/entropy_token_count'] = response_mask.sum().detach()
+                if layer_metrics:
+                    micro_metrics.update(layer_metrics)
                 if kd_loss is not None:
                     micro_metrics['actor/kd_loss'] = kd_loss.detach()
                     if kd_student_mass is not None:
@@ -1449,17 +1707,8 @@ class DataParallelPPOActor(BasePPOActor):
 
         # Materialize deferred GPU scalars in one sync. Values are bit-identical to
         # the previous per-micro-batch .item() conversions; list lengths unchanged.
-        for key in ('actor/entropy_loss', 'actor/pg_loss', 'actor/pg_clipfrac', 'actor/ppo_kl',
-                    'actor/kl_loss', 'actor/kd_loss', 'actor/kd_student_mass',
-                    'actor/kd_teacher_mass', 'loss/grpo', 'loss/sled_delta', 'loss/sled_weighted',
-                    'loss/total', 'sled/loss_coef', 'sled/adv_mean', 'sled/adv_abs_mean',
-                    'sled/adv_std', 'sled/delta_mean', 'sled/delta_abs_mean', 'sled/delta_std',
-                    'sled/opd_adv_mean', 'sled/opd_adv_abs_mean', 'sled/opd_adv_std',
-                    'sled/gate_keep_fraction', 'grpo/adv_mean', 'grpo_sled/agree',
-                    'grpo_sled/disagree', 'grpo_sled/pp', 'grpo_sled/pn', 'grpo_sled/np',
-                    'grpo_sled/nn', 'grpo_sled/grad_weight_cosine'):
-            vals = metrics.get(key)
-            if vals and isinstance(vals[0], torch.Tensor):
+        for key, vals in metrics.items():
+            if isinstance(vals, list) and vals and isinstance(vals[0], torch.Tensor):
                 metrics[key] = torch.stack(vals).tolist()
 
         self.cumulative_bp += 1
@@ -1486,6 +1735,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {'actor/grad_norm': grad_norm.detach().item()})
+        if self.selected_policy_layers:
+            metrics['num_selected_policy_layers'] = len(self.selected_policy_layers)
         metrics['actor/cumulative_bp'] = self.cumulative_bp
         metrics['actor/policy_grad_evals_step'] = self.cumulative_bp - bp_start
         metrics['actor/cumulative_policy_grad_evals'] = self.cumulative_bp
@@ -2508,6 +2759,15 @@ class DataParallelPPOActor(BasePPOActor):
                                                        trigger_enabled=trigger_enabled,
                                                        defer_trigger=defer_trigger)
                 _merge_metrics(metrics, mb_metrics)
+        # One token-weighted entropy for the outer batch; averaging minibatch
+        # means would over-weight shorter minibatches.
+        entropy_sums = metrics.pop('actor/entropy_token_sum', [])
+        entropy_counts = metrics.pop('actor/entropy_token_count', [])
+        if entropy_counts:
+            total_tokens = sum(float(value) for value in entropy_counts)
+            if total_tokens:
+                metrics['actor/entropy_loss'] = (
+                    sum(float(value) for value in entropy_sums) / total_tokens)
         if force_standard:
             metrics['actor/gxpo_format_skip'] = 1.0
         if defer_trigger:
@@ -2592,4 +2852,8 @@ class DataParallelPPOActor(BasePPOActor):
                 and self._gxpo_bufs is not None):
             self._gxpo_release_buffers()
             metrics['actor/gxpo_budget_buffers_released'] = 1.0
+        # theta0/g0/g1 are per-minibatch scratch (rewritten before read); free them so
+        # rollout/eval/ckpt don't carry ~3 model copies into vLLM wake_up. Rebuilt lazily.
+        if self._gxpo_bufs is not None:
+            self._gxpo_release_buffers()
         return metrics
